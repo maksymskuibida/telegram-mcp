@@ -5,6 +5,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
 coverage.xml
 htmlcov/
 dist/
@@ -12,3 +13,9 @@ build/
 *.egg-info/
 .DS_Store
 *.session
+*.session-journal
+broker.secret
+*.sock
+.env
+.env.*
+.dmypy.json
