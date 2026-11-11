@@ -25,6 +25,12 @@ def home(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     folder = Path(os.path.realpath(tempfile.mkdtemp(prefix="tgm", dir="/tmp")))
     monkeypatch.setenv("HOME", str(folder))
     monkeypatch.delenv("TELEGRAM_MCP_TEST_FAKE_GATEWAY", raising=False)
+    # Any subprocess a test starts uses a file keyring in this HOME, never the real Keychain.
+    monkeypatch.setenv("PYTHON_KEYRING_BACKEND", "support.file_keyring.FileKeyring")
+    tests_dir = str(Path(__file__).parent)
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join(filter(None, [tests_dir, os.environ.get("PYTHONPATH")]))
+    )
     try:
         yield folder
     finally:

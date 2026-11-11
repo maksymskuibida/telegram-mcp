@@ -168,6 +168,7 @@ class Broker:
         self._write_lock = asyncio.Lock()
         self._writers: set[asyncio.StreamWriter] = set()
         self._stopped = asyncio.Event()
+        self._finished = asyncio.Event()
         self._exit_when_idle = False
         self._last_request = clock()
         self._handlers: dict[str, Handler] = {
@@ -221,8 +222,15 @@ class Broker:
     async def stop(self) -> None:
         """Clean exit: stop serving, rewrite the lock to released, delete socket and secret."""
         if self._stopped.is_set():
+            await self._finished.wait()
             return
         self._stopped.set()
+        try:
+            await self._shut_down()
+        finally:
+            self._finished.set()
+
+    async def _shut_down(self) -> None:
         if self._sweeper is not None:
             self._sweeper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -246,7 +254,8 @@ class Broker:
         self._lock.release()
 
     async def wait_stopped(self) -> None:
-        await self._stopped.wait()
+        """Return once the broker has stopped and removed its socket and secret."""
+        await self._finished.wait()
 
     # Connections ----------------------------------------------------------------------------
 
