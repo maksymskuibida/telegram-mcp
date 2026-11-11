@@ -16,6 +16,9 @@ KEYRING_FILE = "test-keyring.json"
 class FileKeyring(KeyringBackend):
     priority = 1
 
+    def __init__(self) -> None:
+        super().__init__()  # type: ignore[no-untyped-call]
+
     @staticmethod
     def _path() -> Path:
         return Path.home() / KEYRING_FILE
