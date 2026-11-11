@@ -551,11 +551,12 @@ async def test_an_unexpected_error_inside_the_broker_refuses(
         }
     client = approval_hook if method != "tool.call" else await RawClient.connect(paths)
     answer = await client.result(method, params)
-    expected: dict[str, Any] = {
+    expectations: dict[str, dict[str, Any]] = {
         "approval.check": {"decision": "refuse", "code": "telegram_error"},
         "approval.answer": {"outcome": "unknown"},
         "tool.call": {"ok": False},
-    }[method]
+    }
+    expected = expectations[method]
     assert expected.items() <= answer.items()
     assert "RuntimeError" in paths.diagnostics.read_text()
 
