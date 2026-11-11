@@ -1,0 +1,12 @@
+{
+  "name": "telegram-mcp",
+  "description": "The telegram-mcp plugin: your own Telegram account in Claude Code, with a confirmation for every message sent.",
+  "owner": { "name": "maksymskuibida" },
+  "plugins": [
+    {
+      "name": "telegram-mcp",
+      "source": "./",
+      "description": "Use your own Telegram account from Claude Code, confirming every message sent."
+    }
+  ]
+}

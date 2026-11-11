@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "telegram": {
+      "command": "uvx",
+      "args": [
+        "--quiet",
+        "--constraints",
+        "${CLAUDE_PLUGIN_ROOT}/constraints.txt",
+        "--from",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "telegram-mcp",
+        "serve"
+      ]
+    }
+  }
+}
