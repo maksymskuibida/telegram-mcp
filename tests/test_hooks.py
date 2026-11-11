@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from support.brokers import subprocess_brokers
+from support.flows import question_from
 from telegram_mcp.broker.client import BrokerUnavailable, RequestLost
 from telegram_mcp.hooks import approval_post, approval_pre, run_hook
 from telegram_mcp.paths import FixedPaths
@@ -86,11 +87,19 @@ async def test_ask_denies_with_the_exact_question_options_and_descriptions() -> 
     verdict, reason = decision(output)
     assert verdict == "deny"
     assert reason == (
+        "Not sent yet: this is the confirmation step. "
         "Ask the person with AskUserQuestion, exactly: question "
         + json.dumps(QUESTION, ensure_ascii=False)
         + '; options Allow (description "Send it") and Deny (description "Do not send"), '
         "in that order, multiSelect false; then call the tool again with the same arguments."
     )
+
+
+async def test_the_deny_reason_starts_with_the_confirmation_step_and_carries_the_question() -> None:
+    _, reason = decision(await approval_pre(pre_input(), StubBroker(ASK)))
+    assert reason is not None
+    assert reason.startswith("Not sent yet: this is the confirmation step. ")
+    assert question_from(await approval_pre(pre_input(), StubBroker(ASK))) == QUESTION
 
 
 async def test_refuse_denies_with_the_code_and_message() -> None:

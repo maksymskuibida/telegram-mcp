@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 
-from telethon import TelegramClient, errors, utils
+from telethon import TelegramClient, errors, functions, utils
 from telethon.sessions import StringSession
 from telethon.tl import types
 
@@ -21,6 +21,7 @@ from telegram_mcp.gateway.models import (
     ChatNotFound,
     ChatRef,
     ChatType,
+    CodeDelivery,
     CodeExpired,
     FloodWait,
     GatewayError,
@@ -29,10 +30,12 @@ from telegram_mcp.gateway.models import (
     NotAuthorized,
     OutcomeUnknown,
     PasswordNeeded,
+    SentCodeInfo,
     SentMessage,
     TelegramError,
     decode_cursor,
     encode_cursor,
+    mark_saved_messages,
 )
 
 CALL_TIMEOUT = 30.0
@@ -60,6 +63,9 @@ class TelethonGateway:
         self._timeout = call_timeout
         self._phone: str | None = None
         self._phone_code_hash: str | None = None
+        # The account's own id, read once per connection to mark its Saved Messages (NFR4.4).
+        self._own_id: int | None = None
+        self._own_id_read = False
 
     async def _call(self, make: Callable[[], Awaitable[T]], *, write: bool = False) -> T:
         """Run one Telegram call with the 30 s limit, mapping every failure to a gateway error.
@@ -81,6 +87,7 @@ class TelethonGateway:
     async def _ensure_connected(self) -> None:
         if self._client.is_connected():
             return
+        self._own_id_read = False
         try:
             await asyncio.wait_for(self._client.connect(), self._timeout)
         except TimeoutError as error:
@@ -98,10 +105,21 @@ class TelethonGateway:
     async def is_authorized(self) -> bool:
         return bool(await self._call(self._client.is_user_authorized))
 
-    async def sign_in_phone(self, phone: str) -> None:
+    async def sign_in_phone(self, phone: str) -> SentCodeInfo:
         sent = await self._call(lambda: self._client.send_code_request(phone))
         self._phone = phone
         self._phone_code_hash = sent.phone_code_hash
+        return sent_code_info(sent)
+
+    async def resend_code(self, phone: str) -> SentCodeInfo:
+        """Ask for the code by the next way Telegram offered, with the code hash the first
+        request returned; Telegram answers with a new hash for the new code."""
+        code_hash = self._phone_code_hash or ""
+        request = functions.auth.ResendCodeRequest(phone, code_hash)
+        sent = await self._call(lambda: self._client(request))
+        self._phone = phone
+        self._phone_code_hash = getattr(sent, "phone_code_hash", None) or self._phone_code_hash
+        return sent_code_info(sent)
 
     async def sign_in_code(self, code: str) -> Me:
         phone, code_hash = self._phone, self._phone_code_hash
@@ -121,6 +139,18 @@ class TelethonGateway:
             raise NotAuthorized()
         return Me(id=int(user.id), name=utils.get_display_name(user), username=user.username)
 
+    async def _account_id(self) -> int | None:
+        """The logged-in account's own id, read with ``me()`` once per connection. None when
+        it cannot be read, so that no chat is marked as the person's Saved Messages."""
+        await self._ensure_connected()
+        if not self._own_id_read:
+            try:
+                self._own_id = (await self.me()).id
+            except GatewayError:
+                return None
+            self._own_id_read = True
+        return self._own_id
+
     async def list_chats(
         self, folder_id: int | None, limit: int, offset: str | None
     ) -> tuple[list[ChatRef], str | None]:
@@ -133,7 +163,8 @@ class TelethonGateway:
                 lambda: self._client.get_input_entity(peer_id)
             )
         dialogs = await self._call(lambda: self._client.get_dialogs(**options))
-        chats = [_chat_from_dialog(d) for d in dialogs]
+        own_id = await self._account_id()
+        chats = [mark_saved_messages(_chat_from_dialog(d), own_id) for d in dialogs]
         next_offset = None
         if len(dialogs) >= limit and dialogs:
             last = dialogs[-1]
@@ -152,11 +183,12 @@ class TelethonGateway:
                 entity = await self._call(lambda: self._client.get_entity(chat_id))
             except (ValueError, TelegramError) as error:
                 raise ChatNotFound() from error
-        return ChatRef(
+        chat = ChatRef(
             id=int(utils.get_peer_id(entity)),
             name=utils.get_display_name(entity),
             type=_chat_type(entity),
         )
+        return mark_saved_messages(chat, await self._account_id())
 
     async def send_text(
         self, chat_id: int, text: str, reply_to: int | None, topic_id: int | None
@@ -167,6 +199,48 @@ class TelethonGateway:
             write=True,
         )
         return SentMessage(id=int(message.id), chat_id=chat_id, date=message.date)
+
+
+_SENT_TYPES: tuple[tuple[type[Any], CodeDelivery], ...] = (
+    (types.auth.SentCodeTypeApp, "app"),
+    (types.auth.SentCodeTypeSms, "sms"),
+    (types.auth.SentCodeTypeSmsWord, "sms"),
+    (types.auth.SentCodeTypeSmsPhrase, "sms"),
+    (types.auth.SentCodeTypeFirebaseSms, "sms"),
+    (types.auth.SentCodeTypeCall, "call"),
+    (types.auth.SentCodeTypeFlashCall, "flash_call"),
+    (types.auth.SentCodeTypeMissedCall, "missed_call"),
+    (types.auth.SentCodeTypeEmailCode, "email"),
+    (types.auth.SentCodeTypeFragmentSms, "fragment"),
+)
+_NEXT_TYPES: tuple[tuple[type[Any], CodeDelivery], ...] = (
+    (types.auth.CodeTypeSms, "sms"),
+    (types.auth.CodeTypeCall, "call"),
+    (types.auth.CodeTypeFlashCall, "flash_call"),
+    (types.auth.CodeTypeMissedCall, "missed_call"),
+    (types.auth.CodeTypeFragmentSms, "fragment"),
+)
+
+
+def _delivery(value: Any, table: tuple[tuple[type[Any], CodeDelivery], ...]) -> CodeDelivery:
+    for telethon_type, delivery in table:
+        if isinstance(value, telethon_type):
+            return delivery
+    return "other"
+
+
+def sent_code_info(sent: Any) -> SentCodeInfo:
+    """Telegram's ``auth.SentCode`` as where the code went and the next way offered (BR1.10)."""
+    code_type = getattr(sent, "type", None)
+    next_type = getattr(sent, "next_type", None)
+    pattern = getattr(code_type, "email_pattern", None)
+    timeout = getattr(sent, "timeout", None)
+    return SentCodeInfo(
+        delivery=_delivery(code_type, _SENT_TYPES),
+        email_pattern=str(pattern) if pattern else None,
+        next_delivery=_delivery(next_type, _NEXT_TYPES) if next_type is not None else None,
+        timeout_seconds=int(timeout) if isinstance(timeout, int) else None,
+    )
 
 
 _SIGN_IN_ERRORS: tuple[tuple[type[Exception], type[GatewayError]], ...] = (

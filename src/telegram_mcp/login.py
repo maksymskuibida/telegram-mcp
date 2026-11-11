@@ -11,8 +11,9 @@ import contextlib
 import getpass
 import re
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from telegram_mcp.broker.client import BrokerClient
 from telegram_mcp.broker.lock import BrokerLock, LockProbe, LockState, probe_lock
@@ -20,10 +21,15 @@ from telegram_mcp.broker.server import default_gateway_factory
 from telegram_mcp.gateway.models import (
     BadCode,
     BadPassword,
+    CodeDelivery,
     CodeExpired,
+    FloodWait,
     GatewayError,
+    GatewayTimeout,
     Me,
     PasswordNeeded,
+    SentCodeInfo,
+    TelegramError,
 )
 from telegram_mcp.gateway.protocol import GatewayFactory, TelegramGateway
 from telegram_mcp.paths import FixedPaths
@@ -35,6 +41,35 @@ ACCOUNT_LOOKUP_SECONDS = 15.0
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED = 0, 1, 2
 _API_HASH = re.compile(r"^[0-9a-fA-F]{32}$")
 _PHONE = re.compile(r"^\+?\d{6,15}$")
+_PASTE_MARKERS = ("\x1b[200~", "\x1b[201~")
+_WHERE: dict[CodeDelivery, str] = {
+    "app": (
+        "Telegram sent the code to your Telegram app: look for a message from Telegram "
+        "(blue tick) on a device where this account is logged in."
+    ),
+    "sms": "Telegram sent the code by SMS to your phone.",
+    "call": "Telegram is calling your phone to say the code.",
+    "flash_call": (
+        "Telegram is making a short call to your phone: the code is in the calling number."
+    ),
+    "missed_call": (
+        "Telegram is calling your phone and hanging up: the code is the last digits of the "
+        "calling number."
+    ),
+    "email": "Telegram sent the code by email to {email}.",
+    "fragment": "Telegram sent the code to your anonymous number on Fragment (fragment.com).",
+    "other": "Telegram sent the code in a way this version cannot name.",
+}
+_NEXT_WAY: dict[CodeDelivery, str] = {
+    "app": "the Telegram app",
+    "sms": "SMS",
+    "call": "a phone call",
+    "flash_call": "a short call",
+    "missed_call": "a missed call",
+    "email": "email",
+    "fragment": "Fragment",
+    "other": "another way",
+}
 
 
 @dataclass
@@ -160,8 +195,9 @@ async def _sign_in(
     gateway = gateway_factory("", api_id, api_hash)
     try:
         await gateway.connect()
-        await gateway.sign_in_phone(phone)
-        me = await _enter_code(terminal, gateway, phone)
+        sent = await gateway.sign_in_phone(phone)
+        terminal.say(where_the_code_went(sent))
+        me = await _enter_code(terminal, gateway, phone, sent)
         stored = StoredSession(gateway.export_session(), api_id, api_hash)
     except GatewayError as error:
         raise LoginStopped(
@@ -180,20 +216,62 @@ async def _sign_in(
     return EXIT_OK
 
 
-async def _enter_code(terminal: Terminal, gateway: TelegramGateway, phone: str) -> Me:
-    """BR1.2: up to 3 codes, then up to 3 passwords when the account has one."""
-    for _ in range(MAX_TRIES):
+def where_the_code_went(sent: SentCodeInfo) -> str:
+    """The line printed before the code is asked for (BR1.10): where Telegram sent it, and
+    either the next way it offers or that it offers none."""
+    line = _WHERE[sent.delivery].format(email=sent.email_pattern or "your login email address")
+    if sent.next_delivery is None:
+        return f"{line} Telegram offers no other way to send it for this login."
+    way = _NEXT_WAY[sent.next_delivery]
+    if sent.timeout_seconds:
+        wait = f"If it does not arrive within {sent.timeout_seconds} seconds"
+    else:
+        wait = "If it does not arrive"
+    return f"{line} {wait}, press Enter with no code to ask for it by {way}."
+
+
+async def _enter_code(
+    terminal: Terminal, gateway: TelegramGateway, phone: str, sent: SentCodeInfo
+) -> Me:
+    """BR1.2: up to 3 codes, then up to 3 passwords when the account has one. An empty code
+    asks for the code by the next way Telegram offers, or is asked again when it offers none;
+    neither counts as a try (BR1.10)."""
+    tries = 0
+    while tries < MAX_TRIES:
         code = terminal.ask("The code Telegram sent you: ").strip()
+        if not code:
+            if sent.next_delivery is not None:
+                sent = await _resend(terminal, gateway, phone, sent)
+            continue
+        tries += 1
         try:
             return await gateway.sign_in_code(code)
         except BadCode:
             terminal.say("The code was wrong.")
         except CodeExpired:
             terminal.say("The code expired; a new one was sent.")
-            await gateway.sign_in_phone(phone)
+            sent = await gateway.sign_in_phone(phone)
+            terminal.say(where_the_code_went(sent))
         except PasswordNeeded:
             return await _enter_password(terminal, gateway)
     raise LoginStopped("The code was wrong 3 times; nothing was saved.", EXIT_FAILED)
+
+
+async def _resend(
+    terminal: Terminal, gateway: TelegramGateway, phone: str, sent: SentCodeInfo
+) -> SentCodeInfo:
+    """Ask for the code by the next way. When Telegram refuses, say so and keep the code
+    already sent: the person can still type it."""
+    try:
+        resent = await gateway.resend_code(phone)
+    except (TelegramError, FloodWait, GatewayTimeout) as error:
+        terminal.say(
+            f"Telegram did not send the code another way ({type(error).__name__}); "
+            "type the code you have."
+        )
+        return replace(sent, next_delivery=None, timeout_seconds=None)
+    terminal.say(where_the_code_went(resent))
+    return resent
 
 
 async def _enter_password(terminal: Terminal, gateway: TelegramGateway) -> Me:
@@ -225,8 +303,19 @@ def _parse_api_id(text: str) -> int | None:
     return int(text) if text.isdigit() and int(text) > 0 else None
 
 
+def clean_hidden_paste(text: str) -> str:
+    """A value typed at a hidden prompt, cleaned of what the person cannot see there (BR1.1):
+    the terminal's bracketed-paste markers, every other control or format character (a
+    newline, a zero-width space), and surrounding whitespace."""
+    for marker in _PASTE_MARKERS:
+        text = text.replace(marker, "")
+    shown = "".join(char for char in text if unicodedata.category(char) not in ("Cc", "Cf"))
+    return shown.strip()
+
+
 def _parse_api_hash(text: str) -> str | None:
-    return text.lower() if _API_HASH.match(text) else None
+    cleaned = clean_hidden_paste(text)
+    return cleaned.lower() if _API_HASH.match(cleaned) else None
 
 
 def _parse_phone(text: str) -> str | None:

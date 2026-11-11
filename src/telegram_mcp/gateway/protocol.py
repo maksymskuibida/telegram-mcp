@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Protocol
 
-from telegram_mcp.gateway.models import ChatRef, Me, SentMessage
+from telegram_mcp.gateway.models import ChatRef, Me, SentCodeInfo, SentMessage
 
 
 class TelegramGateway(Protocol):
@@ -15,8 +15,11 @@ class TelegramGateway(Protocol):
 
     async def is_authorized(self) -> bool: ...
 
-    async def sign_in_phone(self, phone: str) -> None:
-        """Ask Telegram to send a login code to ``phone``."""
+    async def sign_in_phone(self, phone: str) -> SentCodeInfo:
+        """Ask Telegram to send a login code to ``phone``; says where it went (BR1.10)."""
+
+    async def resend_code(self, phone: str) -> SentCodeInfo:
+        """Ask Telegram to send the code again by the next way it offered (BR1.10)."""
 
     async def sign_in_code(self, code: str) -> Me:
         """Sign in with the code; raises ``PasswordNeeded``, ``BadCode`` or ``CodeExpired``."""

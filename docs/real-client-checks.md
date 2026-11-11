@@ -24,11 +24,17 @@ person, sending must not be treated as safe.
 
 On your own account, in a real Claude Code session with the plugin installed:
 
-1. `telegram-mcp login` in a terminal; it prints `Logged in as …`.
+1. `telegram-mcp login` in a terminal. Paste the `api_hash` at the hidden prompt. Check that
+   before asking for the code it says where Telegram sent it and whether another way is
+   offered (and, when one is, that Enter with no code asks for it that way). It ends with
+   `Logged in as …`.
 2. Ask Claude to list your chats. Time it with the broker already running (target 5 s) and from
-   a cold start (target 10 s).
-3. Ask Claude to send a message to yourself (Saved Messages) by chat id. Check that the
-   question box shows the chat and the full text, pick **Deny**, and check nothing was sent.
+   a cold start (target 10 s). Check that exactly one chat, your own, has `saved_messages`
+   true and the name "Saved Messages".
+3. Ask Claude to send a message to yourself (Saved Messages) by chat id. Check that Claude asks
+   the question right after the first call without treating it as a failure, that the box
+   reads `Send this message to your Saved Messages (id …)?` with the full text, pick **Deny**,
+   and check nothing was sent.
 4. Ask again, pick **Allow**, and check exactly one message arrives.
 5. Read `~/Library/Application Support/telegram-mcp/activity.log` and check the call, the
    question, both decisions and the result are there, with no session or api_hash in it.

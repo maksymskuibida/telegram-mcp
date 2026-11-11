@@ -23,10 +23,12 @@ from telegram_mcp.gateway.models import (
     NotAuthorized,
     OutcomeUnknown,
     PasswordNeeded,
+    SentCodeInfo,
     SentMessage,
     TelegramError,
     decode_cursor,
     encode_cursor,
+    mark_saved_messages,
 )
 
 FAKE_CONFIG_NAME = "fake-gateway.json"
@@ -59,6 +61,10 @@ class FakeGateway:
     login_code: str = "12345"
     password: str | None = None
     session_after_login: str = "fake-session"
+    sent_code: SentCodeInfo = field(default_factory=lambda: SentCodeInfo("app"))
+    resent_code: SentCodeInfo = field(default_factory=lambda: SentCodeInfo("sms"))
+    own_id_known: bool = True
+    """False stands for a gateway that could not read the account's own id: no chat is marked."""
     record_path: Path | None = None
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     sent: list[SentText] = field(default_factory=list)
@@ -119,8 +125,13 @@ class FakeGateway:
         await self._enter("is_authorized")
         return self.authorized
 
-    async def sign_in_phone(self, phone: str) -> None:
+    async def sign_in_phone(self, phone: str) -> SentCodeInfo:
         await self._enter("sign_in_phone", phone=phone)
+        return self.sent_code
+
+    async def resend_code(self, phone: str) -> SentCodeInfo:
+        await self._enter("resend_code", phone=phone)
+        return self.resent_code
 
     async def sign_in_code(self, code: str) -> Me:
         await self._enter("sign_in_code")
@@ -153,7 +164,7 @@ class FakeGateway:
         self._require_authorized()
         visible = [c for c in self.chats if folder_id is None or folder_id in c.folder_ids]
         start = decode_cursor(offset)[0] if offset else 0
-        page = visible[start : start + limit]
+        page = [mark_saved_messages(c, self._own_id()) for c in visible[start : start + limit]]
         more = start + limit < len(visible)
         return page, encode_cursor(start + limit, 0, 0) if more else None
 
@@ -162,8 +173,11 @@ class FakeGateway:
         self._require_authorized()
         for chat in self.chats:
             if chat.id == chat_id:
-                return chat
+                return mark_saved_messages(chat, self._own_id())
         raise ChatNotFound()
+
+    def _own_id(self) -> int | None:
+        return self.account.id if self.own_id_known else None
 
     async def send_text(
         self, chat_id: int, text: str, reply_to: int | None, topic_id: int | None

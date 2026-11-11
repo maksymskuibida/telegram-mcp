@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Literal
 
 ChatType = Literal["user", "group", "supergroup", "channel", "forum"]
 CHAT_TYPES: tuple[ChatType, ...] = ("user", "group", "supergroup", "channel", "forum")
 PREVIEW_LIMIT = 200
+SAVED_MESSAGES = "Saved Messages"
 
 
 @dataclass(frozen=True)
 class ChatRef:
-    """A chat as the gateway returns it. ``name`` and ``last_preview`` are Telegram content."""
+    """A chat as the gateway returns it. ``name`` and ``last_preview`` are Telegram content.
+
+    ``saved_messages`` is true only for the logged-in account's own chat, decided by the
+    gateway from the account's own id and never from a title (NFR4.4)."""
 
     id: int
     name: str
@@ -23,6 +27,32 @@ class ChatRef:
     muted: bool = False
     last_preview: str | None = None
     folder_ids: tuple[int, ...] = ()
+    saved_messages: bool = False
+
+
+def mark_saved_messages(chat: ChatRef, own_id: int | None) -> ChatRef:
+    """The chat as the gateway returns it: the account's own chat marked and named
+    "Saved Messages", every other chat unmarked whatever it is called. With no own id, no
+    chat is marked."""
+    if own_id is not None and chat.id == own_id:
+        return replace(chat, name=SAVED_MESSAGES, saved_messages=True)
+    return replace(chat, saved_messages=False) if chat.saved_messages else chat
+
+
+CodeDelivery = Literal[
+    "app", "sms", "call", "flash_call", "missed_call", "email", "fragment", "other"
+]
+
+
+@dataclass(frozen=True)
+class SentCodeInfo:
+    """Where Telegram says it sent a login code, and the next way it offers, if any (BR1.10).
+    ``email_pattern`` is the masked address Telegram gives for email delivery."""
+
+    delivery: CodeDelivery
+    email_pattern: str | None = None
+    next_delivery: CodeDelivery | None = None
+    timeout_seconds: int | None = None
 
 
 @dataclass(frozen=True)

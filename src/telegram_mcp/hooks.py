@@ -16,6 +16,7 @@ from telegram_mcp.paths import FixedPaths
 
 TG_PREFIX = "[tg-"
 NOT_RUN = "it was not run"
+CONFIRMATION_STEP = "Not sent yet: this is the confirmation step."
 
 
 class ApprovalBroker(Protocol):
@@ -37,9 +38,11 @@ def _deny(problem: str) -> dict[str, Any]:
 
 def ask_reason(question: str) -> str:
     """The deny reason that dictates the question box (C6, NFR3.1). The question is given as
-    a JSON string so that its line break and quotes reach the box exactly."""
+    a JSON string so that its line break and quotes reach the box exactly. It opens by saying
+    this is a step, not a failure (BR4.1, BR5.2)."""
     return (
-        "Ask the person with AskUserQuestion, exactly: question "
+        CONFIRMATION_STEP
+        + " Ask the person with AskUserQuestion, exactly: question "
         + json.dumps(question, ensure_ascii=False)
         + '; options Allow (description "Send it") and Deny (description "Do not send"), '
         "in that order, multiSelect false; then call the tool again with the same arguments."

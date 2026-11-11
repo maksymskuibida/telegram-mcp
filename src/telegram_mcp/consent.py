@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any, NamedTuple
 
-from telegram_mcp.gateway.models import ChatRef
+from telegram_mcp.gateway.models import SAVED_MESSAGES, ChatRef
 
 APPROVAL_TTL = timedelta(seconds=120)
 MAX_OPEN_APPROVALS = 100
@@ -147,11 +147,15 @@ def sanitize_chat_name(name: str) -> str:
 def build_send_question(
     approval_id: str, chat: ChatRef, text: str, reply_to: int | None, topic_id: int | None
 ) -> str:
-    """The exact question for a send (BR3.4); the full text follows the first line."""
-    line = (
-        f"[tg-{approval_id}] Send this message to «{sanitize_chat_name(chat.name)}» "
-        f"({chat.type}, id {chat.id})?"
-    )
+    """The exact question for a send (BR3.4); the full text follows the first line. The
+    account's own chat, as the gateway marked it, is named plainly as your Saved Messages."""
+    if chat.saved_messages:
+        line = f"[tg-{approval_id}] Send this message to your {SAVED_MESSAGES} (id {chat.id})?"
+    else:
+        line = (
+            f"[tg-{approval_id}] Send this message to «{sanitize_chat_name(chat.name)}» "
+            f"({chat.type}, id {chat.id})?"
+        )
     if reply_to is not None:
         line += f" Reply to message {reply_to}."
     if topic_id is not None:
@@ -214,7 +218,7 @@ class ConsentGate:
             tool=tool,
             args_digest=digest,
             chat_id=chat.id,
-            chat_name=chat.name,
+            chat_name=SAVED_MESSAGES if chat.saved_messages else chat.name,
             chat_type=chat.type,
             content=text,
             reply_to=reply_to,

@@ -173,6 +173,41 @@ def test_the_question_names_a_reply_and_a_topic() -> None:
     )
 
 
+# The gateway marks the account's own chat from its own id and names it (NFR4.4); the name it
+# came with must not matter.
+OWN_CHAT = ChatRef(id=4242, name="Test Person", type="user", saved_messages=True)
+TITLED_SAVED = ChatRef(id=555, name="Saved Messages", type="user")
+
+
+@pytest.mark.parametrize(
+    ("reply_to", "topic_id", "suffix"),
+    [(None, None, ""), (5, None, " Reply to message 5."), (None, 9, " In topic 9.")],
+)
+def test_the_question_for_your_own_chat_names_your_saved_messages(
+    reply_to: int | None, topic_id: int | None, suffix: str
+) -> None:
+    question = build_send_question("abcdefghij", OWN_CHAT, "note", reply_to, topic_id)
+    assert question == (
+        "[tg-abcdefghij] Send this message to your Saved Messages (id 4242)?" + suffix + "\nnote"
+    )
+
+
+def test_an_approval_for_your_own_chat_stores_saved_messages_as_its_name(
+    gate: ConsentGate,
+) -> None:
+    approval = ask(gate, chat=OWN_CHAT).approval
+    assert approval.chat_name == "Saved Messages"
+    assert approval.question == (
+        f"[tg-{approval.id}] Send this message to your Saved Messages (id 4242)?\nhello"
+    )
+
+
+def test_a_chat_titled_saved_messages_is_named_by_its_title_and_id(gate: ConsentGate) -> None:
+    question = build_send_question("abcdefghij", TITLED_SAVED, "x", None, None)
+    assert question == "[tg-abcdefghij] Send this message to «Saved Messages» (user, id 555)?\nx"
+    assert ask(gate, chat=TITLED_SAVED).approval.chat_name == "Saved Messages"
+
+
 def test_the_full_4096_character_text_is_kept(gate: ConsentGate) -> None:
     text = "y" * 4095 + "z"
     decision = ask(gate, text=text)

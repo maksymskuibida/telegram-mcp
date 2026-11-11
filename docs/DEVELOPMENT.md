@@ -71,8 +71,9 @@ uvx --constraints /path/to/telegram-mcp/constraints.txt --from /path/to/telegram
 ```
 
 Login asks for `api_id`, `api_hash` (hidden), your phone number, the code Telegram sends, and
-the two-step password (hidden) if your account has one. The session is stored in the macOS
-Keychain only.
+the two-step password (hidden) if your account has one. Before the code it says where
+Telegram sent it; when Telegram offers another way, Enter with no code asks for it that way.
+The session is stored in the macOS Keychain only.
 
 ## Commands
 

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from support.samples import TEAM, sample_chats
-from telegram_mcp.gateway.models import SentMessage, encode_cursor
+from telegram_mcp.gateway.models import ChatRef, SentMessage, encode_cursor
 from telegram_mcp.tools import (
     CHATS_LIST,
     MESSAGES_SEND,
@@ -34,9 +34,12 @@ def test_u1_lists_two_tools_with_closed_schemas() -> None:
 
 def test_descriptions_say_what_confirms() -> None:
     send = SPECS[MESSAGES_SEND].description
-    assert "confirm" in send
-    assert "question box" in send
-    assert "call this tool again with the same arguments" in send
+    assert send.startswith(
+        "The first call never sends: it always comes back with an exact question for the "
+        "person. Ask it with AskUserQuestion exactly as given (question, options, "
+        "descriptions), then call this tool again with the same arguments; the message is "
+        "sent only after the person picks Allow."
+    )
     listing = SPECS[CHATS_LIST].description
     assert "asks nothing" in listing
     assert "marks nothing as read" in listing
@@ -89,7 +92,17 @@ def test_an_instruction_like_preview_is_returned_marked_and_unchanged() -> None:
         "muted",
         "last_preview",
         "folder_ids",
+        "saved_messages",
     }
+
+
+def test_every_listed_chat_says_whether_it_is_your_saved_messages() -> None:
+    own = ChatRef(id=4242, name="Saved Messages", type="user", saved_messages=True)
+    result = list_result([own, *sample_chats()], None)
+    assert [chat["saved_messages"] for chat in result["chats"]] == [True] + [False] * 5
+    listing = SPECS[CHATS_LIST].description
+    assert "saved_messages" in listing
+    assert "your own Saved Messages" in listing
 
 
 def test_send_result_holds_the_message_id_chat_and_date() -> None:

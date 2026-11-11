@@ -443,8 +443,10 @@ class Broker:
         try:
             if self._is_write(tool) and connection.client_name != CLAUDE_CODE:
                 raise ToolFailure.fixed("unsupported_client")
-            self._log_call(connection, tool, raw)
+            # BR8.2: the vault is read (and the redactor given its secrets) before any entry
+            # holding the caller's text is written, also after a start with no session.
             stored = await self._session()
+            self._log_call(connection, tool, raw)
             if tool not in DECLS:
                 raise ToolFailure.fixed("not_found", "not_found_tool")
             if not self._is_write(tool):

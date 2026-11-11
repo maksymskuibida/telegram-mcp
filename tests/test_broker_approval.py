@@ -6,6 +6,7 @@ over a real Unix socket with the fake gateway."""
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
@@ -21,6 +22,7 @@ from telegram_mcp.broker.server import Broker
 from telegram_mcp.gateway.fake import FakeGateway
 from telegram_mcp.gateway.models import (
     ChatNotFound,
+    ChatRef,
     FloodWait,
     GatewayTimeout,
     NotAuthorized,
@@ -154,6 +156,46 @@ async def test_one_allow_runs_exactly_one_send(
     assert second["ok"] is False
     assert second["error"]["code"] == "needs_confirmation"
     assert [sent.text for sent in fake_gateway.sent] == [SEND_ARGS["text"]]
+
+
+@pytest.mark.usefixtures("logged_in")
+async def test_a_send_to_your_own_chat_asks_about_your_saved_messages(
+    start_broker: Callable[..., Any], paths: FixedPaths, fake_gateway: FakeGateway
+) -> None:
+    # BR3.4, NFR4.4: the gateway marks the account's own chat; the question says so plainly.
+    own_id = fake_gateway.account.id
+    fake_gateway.chats.append(ChatRef(id=own_id, name=fake_gateway.account.name, type="user"))
+    await start_broker()
+    approval_hook = await hook(paths)
+    asked = await check(approval_hook, {"chat": own_id, "text": "note to self"})
+    assert asked["question"] == (
+        f"[tg-{asked['approval_id']}] Send this message to your Saved Messages (id {own_id})?"
+        "\nnote to self"
+    )
+
+
+async def test_the_first_entries_after_a_login_are_written_redacted(
+    start_broker: Callable[..., Any], paths: FixedPaths
+) -> None:
+    # BR8.2, NFR1.5: a broker that started with no session reads the vault again, and gives the
+    # redactor the new secrets, before it writes the first entry holding the caller's text.
+    await start_broker()
+    values = fake_secrets()
+    SessionVault().save(StoredSession(values.session, values.api_id, values.api_hash))
+    text = f"my hash is {values.api_hash} and my session {values.session}"
+    server = await RawClient.connect(paths)
+    assert (await call(server, {"chat": ALICE.id, "text": text}))["error"]["code"] == (
+        "needs_confirmation"
+    )
+    approval_hook = await hook(paths)
+    assert (await check(approval_hook, {"chat": ALICE.id, "text": text}))["decision"] == "ask"
+    log = paths.log.read_text(encoding="utf-8")
+    assert values.api_hash not in log
+    assert values.session not in log
+    entries = [json.loads(line) for line in log.splitlines()]
+    with_text = [e for e in entries if e["event"] in ("call", "prompt")]
+    assert [e["event"] for e in with_text] == ["call", "prompt"]
+    assert all("[redacted]" in e["content"] for e in with_text)
 
 
 @pytest.mark.parametrize(

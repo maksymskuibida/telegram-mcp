@@ -14,10 +14,12 @@ from telegram_mcp.gateway.models import (
     BadCode,
     BadPassword,
     ChatNotFound,
+    ChatRef,
     FloodWait,
     NotAuthorized,
     OutcomeUnknown,
     PasswordNeeded,
+    SentCodeInfo,
 )
 
 
@@ -71,7 +73,9 @@ async def test_not_authorized_and_drop_after_send(fake_gateway: FakeGateway) -> 
 
 async def test_sign_in_with_code_and_password() -> None:
     fake = FakeGateway(authorized=False, password="pw")
-    await fake.sign_in_phone("+10000000000")
+    assert await fake.sign_in_phone("+10000000000") == SentCodeInfo("app")
+    assert await fake.resend_code("+10000000000") == SentCodeInfo("sms")
+    assert fake.call_names() == ["sign_in_phone", "resend_code"]
     with pytest.raises(BadCode):
         await fake.sign_in_code("00000")
     with pytest.raises(PasswordNeeded):
@@ -81,6 +85,36 @@ async def test_sign_in_with_code_and_password() -> None:
     me = await fake.sign_in_password("pw")
     assert me == fake.account
     assert fake.authorized
+
+
+OWN = ChatRef(id=4242, name="Test Person", type="user")
+# A chat that claims the mark: only the gateway's own-id check decides it (NFR4.4).
+TITLED_SAVED = ChatRef(id=555, name="Saved Messages", type="user", saved_messages=True)
+
+
+async def test_your_own_chat_is_marked_and_named_saved_messages() -> None:
+    fake = FakeGateway(chats=[OWN, TITLED_SAVED, ALICE])
+    page, _ = await fake.list_chats(None, 50, None)
+    shown = {chat.id: (chat.name, chat.saved_messages) for chat in page}
+    assert shown == {
+        OWN.id: ("Saved Messages", True),
+        TITLED_SAVED.id: ("Saved Messages", False),
+        ALICE.id: ("Alice", False),
+    }
+    own = await fake.resolve_chat(OWN.id)
+    assert (own.name, own.saved_messages) == ("Saved Messages", True)
+    titled = await fake.resolve_chat(TITLED_SAVED.id)
+    assert (titled.name, titled.saved_messages) == ("Saved Messages", False)
+
+
+async def test_nothing_is_marked_when_your_own_id_cannot_be_read() -> None:
+    fake = FakeGateway(chats=[OWN, ALICE], own_id_known=False)
+    page, _ = await fake.list_chats(None, 50, None)
+    assert [(chat.name, chat.saved_messages) for chat in page] == [
+        ("Test Person", False),
+        ("Alice", False),
+    ]
+    assert not (await fake.resolve_chat(OWN.id)).saved_messages
 
 
 async def test_from_file_builds_chats_scripts_and_a_call_record(home: Path) -> None:

@@ -50,7 +50,7 @@ async def test_lists_the_two_tools_with_closed_schemas(paths: FixedPaths) -> Non
     assert set(tools) == {"tg_chats_list", SEND}
     assert all(tool.input_schema["additionalProperties"] is False for tool in tools.values())
     description = tools[SEND].description or ""
-    assert "Nothing is sent until the person confirms" in description
+    assert description.startswith("The first call never sends: ")
 
 
 async def test_a_send_runs_through_check_answer_and_call(

@@ -62,6 +62,20 @@ The session, `api_id` and `api_hash` are three generic-password items of the Key
 `telegram-mcp`. They are written together after a successful login, or not at all. Nothing is
 ever stored on disk in their place.
 
+## Login
+
+`telegram-mcp login` asks, in the terminal only, for `api_id`, `api_hash` (hidden), the phone
+number, the code, and the two-step password (hidden) when the account has one. Every typed
+value is trimmed; the hidden `api_hash` also loses the terminal's bracketed-paste markers and
+any other control or format character before it is checked, because the person cannot see them
+at a hidden prompt.
+
+Before asking for the code, login prints where Telegram sent it (the Telegram app, SMS, a
+call, a flash or missed call, email with the masked address Telegram gives, or Fragment). When
+Telegram offers no other way it says so; when it offers one it says how long to wait and that
+pressing Enter with no code asks for the code that way. An empty code never counts as one of
+the three tries.
+
 ## The broker protocol
 
 JSON-RPC 2.0, one UTF-8 JSON message per line, over `broker.sock`.
@@ -97,7 +111,7 @@ sequenceDiagram
     C->>H: tg_messages_send(chat, text)
     H->>B: approval.check
     B-->>H: ask, "[tg-<id>] Send this message to «Alice» (user, id 101)?\n<text>"
-    H-->>C: deny: ask this question with AskUserQuestion, then call again
+    H-->>C: deny: not sent yet, ask this question with AskUserQuestion, then call again
     C->>P: question box: Allow / Deny
     P-->>C: Allow
     C->>H: (after the box) the recorded pick
@@ -110,8 +124,10 @@ sequenceDiagram
     B->>B: use the approval once, send the stored text to the stored chat
 ```
 
-Text version: the first call is stopped by the pre hook with the exact question. Claude shows
-it in the question box. The post hook relays the person's pick. The broker confirms the
+Text version: the first call is stopped by the pre hook with the exact question; the deny
+reason opens with "Not sent yet: this is the confirmation step.", and the send tool's
+description says up front that the first call never sends, so Claude reads the stop as a step
+rather than a failure. Claude shows the question in the question box. The post hook relays the person's pick. The broker confirms the
 approval only if the question text, the option labels `Allow` and `Deny` in that order, their
 descriptions and single choice all equal what it prepared, and the pick is exactly `Allow`.
 When Claude calls the tool again, the broker uses that confirmed approval once and sends what
@@ -143,6 +159,14 @@ Rules that make this hold:
 - **Chat names cannot pose as text.** The chat name in the question has line breaks, control,
   format and separator characters replaced by spaces, « and » replaced by quotes, and is cut to
   64 characters. The resolved id is always shown beside it. The message text is shown in full.
+- **Your own chat is named plainly.** The gateway reads the account's own id once per
+  connection and marks only that chat `saved_messages`, named "Saved Messages"; its question
+  reads `Send this message to your Saved Messages (id <id>)?`. A chat merely titled "Saved
+  Messages" is not marked and is shown by its title and id. When the own id cannot be read, no
+  chat is marked.
+- **The log never holds a secret.** The broker reads the vault, and gives the redactor the
+  stored session and `api_hash`, before it writes any entry carrying the caller's text, also
+  for the first call after a login made while it was running.
 - **Text from Telegram is marked.** Results that carry chat names or message text list those
   fields in `telegram_content_fields` with a notice that they are data, not instructions.
 
