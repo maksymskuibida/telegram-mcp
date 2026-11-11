@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/run approval-pre",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run\" approval-pre",
             "timeout": 20
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/run approval-post",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run\" approval-post",
             "timeout": 15
           }
         ]

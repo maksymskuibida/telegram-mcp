@@ -64,14 +64,14 @@ def test_the_two_approval_hooks_run_through_the_launcher_with_their_timeouts() -
     assert pre["hooks"] == [
         {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/run approval-pre",
+            "command": '"${CLAUDE_PLUGIN_ROOT}/hooks/run" approval-pre',
             "timeout": 20,
         }
     ]
     assert post["hooks"] == [
         {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/run approval-post",
+            "command": '"${CLAUDE_PLUGIN_ROOT}/hooks/run" approval-post',
             "timeout": 15,
         }
     ]
@@ -83,5 +83,6 @@ def test_no_other_hook_is_registered_yet() -> None:
     hooks = load("hooks/hooks.json")["hooks"]
     assert set(hooks) == {"PreToolUse", "PostToolUse"}
     commands = [h["command"] for entries in hooks.values() for e in entries for h in e["hooks"]]
-    assert all(command.startswith("${CLAUDE_PLUGIN_ROOT}/hooks/run ") for command in commands)
+    # The plugin path is quoted, so a folder name with a space cannot split the command.
+    assert all(command.startswith('"${CLAUDE_PLUGIN_ROOT}/hooks/run" ') for command in commands)
     assert not any(command.endswith(" guard") for command in commands)
