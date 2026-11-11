@@ -1,0 +1,33 @@
+#!/bin/sh
+# Runs one telegram-mcp hook for Claude Code and passes its JSON answer through.
+#
+# Whenever the hook cannot give a valid answer (uvx is missing, the command fails to start,
+# crashes, exits non-zero or prints no JSON) this script says why on standard error and exits
+# 2, which Claude Code treats as a block. It runs exactly the versions in constraints.txt.
+
+set -u
+
+name="${1:-}"
+
+fail() {
+    printf 'telegram-mcp hook %s: %s\n' "$name" "$1" >&2
+    exit 2
+}
+
+[ -n "$name" ] || fail "no hook name was given"
+
+root="${CLAUDE_PLUGIN_ROOT:-}"
+if [ -z "$root" ]; then
+    root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd) || fail "cannot find the plugin folder"
+fi
+
+command -v uvx >/dev/null 2>&1 || fail "uvx was not found; install uv from https://docs.astral.sh/uv/"
+
+output=$(uvx --quiet --constraints "$root/constraints.txt" --from "$root" telegram-mcp hook "$name") \
+    || fail "the hook command failed (exit status $?)"
+
+compact=$(printf '%s' "$output" | tr -d ' \t\r\n')
+case "$compact" in
+    '{'*'}') printf '%s\n' "$output" ;;
+    *) fail "the hook printed no JSON answer" ;;
+esac
