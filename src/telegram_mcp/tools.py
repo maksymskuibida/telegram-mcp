@@ -112,9 +112,7 @@ def _reject_unknown(tool: str, raw: Mapping[str, Any], known: Sequence[str]) -> 
 
 
 def _whole_number(name: str, value: object, minimum: int | None = None) -> int:
-    if isinstance(value, bool) or isinstance(value, float):
-        raise InvalidArguments(f"{name} must be a whole number")
-    if not isinstance(value, int):
+    if isinstance(value, bool | float) or not isinstance(value, int):
         raise InvalidArguments(f"{name} must be a whole number")
     if minimum is not None and value < minimum:
         raise InvalidArguments(f"{name} must be at least {minimum}")

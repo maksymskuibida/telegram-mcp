@@ -183,10 +183,10 @@ def test_the_full_4096_character_text_is_kept(gate: ConsentGate) -> None:
     ("title", "shown"),
     [
         ("Bob\n(user, id 1)", "Bob (user, id 1)"),
-        ("Ev‮il", "Ev il"),
-        ("Zero‍Width", "Zero Width"),
-        ("«Bank» official", '"Bank" official'),
-        ("Line Para End", "Line Para End"),
+        ("Ev" + chr(0x202E) + "il", "Ev il"),
+        ("Zero" + chr(0x200D) + "Width", "Zero Width"),
+        (chr(0xAB) + "Bank" + chr(0xBB) + " official", '"Bank" official'),
+        ("Line" + chr(0x2028) + "Para" + chr(0x2029) + "End", "Line Para End"),
         ("Tab\there\x00", "Tab here "),
     ],
 )
