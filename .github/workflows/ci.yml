@@ -20,12 +20,12 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out the full history (the secret scan reads every commit)
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           version: "0.12.23"
           python-version: "3.12"
