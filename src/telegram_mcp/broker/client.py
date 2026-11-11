@@ -251,10 +251,17 @@ class BrokerClient:
             self._spawn()
         deadline = time.monotonic() + self.timeouts.start
         while time.monotonic() < deadline:
-            if self._paths.socket.exists() and self._paths.secret.exists():
-                return
-            if probe_lock(self._paths.lock) is LockProbe.LOGIN:
+            probe = probe_lock(self._paths.lock)
+            if probe is LockProbe.LOGIN:
                 raise BrokerUnavailable("login_in_progress", LOGIN_IN_PROGRESS)
+            # A socket and secret left by a broker that died are stale: only a held lock
+            # says a live broker owns them.
+            if (
+                probe is LockProbe.RUNNING
+                and self._paths.socket.exists()
+                and self._paths.secret.exists()
+            ):
+                return
             await asyncio.sleep(POLL_SECONDS)
 
     def _drop(self) -> None:

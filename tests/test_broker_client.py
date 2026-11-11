@@ -67,6 +67,44 @@ async def test_a_free_lock_makes_the_client_start_a_broker(
             await broker.stop()
 
 
+async def test_a_socket_left_by_a_dead_broker_is_not_taken_as_live(
+    paths: FixedPaths, fake_gateway: FakeGateway
+) -> None:
+    # A killed broker leaves broker.sock and broker.secret behind with its lock free.
+    save_fake_session()
+    paths.data_dir.mkdir(parents=True, mode=0o700)
+    paths.socket.write_text("")
+    paths.secret.write_text("stale")
+    started: list[Broker] = []
+
+    def spawn() -> None:
+        broker = make_broker(paths, fake_gateway)
+        started.append(broker)
+        asyncio.get_running_loop().create_task(broker.start())
+
+    client = BrokerClient(paths, "mcp-server", client_name="claude-code", spawn=spawn)
+    try:
+        result = await client.tool_call("tg_chats_list", {})
+        assert result["ok"] is True
+        assert len(started) == 1
+    finally:
+        await client.close()
+        for broker in started:
+            await broker.stop()
+
+
+def test_the_fake_gateway_switch_needs_a_real_temporary_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from telegram_mcp.broker.server import FAKE_GATEWAY_ENV, default_gateway_factory
+
+    monkeypatch.setenv(FAKE_GATEWAY_ENV, "1")
+    escaping = FixedPaths.from_home(Path("/tmp/../Users/nobody"))
+    factory = default_gateway_factory(escaping)
+    gateway = factory("", 1, "0" * 32)
+    assert type(gateway).__name__ == "TelethonGateway"
+
+
 async def test_a_running_lock_makes_the_client_wait_for_the_socket(
     paths: FixedPaths, fake_gateway: FakeGateway
 ) -> None:

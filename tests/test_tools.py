@@ -119,3 +119,10 @@ def test_arguments_must_be_an_object_for_a_known_tool() -> None:
         validate_args(MESSAGES_SEND, ["chat", 1])
     with pytest.raises(InvalidArguments, match="not a tool"):
         validate_args("tg_unknown", {})
+
+
+def test_a_reply_and_a_topic_together_are_refused() -> None:
+    # Telegram takes one reply target per message; the question must say where it lands.
+    with pytest.raises(InvalidArguments, match="reply_to or topic_id, not both"):
+        validate_args(MESSAGES_SEND, {"chat": 1, "text": "hi", "reply_to": 5, "topic_id": 7})
+    assert validate_args(MESSAGES_SEND, {"chat": 1, "text": "hi", "topic_id": 7})["topic_id"] == 7

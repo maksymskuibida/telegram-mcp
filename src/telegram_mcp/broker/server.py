@@ -721,8 +721,8 @@ def _require_private_modes(paths: FixedPaths) -> None:
 def default_gateway_factory(paths: FixedPaths) -> GatewayFactory:
     """The real gateway, or, only for a test run whose home folder is under /tmp, a fake one
     described by ``fake-gateway.json`` in that home folder."""
-    if os.environ.get(FAKE_GATEWAY_ENV) == "1" and str(paths.home).startswith(
-        ("/tmp/", "/private/tmp/")  # noqa: S108 - test runs only, never a real home folder
+    if os.environ.get(FAKE_GATEWAY_ENV) == "1" and os.path.realpath(paths.home).startswith(
+        "/private/tmp/"  # test runs only: the resolved home must be a temporary folder
     ):
         from telegram_mcp.gateway.fake import FAKE_CONFIG_NAME, FakeGateway
 

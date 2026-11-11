@@ -147,11 +147,19 @@ def _validate_send(raw: Mapping[str, Any]) -> dict[str, Any]:
     text = raw.get("text")
     if not isinstance(text, str) or not 1 <= len(text) <= TEXT_LIMIT:
         raise InvalidArguments(f"text must be 1 to {TEXT_LIMIT} characters")
+    reply_to = _optional_positive("reply_to", raw)
+    topic_id = _optional_positive("topic_id", raw)
+    if reply_to is not None and topic_id is not None:
+        # Telegram takes one reply target per message; a reply already lands in the topic of
+        # the message it answers, so accepting both could send somewhere the question did not say.
+        raise InvalidArguments(
+            "give reply_to or topic_id, not both: a reply lands in its message's topic"
+        )
     return {
         "chat": parse_chat_id(raw.get("chat")),
         "text": text,
-        "reply_to": _optional_positive("reply_to", raw),
-        "topic_id": _optional_positive("topic_id", raw),
+        "reply_to": reply_to,
+        "topic_id": topic_id,
     }
 
 

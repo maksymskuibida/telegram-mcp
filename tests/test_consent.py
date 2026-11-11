@@ -320,12 +320,22 @@ def test_a_pending_approval_cannot_be_consumed(gate: ConsentGate) -> None:
 
 
 def test_consume_returns_what_was_stored_at_check_time(gate: ConsentGate) -> None:
-    prepared = ask(gate, chat=TEAM, text="the text", reply_to=3, topic_id=4)
+    prepared = ask(gate, chat=TEAM, text="the text", reply_to=3)
     answer(gate, prepared)
     used = gate.consume(SEND, prepared.approval.args_digest)
     assert used is not None
-    assert (used.chat_id, used.content, used.reply_to, used.topic_id) == (TEAM.id, "the text", 3, 4)
+    assert (used.chat_id, used.content, used.reply_to, used.topic_id) == (
+        TEAM.id,
+        "the text",
+        3,
+        None,
+    )
     assert (used.chat_name, used.chat_type) == ("Team", "supergroup")
+    in_topic = ask(gate, chat=TEAM, text="in a topic", topic_id=4)
+    answer(gate, in_topic)
+    used_in_topic = gate.consume(SEND, in_topic.approval.args_digest)
+    assert used_in_topic is not None
+    assert (used_in_topic.reply_to, used_in_topic.topic_id) == (None, 4)
 
 
 # BR3.7, BR3.8 --------------------------------------------------------------------------------
