@@ -5,6 +5,7 @@ over a real Unix socket with the fake gateway."""
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
@@ -20,6 +21,8 @@ from telegram_mcp.broker.server import Broker
 from telegram_mcp.gateway.fake import FakeGateway
 from telegram_mcp.gateway.models import (
     ChatNotFound,
+    FloodWait,
+    GatewayTimeout,
     NotAuthorized,
     OutcomeUnknown,
     TelegramError,
@@ -446,3 +449,173 @@ async def test_an_unanswered_approval_expires_and_is_logged_timed_out(
     assert await relay(approval_hook, asked["question"]) == "unknown"
     entries = paths.log.read_text().splitlines()
     assert any('"decision":"timed_out"' in entry for entry in entries)
+
+
+# Added after Green: every remaining branch of the approval path ---------------------------
+
+
+async def test_a_confirmed_approval_that_expires_is_logged_unused(
+    start_broker: Callable[..., Any],
+    paths: FixedPaths,
+    clock: FakeClock,
+    logged_in: StoredSession,
+) -> None:
+    broker = await start_broker(sweep_interval=0.01)
+    approval_id = await confirm(paths)
+    clock.advance(121)
+    for _ in range(100):
+        if approval_id in paths.log.read_text() and '"event":"result"' in paths.log.read_text():
+            break
+        await asyncio.sleep(0.01)
+    results = [line for line in paths.log.read_text().splitlines() if '"event":"result"' in line]
+    assert any(approval_id in line and '"result":"timed_out"' in line for line in results)
+    assert broker.gate.open_count() == 0
+
+
+@pytest.mark.usefixtures("logged_in")
+async def test_the_open_approval_cap_is_answered_as_a_refusal(
+    start_broker: Callable[..., Any], paths: FixedPaths
+) -> None:
+    await start_broker()
+    approval_hook = await hook(paths)
+    for number in range(100):
+        assert (await check(approval_hook, {**SEND_ARGS, "text": f"n{number}"}))[
+            "decision"
+        ] == "ask"
+    refused = await check(approval_hook, {**SEND_ARGS, "text": "one too many"})
+    assert (refused["decision"], refused["code"]) == ("refuse", "telegram_error")
+
+
+@pytest.mark.parametrize(
+    ("script", "code"),
+    [
+        (GatewayTimeout(), "telegram_timeout"),
+        (FloodWait(42), "flood_wait"),
+    ],
+)
+@pytest.mark.usefixtures("logged_in")
+async def test_a_slow_or_throttled_chat_lookup_refuses(
+    start_broker: Callable[..., Any],
+    paths: FixedPaths,
+    fake_gateway: FakeGateway,
+    script: Exception,
+    code: str,
+) -> None:
+    await start_broker()
+    fake_gateway.script("resolve_chat", error=script)  # type: ignore[arg-type]
+    refused = await check(await hook(paths))
+    assert (refused["decision"], refused["code"]) == ("refuse", code)
+
+
+@pytest.mark.usefixtures("logged_in")
+async def test_malformed_calls_and_unknown_tools_are_answered(
+    start_broker: Callable[..., Any], paths: FixedPaths
+) -> None:
+    await start_broker()
+    server = await RawClient.connect(paths)
+    no_name = await server.result("tool.call", {"tool": 7, "args": {}})
+    assert no_name["error"]["code"] == "invalid_arguments"
+    unknown = await server.result("tool.call", {"tool": "tg_mystery_delete", "args": {}})
+    assert unknown["error"]["code"] == "not_found"
+    approval_hook = await hook(paths)
+    garbled = await approval_hook.result(
+        "approval.answer", {"question": "[tg-aaaaaaaaaa] x", "options": "Allow", "pick": "Allow"}
+    )
+    assert garbled == {"outcome": "unknown"}
+
+
+@pytest.mark.parametrize("method", ["approval.check", "approval.answer", "tool.call"])
+@pytest.mark.usefixtures("logged_in")
+async def test_an_unexpected_error_inside_the_broker_refuses(
+    start_broker: Callable[..., Any],
+    paths: FixedPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+) -> None:
+    broker = await start_broker()
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("unexpected")
+
+    for name in ("check", "answer", "consume"):
+        monkeypatch.setattr(broker.gate, name, explode)
+    approval_hook = await hook(paths)
+    params: dict[str, Any] = {"tool": SEND, "args": SEND_ARGS}
+    if method == "approval.answer":
+        params = {
+            "question": "[tg-aaaaaaaaaa] q",
+            "options": ["Allow", "Deny"],
+            "pick": "Allow",
+            "option_descriptions": DESCRIPTIONS,
+            "multi_select": False,
+        }
+    client = approval_hook if method != "tool.call" else await RawClient.connect(paths)
+    answer = await client.result(method, params)
+    expected: dict[str, Any] = {
+        "approval.check": {"decision": "refuse", "code": "telegram_error"},
+        "approval.answer": {"outcome": "unknown"},
+        "tool.call": {"ok": False},
+    }[method]
+    assert expected.items() <= answer.items()
+    assert "RuntimeError" in paths.diagnostics.read_text()
+
+
+@pytest.mark.parametrize(
+    ("script", "code", "retry_after"),
+    [
+        (GatewayTimeout(), "telegram_timeout", None),
+        (FloodWait(30), "flood_wait", 30),
+        (NotAuthorized(), "no_session", None),
+        (RuntimeError("bug"), "telegram_error", None),
+    ],
+)
+@pytest.mark.usefixtures("logged_in")
+async def test_read_failures_are_mapped_to_their_codes(
+    start_broker: Callable[..., Any],
+    paths: FixedPaths,
+    fake_gateway: FakeGateway,
+    script: Exception,
+    code: str,
+    retry_after: int | None,
+) -> None:
+    await start_broker()
+    fake_gateway.script("list_chats", error=script)  # type: ignore[arg-type]
+    server = await RawClient.connect(paths)
+    failed = await server.result("tool.call", {"tool": "tg_chats_list", "args": {}})
+    assert failed["error"]["code"] == code
+    assert failed["error"].get("retry_after") == retry_after
+
+
+@pytest.mark.parametrize(
+    ("script", "code"),
+    [
+        (ChatNotFound(), "not_found"),
+        (RuntimeError("bug"), "outcome_unknown"),
+        (FloodWait(5), "flood_wait"),
+    ],
+)
+async def test_send_failures_after_consuming_are_mapped_and_never_resent(
+    start_broker: Callable[..., Any],
+    paths: FixedPaths,
+    fake_gateway: FakeGateway,
+    logged_in: StoredSession,
+    script: Exception,
+    code: str,
+) -> None:
+    await start_broker()
+    await confirm(paths)
+    fake_gateway.script("send_text", error=script)  # type: ignore[arg-type]
+    server = await RawClient.connect(paths)
+    assert (await call(server))["error"]["code"] == code
+    assert (await call(server))["error"]["code"] == "needs_confirmation"
+
+
+@pytest.mark.usefixtures("logged_in")
+async def test_an_overlong_line_closes_the_connection(
+    start_broker: Callable[..., Any], paths: FixedPaths
+) -> None:
+    await start_broker()
+    server = await RawClient.connect(paths)
+    server.writer.write(b"x" * (2**20 + 10))
+    await server.writer.drain()
+    assert await asyncio.wait_for(server.reader.read(), 5) == b""

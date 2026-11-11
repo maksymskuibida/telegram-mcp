@@ -246,3 +246,16 @@ def test_the_hook_command_starts_the_broker_and_prints_one_json_answer(home: Pat
     post = post_input([box(QUESTION)], {QUESTION: "Allow"})
     assert run_hook("approval-post", FixedPaths.from_home(home), io.StringIO(post), post_out) == 0
     assert json.loads(post_out.getvalue()) == {}
+
+
+async def test_an_unprefixed_tool_name_is_used_as_given() -> None:
+    broker = StubBroker({"decision": "allow"})
+    await approval_pre(pre_input(tool_name="tg_messages_send"), broker)
+    assert broker.checks == [("tg_messages_send", ARGS)]
+
+
+@pytest.mark.parametrize("raw", ["[]", "5", json.dumps({"tool_response": "x"})])
+async def test_a_post_payload_that_is_not_an_object_relays_nothing(raw: str) -> None:
+    broker = StubBroker()
+    assert await approval_post(raw, broker) == {}
+    assert broker.answers == []

@@ -392,3 +392,19 @@ def test_an_unknown_write_kind_is_refused_at_check(gate: ConsentGate) -> None:
     decision = gate.check("tg_unknown_tool", canonical_digest("tg_unknown_tool", args), ALICE, args)
     assert isinstance(decision, Refuse)
     assert decision.code == "not_found"
+
+
+def test_the_digest_refuses_floats_inside_lists() -> None:
+    with pytest.raises(DigestError):
+        canonical_digest(SEND, {"ids": [1, (2, 3.0)]})
+    assert canonical_digest(SEND, {"ids": [1, (2, 3)]}) == canonical_digest(
+        SEND, {"ids": [1, [2, 3]]}
+    )
+
+
+def test_a_colliding_id_is_drawn_again(gate: ConsentGate, monkeypatch: pytest.MonkeyPatch) -> None:
+    first = ask(gate).approval
+    draws = iter([first.id, "bbbbbbbbbb"])
+    monkeypatch.setattr("telegram_mcp.consent._new_id", lambda: next(draws))
+    second = ask(gate, text="another message").approval
+    assert second.id == "bbbbbbbbbb"
