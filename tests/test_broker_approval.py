@@ -180,19 +180,18 @@ async def test_a_vault_failure_stops_before_any_telegram_call_or_approval(
     assert broker.gate.open_count() == 0
 
 
-async def test_a_confirmed_approval_survives_a_vault_failure_unused(
+async def test_a_confirmed_approval_survives_a_session_failure_unused(
     start_broker: Callable[..., Any],
     paths: FixedPaths,
     fake_gateway: FakeGateway,
-    memory_keyring: MemoryKeyring,
     logged_in: StoredSession,
 ) -> None:
     await start_broker()
     await confirm(paths)
     server = await RawClient.connect(paths)
-    memory_keyring.locked = True
-    assert (await call(server))["error"]["code"] == "keychain_locked"
-    memory_keyring.locked = False
+    fake_gateway.authorized = False
+    assert (await call(server))["error"]["code"] == "no_session"
+    fake_gateway.authorized = True
     bad = await call(server, {**SEND_ARGS, "approval_id": "x"})
     assert bad["error"]["code"] == "invalid_arguments"
     assert fake_gateway.sent == []

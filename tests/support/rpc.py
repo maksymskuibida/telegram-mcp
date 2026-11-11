@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from itertools import count
 from typing import Any
@@ -64,7 +65,5 @@ class RawClient:
 
     async def close(self) -> None:
         self.writer.close()
-        try:
+        with contextlib.suppress(ConnectionError, OSError):
             await self.writer.wait_closed()
-        except (ConnectionError, OSError):
-            pass
