@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "A local MCP server that lets Claude Code use your own Telegram account, asking you before every action that changes anything."
 readme = "README.md"
 requires-python = ">=3.12"
-license = "MIT"
 dependencies = [
     "telethon==1.45.0",
     "mcp==2.3.0",

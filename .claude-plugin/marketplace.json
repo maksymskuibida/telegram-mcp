@@ -1,0 +1,11 @@
+{
+  "name": "telegram-mcp",
+  "owner": { "name": "maksymskuibida" },
+  "plugins": [
+    {
+      "name": "telegram-mcp",
+      "source": "./",
+      "description": "Use your own Telegram account from Claude Code, confirming every message sent."
+    }
+  ]
+}
