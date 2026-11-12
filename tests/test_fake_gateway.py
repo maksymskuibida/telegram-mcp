@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,9 @@ from telegram_mcp.gateway.models import (
     NotAuthorized,
     OutcomeUnknown,
     PasswordNeeded,
+    QrExpired,
     SentCodeInfo,
+    TelegramError,
 )
 
 
@@ -187,3 +190,64 @@ async def test_a_real_delay_holds_the_call_and_the_file_form_reads_it(home: Path
     started = time.monotonic()
     await fake.list_chats(None, 50, None)
     assert time.monotonic() - started < 0.1
+
+
+# QR login and log-out ---------------------------------------------------------------------
+
+
+async def test_qr_tokens_are_handed_out_in_order_with_their_expiry() -> None:
+    now = datetime(2026, 11, 12, 10, 0, tzinfo=UTC)
+    fake = FakeGateway(authorized=False, qr_tokens=["tg://login?token=AAAA"], clock=lambda: now)
+    first = await fake.sign_in_qr()
+    second = await fake.sign_in_qr()
+    assert first.url == "tg://login?token=AAAA"
+    assert second.url.startswith("tg://login?token=FAKE")
+    assert first.expires_at == now + timedelta(seconds=30)
+    assert "AAAA" not in repr(first)
+    assert fake.call_names() == ["sign_in_qr", "sign_in_qr"]
+
+
+async def test_an_unscanned_wait_expires_and_lets_time_pass() -> None:
+    waited: list[float] = []
+    fake = FakeGateway(authorized=False, qr_scan_on_wait=3, qr_time_passes=waited.append)
+    for timeout in (30.0, 12.5):
+        with pytest.raises(QrExpired):
+            await fake.wait_qr(timeout)
+    assert waited == [30.0, 12.5]
+    assert await fake.wait_qr(30.0) == fake.account
+    assert fake.authorized
+    assert ("wait_qr", {"timeout_seconds": 12.5}) in fake.calls
+
+
+async def test_nobody_scans_when_no_scan_is_scripted() -> None:
+    fake = FakeGateway(authorized=False)
+    with pytest.raises(QrExpired):
+        await fake.wait_qr(1.0)
+    assert not fake.authorized
+
+
+async def test_a_scan_on_an_account_with_a_password_asks_for_it() -> None:
+    fake = FakeGateway(authorized=False, password="pw", qr_scan_on_wait=1)
+    with pytest.raises(PasswordNeeded):
+        await fake.wait_qr(30.0)
+    assert not fake.authorized
+    assert await fake.sign_in_password("pw") == fake.account
+
+
+async def test_qr_calls_and_log_out_can_be_scripted_to_fail() -> None:
+    fake = FakeGateway()
+    fake.script("sign_in_qr", error=FloodWait(42))
+    fake.script("log_out", error=TelegramError("AUTH_KEY_UNREGISTERED"))
+    with pytest.raises(FloodWait):
+        await fake.sign_in_qr()
+    with pytest.raises(TelegramError):
+        await fake.log_out()
+    assert fake.authorized
+
+
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_log_out_returns_its_scripted_result(confirmed: bool) -> None:
+    fake = FakeGateway(log_out_result=confirmed)
+    assert await fake.log_out() is confirmed
+    assert fake.authorized is not confirmed
+    assert fake.call_names() == ["log_out"]
