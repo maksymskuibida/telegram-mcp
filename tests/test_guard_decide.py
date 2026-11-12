@@ -11,6 +11,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ import pytest
 from support.guard_home import DATA_FILES, WATCHED_TOOLS, GuardHome, make_guard_home
 from telegram_mcp import guard
 from telegram_mcp.guard import GuardDecision, Route, decide, rules, run_guard
+from test_guard_shell_rules import SPEC_EXAMPLES
 
 GUARD_SOURCE = Path(guard.__file__).parent
 PREFIX = "telegram-mcp guard: refused "
@@ -579,3 +581,42 @@ def test_the_guard_hook_loads_no_heavy_module(gh: GuardHome) -> None:
     assert result.stdout.strip() == "{}"
     report = json.loads(result.stderr.strip().splitlines()[-1])
     assert report == {"code": 0, "heavy": []}
+
+
+# NFR11.1, BR6.1: a decision averages under 5 ms; no example line takes over 50 ms
+
+TIMED_COMMANDS = [command for command, _route in SPEC_EXAMPLES] + [
+    "git status && git diff --stat",
+    "ls -la src tests docs",
+    "uv run --directory telegram-mcp pytest -q",
+    "find ~ -name '*.log' -newer README.md",
+]
+RUNS = 100
+MEAN_LIMIT = 0.005
+SLOWEST_LIMIT = 0.050
+
+
+def measure(gh: GuardHome) -> tuple[float, float]:
+    """The mean decision in wall-clock time, and the slowest run of any line in this thread's
+    CPU time: on a busy machine a single run can wait for the CPU far longer than the guard
+    works, and that wait is not the guard's cost."""
+    calls = [gh.call("Bash", command=gh.fill(c)) for c in TIMED_COMMANDS]
+    calls.append(gh.call("Read", file_path=str(gh.paths.log)))
+    calls.append(gh.call("Glob", pattern="**/*.py", path=str(gh.home)))
+    slowest = [0.0] * len(calls)
+    total = 0.0
+    for _ in range(RUNS):
+        for index, call in enumerate(calls):
+            started, cpu_started = time.perf_counter(), time.thread_time()
+            gh.decide(call)
+            total += time.perf_counter() - started
+            slowest[index] = max(slowest[index], time.thread_time() - cpu_started)
+    return total / (RUNS * len(calls)), max(slowest)
+
+
+def test_deciding_is_fast_enough_for_every_call(gh: GuardHome) -> None:
+    mean, slowest = measure(gh)
+    if mean >= MEAN_LIMIT or slowest >= SLOWEST_LIMIT:
+        mean, slowest = measure(gh)  # one retry of the whole test absorbs CI noise
+    assert mean < MEAN_LIMIT, f"mean {mean * 1000:.2f} ms"
+    assert slowest < SLOWEST_LIMIT, f"slowest {slowest * 1000:.2f} ms"
