@@ -231,11 +231,20 @@ def _not_started(reason: str) -> str:
 
 
 def run_logout(paths: FixedPaths, terminal: Terminal, yes: bool) -> int:
-    return asyncio.run(_with_client(paths, lambda c: logout(paths, terminal, yes=yes, client=c)))
+    try:
+        return asyncio.run(
+            _with_client(paths, lambda c: logout(paths, terminal, yes=yes, client=c))
+        )
+    except KeyboardInterrupt:  # the logout may already have been sent
+        terminal.say(LOGOUT_UNKNOWN)
+        return EXIT_FAILED
 
 
 def run_status(paths: FixedPaths, terminal: Terminal) -> int:
-    return asyncio.run(_with_client(paths, lambda c: status(paths, terminal, client=c)))
+    try:
+        return asyncio.run(_with_client(paths, lambda c: status(paths, terminal, client=c)))
+    except KeyboardInterrupt:
+        return EXIT_FAILED
 
 
 async def _with_client(paths: FixedPaths, command: Any) -> int:
