@@ -134,7 +134,9 @@ async def test_the_alternative_paths_never_send(home: Path, path: str) -> None:
         args = {**args, "text": args["text"] + " (changed)"}
     async with claude_code_session() as session:
         result = await session.call_tool(SEND, args)
-    assert payload(result)["code"] == "needs_confirmation"
+    # U2 BR12.4: for 60 s after a Deny (an empty answer is one) the same call is told so.
+    expected = "declined" if path in ("deny", "no answer") else "needs_confirmation"
+    assert payload(result)["code"] == expected
     asked_again = await hook("approval-pre", pre_hook_input(args))
     assert asked_again["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert sent_texts(home) == []
@@ -159,6 +161,6 @@ async def test_an_unanswered_question_expires_after_120_seconds(home: Path) -> N
         async with Client(build_server(paths, spawn=no_spawn), client_info=CLAUDE) as client:
             result = await client.call_tool(SEND, args)
         await hook_client.close()
-    assert payload(result)["code"] == "needs_confirmation"
+    assert payload(result)["code"] == "timed_out"  # U2 BR12.4: remembered for 60 s
     assert gateway.sent == []
     assert '"decision":"timed_out"' in paths.log.read_text()

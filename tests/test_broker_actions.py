@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 from support.rpc import RawClient
-from support.samples import ALICE, FORUM, fake_secrets
+from support.samples import FORUM, fake_secrets
 from support.standins import (
     MARK_TOOL,
     READ_TOOL,
@@ -218,7 +218,7 @@ async def test_an_unknown_tool_is_not_found(
     assert (await call(await server(paths), "tg_mystery", {}))["error"]["code"] == "not_found"
 
 
-# BR11.7, NFR2.2: a describer that fails refuses -----------------------------------------------------
+# BR11.7, NFR2.2: a describer that fails refuses -------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -279,7 +279,7 @@ async def test_message_text_with_instructions_changes_no_approval_state(
     assert "record_write" not in fake.call_names()
 
 
-# BR12.4, NFR3.6: repeat calls ----------------------------------------------------------------------
+# BR12.4, NFR3.6: repeat calls -------------------------------------------------------------------
 
 
 async def test_after_a_deny_check_and_call_are_refused_declined(
@@ -310,7 +310,7 @@ async def test_after_a_timeout_check_and_call_are_refused_timed_out(
     assert (await call(await server(paths), LEAVE, LEAVE_ARGS))["error"]["code"] == "timed_out"
 
 
-# BR12.5, NFR3.4: ask_again --------------------------------------------------------------------------
+# BR12.5, NFR3.4: ask_again ----------------------------------------------------------------------
 
 
 async def test_ask_again_reopens_the_question_with_the_same_digest(
@@ -338,7 +338,7 @@ async def test_ask_again_must_be_a_boolean(
     assert refused["code"] == "invalid_arguments"
 
 
-# Marking: BR13.2 to BR13.7 -------------------------------------------------------------------------
+# Marking: BR13.2 to BR13.7 ----------------------------------------------------------------------
 
 
 def unread_messages(fake: FakeGateway, count: int, chat: int = 101) -> list[int]:
@@ -439,7 +439,7 @@ async def test_a_failed_unread_check_refuses_and_marks_nothing(
 async def test_a_hanging_unread_check_refuses_within_the_budget(
     start_broker: Callable[..., Any], paths: FixedPaths, fake: FakeGateway
 ) -> None:
-    await start_broker(check_budget=0.3, telegram_timeout=0.3)
+    await start_broker(check_budget=0.3, call_limit=0.3)
     fake.script("unread_state", hang=True, times=None)
     started = time.monotonic()
     refused = await check(await hook(paths), MARK_TOOL, {"chat": 101})
@@ -492,7 +492,7 @@ async def test_a_long_flood_wait_on_mark_read_is_returned(
 async def test_a_hanging_mark_read_is_outcome_unknown_and_never_resent(
     start_broker: Callable[..., Any], paths: FixedPaths, fake: FakeGateway
 ) -> None:
-    await start_broker(telegram_timeout=0.2)
+    await start_broker(call_limit=0.2)
     unread_messages(fake, 1)
     await confirm(paths, MARK_TOOL, {"chat": 101})
     fake.script("mark_read", hang=True)
@@ -517,7 +517,7 @@ async def test_a_declined_mark_is_refused_declined(
     assert fake.read_acknowledgements() == []
 
 
-# The read tool asked to mark (BR13.3, BR13.7) ------------------------------------------------------
+# The read tool asked to mark (BR13.3, BR13.7) ---------------------------------------------------
 
 
 async def test_the_read_tool_marks_up_to_the_lower_of_returned_and_counted(
@@ -625,7 +625,7 @@ async def test_no_read_path_call_acknowledges_reading(
     assert fake.read_acknowledgements() == []
 
 
-# BR15.1: logging --------------------------------------------------------------------------------------
+# BR15.1: logging --------------------------------------------------------------------------------
 
 
 async def test_a_prompt_that_cannot_be_logged_refuses_and_prepares_nothing(

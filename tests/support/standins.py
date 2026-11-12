@@ -108,9 +108,9 @@ def validator(tool: str, schema: Mapping[str, tuple[type, bool]]) -> Any:
             if name in ("chat", "from_chat"):
                 args[name] = parse_chat_id(value)
                 continue
-            if isinstance(value, bool) and kind is not bool or not isinstance(value, kind):
+            if (isinstance(value, bool) and kind is not bool) or not isinstance(value, kind):
                 raise InvalidArguments(f"{name} has the wrong type")
-            args[name] = list(value) if kind is list else value
+            args[name] = list(value) if isinstance(value, list) else value
         if tool == "tg_admins_set":
             try:
                 args["rights"] = normalize_rights(args["rights"])
@@ -238,7 +238,7 @@ def read_action() -> ConsentAction:
     base_validate = validator(READ_TOOL, schema)
 
     def validate(raw: object) -> dict[str, Any]:
-        args = base_validate(raw)
+        args: dict[str, Any] = base_validate(raw)
         args["limit"] = args["limit"] or 20
         args["mark_read"] = bool(args["mark_read"])
         return args

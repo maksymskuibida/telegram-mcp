@@ -232,6 +232,11 @@ class ConsentGate:
             return ActionKind.MARK
         return decl.kind
 
+    def row_refusal(self, tool: str) -> Refuse | None:
+        """The refusal for a write or mark with no kind table row, or None (BR10.1)."""
+        row = self._kind_row(tool)
+        return row if isinstance(row, Refuse) else None
+
     def _kind_row(self, tool: str) -> str | Refuse:
         """The kind table row a write or mark runs through; none refuses (BR10.1)."""
         decl = self._decls.get(tool)
@@ -517,9 +522,9 @@ class ConsentGate:
     def drop_open(self) -> list[PendingApproval]:
         """Expire every open approval now (logout): none can be confirmed or used any more.
         They are returned, and the next ``sweep`` reports each with the status it had."""
-        dropped = [a for a in self._approvals.values() if _is_open(a)]
+        dropped = [a for a in self._store.approvals.values() if _is_open(a)]
         for approval in dropped:
-            self._newly_expired.append((approval, approval.status))
+            self._store.newly_expired.append((approval, approval.status))
             approval.status = ApprovalStatus.EXPIRED
         return dropped
 

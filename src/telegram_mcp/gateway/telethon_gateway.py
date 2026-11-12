@@ -35,6 +35,8 @@ from telegram_mcp.gateway.models import (
     SentCodeInfo,
     SentMessage,
     TelegramError,
+    TopicNotFound,
+    UnreadState,
     decode_cursor,
     encode_cursor,
     mark_saved_messages,
@@ -242,6 +244,61 @@ class TelethonGateway:
             write=True,
         )
         return SentMessage(id=int(message.id), chat_id=chat_id, date=message.date)
+
+    async def _input_peer(self, chat_id: int) -> Any:
+        try:
+            return await self._call(lambda: self._client.get_input_entity(chat_id))
+        except ValueError as error:
+            raise ChatNotFound() from error
+
+    async def unread_state(self, chat_id: int, topic_id: int | None) -> UnreadState:
+        """The dialog's unread count and top message, or the topic's (BR14.1). Neither request
+        acknowledges reading."""
+        peer = await self._input_peer(chat_id)
+        if topic_id is None:
+            request: Any = functions.messages.GetPeerDialogsRequest(
+                peers=[types.InputDialogPeer(peer=peer)]
+            )
+            result = await self._call(lambda: self._client(request))
+            dialogs = list(getattr(result, "dialogs", []) or [])
+            if not dialogs:
+                raise ChatNotFound()
+            found: Any = dialogs[0]
+        else:
+            request = functions.messages.GetForumTopicsByIDRequest(peer=peer, topics=[topic_id])
+            result = await self._call(lambda: self._client(request))
+            topics = [
+                topic
+                for topic in getattr(result, "topics", []) or []
+                if isinstance(topic, types.ForumTopic) and topic.id == topic_id
+            ]
+            if not topics:
+                raise TopicNotFound()
+            found = topics[0]
+        title = str(found.title) if topic_id is not None else None
+        return UnreadState(
+            unread=int(found.unread_count or 0),
+            newest_id=int(found.top_message or 0),
+            topic_title=title,
+        )
+
+    async def mark_read(self, chat_id: int, max_id: int, topic_id: int | None) -> None:
+        """Read history up to ``max_id`` for the chat, or the topic's read request. Never the
+        separate requests that clear all mentions or reactions (BR13.9). A timeout is
+        ``OutcomeUnknown`` and is never retried here (BR14.2)."""
+        peer = await self._input_peer(chat_id)
+        request: Any
+        if topic_id is not None:
+            request = functions.messages.ReadDiscussionRequest(
+                peer=peer, msg_id=topic_id, read_max_id=max_id
+            )
+        elif isinstance(peer, types.InputPeerChannel):
+            request = functions.channels.ReadHistoryRequest(
+                channel=utils.get_input_channel(peer), max_id=max_id
+            )
+        else:
+            request = functions.messages.ReadHistoryRequest(peer=peer, max_id=max_id)
+        await self._call(lambda: self._client(request), write=True)
 
 
 _SENT_TYPES: tuple[tuple[type[Any], CodeDelivery], ...] = (
