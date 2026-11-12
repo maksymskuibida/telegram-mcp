@@ -11,13 +11,23 @@ from typing import Any
 
 import pytest
 
-from support.brokers import subprocess_brokers
-from support.flows import question_from
-from telegram_mcp.broker.client import BrokerUnavailable, RequestLost
-from telegram_mcp.hooks import approval_post, approval_pre, run_hook
+from support.brokers import running_broker, save_fake_session, subprocess_brokers
+from support.flows import descriptions_from, post_hook_input, pre_hook_input, question_from
+from support.standins import SAMPLE_ARGS, seeded_fake, stand_in_registry
+from telegram_mcp.broker.client import BrokerClient, BrokerUnavailable, RequestLost
+from telegram_mcp.consent import canonical_digest
+from telegram_mcp.gateway.fake import FakeGateway
+from telegram_mcp.hooks import approval_post, approval_pre, ask_reason, run_hook
 from telegram_mcp.paths import FixedPaths
+from telegram_mcp.prompts import KINDS
 
 __all__ = ["subprocess_brokers"]
+
+
+@pytest.fixture
+def logged_in_session() -> None:
+    save_fake_session()
+
 
 PREFIXED = "mcp__plugin_telegram-mcp_telegram__tg_messages_send"
 ARGS = {"chat": 101, "text": "hi"}
@@ -87,7 +97,7 @@ async def test_ask_denies_with_the_exact_question_options_and_descriptions() -> 
     verdict, reason = decision(output)
     assert verdict == "deny"
     assert reason == (
-        "Not sent yet: this is the confirmation step. "
+        "Not done yet: this is the confirmation step. "
         "Ask the person with AskUserQuestion, exactly: question "
         + json.dumps(QUESTION, ensure_ascii=False)
         + '; options Allow (description "Send it") and Deny (description "Do not send"), '
@@ -98,7 +108,7 @@ async def test_ask_denies_with_the_exact_question_options_and_descriptions() -> 
 async def test_the_deny_reason_starts_with_the_confirmation_step_and_carries_the_question() -> None:
     _, reason = decision(await approval_pre(pre_input(), StubBroker(ASK)))
     assert reason is not None
-    assert reason.startswith("Not sent yet: this is the confirmation step. ")
+    assert reason.startswith("Not done yet: this is the confirmation step. ")
     assert question_from(await approval_pre(pre_input(), StubBroker(ASK))) == QUESTION
 
 
@@ -268,3 +278,70 @@ async def test_a_post_payload_that_is_not_an_object_relays_nothing(raw: str) -> 
     broker = StubBroker()
     assert await approval_post(raw, broker) == {}
     assert broker.answers == []
+
+
+# U2 BR11.8, NFR3.5: the hook dictates the descriptions the broker stored ------------------------
+
+KIND_PAIRS = sorted(
+    {(tool, spec.descriptions_for(tool)) for spec in KINDS.values() for tool in spec.tools}
+)
+
+
+@pytest.mark.parametrize(("tool", "pair"), KIND_PAIRS)
+async def test_each_kinds_descriptions_go_from_the_ask_result_into_the_deny_reason(
+    tool: str, pair: tuple[str, str]
+) -> None:
+    asked = {**ASK, "option_descriptions": list(pair)}
+    output = await approval_pre(pre_input(tool_name=f"mcp__p__{tool}"), StubBroker(asked))
+    verdict, reason = decision(output)
+    assert verdict == "deny"
+    assert reason is not None
+    assert reason.startswith("Not done yet: this is the confirmation step. ")
+    assert descriptions_from(output) == pair
+    assert question_from(output) == QUESTION
+
+
+@pytest.mark.parametrize("descriptions", [None, [], ["only one"], ["a", 2], "Send it"])
+async def test_an_ask_without_two_descriptions_is_denied_as_a_failure(descriptions: Any) -> None:
+    asked = {**ASK, "option_descriptions": descriptions}
+    verdict, reason = decision(await approval_pre(pre_input(), StubBroker(asked)))
+    assert verdict == "deny"
+    assert reason is not None
+    assert "was not run" in reason
+
+
+def test_the_deny_reason_names_nothing_per_kind() -> None:
+    reason = ask_reason("[tg-abcdefghij] Q", ("Delete them", "Do not delete"))
+    assert "Send it" not in reason
+    assert "Not sent yet" not in reason
+    assert 'Allow (description "Delete them") and Deny (description "Do not delete")' in reason
+
+
+@pytest.mark.usefixtures("logged_in_session")
+async def test_a_delete_is_confirmed_only_with_its_own_pair_through_the_hooks(
+    home: Path, fake_gateway: FakeGateway
+) -> None:
+    paths = FixedPaths.from_home(home)
+    seeded_fake(fake_gateway)
+    tool, args = "tg_messages_delete", SAMPLE_ARGS["tg_messages_delete"]
+
+    def no_spawn() -> None:
+        pytest.fail("the broker runs in this process")
+
+    async with running_broker(paths, fake_gateway, registry=stand_in_registry()) as broker:
+        hook_client = BrokerClient(paths, "approval-hook", spawn=no_spawn)
+        asked = await approval_pre(pre_hook_input(args, tool), hook_client)
+        question, pair = question_from(asked), descriptions_from(asked)
+        assert pair == ("Delete them", "Do not delete")
+        # Shown with the send pair, the box confirms nothing.
+        await approval_post(post_hook_input(question, "Allow"), hook_client)
+        assert broker.gate.consume(tool, _digest_of(broker, tool, args)) is None
+        await approval_post(post_hook_input(question, "Allow", pair), hook_client)
+        allowed = await approval_pre(pre_hook_input(args, tool), hook_client)
+        await hook_client.close()
+    assert decision(allowed) == ("allow", None)
+
+
+def _digest_of(broker: Any, tool: str, args: dict[str, Any]) -> str:
+    action = broker.registry.get(tool)
+    return canonical_digest(tool, action.validate(args))

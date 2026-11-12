@@ -32,6 +32,20 @@ SEND_FIRST_CALL = (
     "Allow."
 )
 
+# FR3.3, BR12.5: every write and mark tool accepts ask_again and says what it is for in these
+# words; the broker removes it before the digest, so it never changes what is approved.
+ASK_AGAIN = "ask_again"
+ASK_AGAIN_SENTENCE = (
+    "After the person declined or did not answer, a repeat call is refused for 60 s; set "
+    "ask_again to true only when the person has asked in the chat to try again, and the "
+    "question is shown again (it never approves anything itself)."
+)
+ASK_AGAIN_PROPERTY: dict[str, Any] = {
+    "type": "boolean",
+    "default": False,
+    "description": "Only when the person has asked in the chat to try again.",
+}
+
 DECLS: dict[str, ActionDecl] = {
     CHATS_LIST: ActionDecl(tool=CHATS_LIST, kind=ActionKind.READ),
     MESSAGES_SEND: ActionDecl(tool=MESSAGES_SEND, kind=ActionKind.WRITE, write_kind="send"),
@@ -80,7 +94,8 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         name=MESSAGES_SEND,
         description=(
             f"{SEND_FIRST_CALL} Sends one text message to a chat named by its id "
-            "(tg_chats_list shows the ids); give reply_to or topic_id, not both."
+            "(tg_chats_list shows the ids); give reply_to or topic_id, not both. "
+            f"{ASK_AGAIN_SENTENCE}"
         ),
         input_schema={
             "type": "object",
@@ -92,6 +107,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                 "text": {"type": "string", "minLength": 1, "maxLength": TEXT_LIMIT},
                 "reply_to": {**_POSITIVE_INT, "description": "Message id to reply to."},
                 "topic_id": {**_POSITIVE_INT, "description": "Forum topic to post in."},
+                ASK_AGAIN: ASK_AGAIN_PROPERTY,
             },
             "required": ["chat", "text"],
             "additionalProperties": False,

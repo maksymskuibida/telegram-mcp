@@ -63,6 +63,17 @@ class SentMessage:
 
 
 @dataclass(frozen=True)
+class UnreadState:
+    """The unread check before a mark (C3 unread_state): Telegram's unread count for the chat,
+    or for one forum topic, and the id of its newest message."""
+
+    unread: int
+    newest_id: int
+    topic_title: str | None = None
+    """The topic's title when a topic was asked for, so the question can name it."""
+
+
+@dataclass(frozen=True)
 class Me:
     """The logged-in account, as login prints it."""
 
@@ -116,6 +127,10 @@ class TelegramError(GatewayError):
 
 class ChatNotFound(GatewayError):
     """The account cannot see a chat with that id."""
+
+
+class TopicNotFound(GatewayError):
+    """The forum has no topic with that id."""
 
 
 class BadCode(GatewayError):

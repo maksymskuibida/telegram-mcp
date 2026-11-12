@@ -45,7 +45,9 @@ else.
 | Broker secret | `broker/secret.py` | Writes the secret file whole and swaps it in one step. |
 | Broker client | `broker/client.py` | How the other processes reach the broker: connects, starts a broker when none runs, retries once only when the request was never written. |
 | Lock | `broker/lock.py` | Makes sure at most one broker (or one login) runs. |
-| ConsentGate | `consent.py` | Decides which actions need confirmation, prepares the exact question, matches the pick, and lets each confirmed approval run once. |
+| ConsentGate | `consent.py` | Decides which actions need confirmation, prepares the exact question, matches the pick, lets each confirmed approval run once, and remembers a Deny or a timeout for 60 s. |
+| Question text | `prompts.py` | The closed table of action kinds and the one renderer that turns typed fields into a question and its two descriptions. |
+| Action registry | `actions.py` | What the broker runs for each tool: validation, the describer that fills a question's fields, and the Telegram call. |
 | Tool catalog | `tools.py` | Tool declarations, closed argument schemas, validation, result shapes. |
 | Telegram gateway | `gateway/` | The interface to Telegram, its Telethon implementation (the only module importing Telethon) and an in-memory fake for tests. |
 | Session vault | `vault.py` | The session, `api_id` and `api_hash` in the macOS Keychain only. |
@@ -258,7 +260,7 @@ sequenceDiagram
 ```
 
 Text version: the first call is stopped by the pre hook with the exact question; the deny
-reason opens with "Not sent yet: this is the confirmation step.", and the send tool's
+reason opens with "Not done yet: this is the confirmation step.", and the send tool's
 description says up front that the first call never sends, so Claude reads the stop as a step
 rather than a failure. Claude shows the question in the question box. The post hook relays the person's pick. The broker confirms the
 approval only if the question text, the option labels `Allow` and `Deny` in that order, their
@@ -276,17 +278,20 @@ Rules that make this hold:
   Code only); vault and session (`no_session`, `keychain_locked`); the tool's kind (a tool with
   no declaration counts as a write); argument validation and the digest; the Telegram
   connection; then either the chat lookup and the question (`approval.check`), or room in the
-  write line, the single use of a confirmed approval and the send (`tool.call`). The first step
+  write line, the single use of a confirmed approval and the Telegram call (`tool.call`). The first step
   that fails decides the answer, and later steps do not run. No Telegram call and no approval
   change happens without a valid session.
-- **Single use.** An approval is used at the moment its send enters the write line. A refusal
+- **Single use.** An approval is used at the moment its write enters the write line. A refusal
   before that (not logged in, Keychain locked, Telegram unreachable, the line full, the call
   entry not logged) keeps it confirmed until it expires, so the same call works once the cause
   is gone. After that, whatever happens (dropped unsent, flood wait, timeout, sent), the
-  approval is spent and the send is never made again; a new send needs a new confirmation
+  approval is spent and the write is never made again; a new write needs a new confirmation
   (`outcome_unknown` when it is not known whether Telegram got it).
-- **Expiry.** An approval expires 120 s after it is prepared, whether answered or not. A sweep
-  runs every 5 s and logs it.
+- **Expiry.** An unanswered question expires 120 s after it is prepared; an Allow must be used
+  within 60 s of the pick. A sweep runs every 5 s and logs both.
+- **Repeat calls.** For 60 s after a Deny or a timeout the same call is refused `declined` or
+  `timed_out`; `ask_again: true` reopens the question at most twice in 10 minutes and never
+  approves anything. [Confirmation rules](confirmation-rules.md) has every rule and question.
 - **Fail closed.** Any error on the approval path refuses. The pre hook denies on every
   failure, and the launcher `hooks/run` exits 2 (a block) whenever the hook cannot print a
   valid answer.
@@ -306,6 +311,29 @@ Rules that make this hold:
   for the first call after a login made while it was running.
 - **Text from Telegram is marked.** Results that carry chat names or message text list those
   fields in `telegram_content_fields` with a notice that they are data, not instructions.
+
+## Actions and the question text
+
+The broker is built with an `ActionRegistry` (`actions.py`). Each registered `ConsentAction`
+has the tool's declaration (read, write or mark, and for a write its kind), a `validate`
+function for its closed schema, and for a write a `describe` function and a `run` function:
+
+- `describe(gateway, args)` reads what the question needs from Telegram (the chat, the
+  messages acted on, the current value of what changes) and returns `PromptFields`. It runs
+  inside the 10 s check budget; any failure refuses and prepares nothing. It never writes text.
+- `render_question` (`prompts.py`) is the only place question text is made. It picks the kind's
+  row in the closed table, checks the fields the kind needs, makes hidden characters visible,
+  and refuses rather than cuts.
+- `run(gateway, approval, args)` makes the Telegram call with the values stored on the approval.
+
+A mark has no describer or run: the broker checks unread state with the gateway's
+`unread_state`, asks, and calls `mark_read` up to the newest message counted. A read tool with
+a `mark_read` option also gives `newest_returned`, so the mark never passes what it returned.
+
+New tools plug in by registering an action; the order of the checks, the question, the
+confirmation, the repeat-call memory and the log stay in the broker. The approval hook copies
+the question and both descriptions from the broker's answer, so nothing in it depends on the
+kind.
 
 Plugin MCP tools are named `mcp__plugin_<plugin>_<server>__<tool>` by Claude Code; the hook
 matcher is `mcp__plugin_telegram-mcp_telegram__tg_messages_send` and the hook strips the

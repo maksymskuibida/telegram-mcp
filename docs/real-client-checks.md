@@ -26,6 +26,8 @@ person, sending must not be treated as safe.
 | 13 | Warm and cold start of `hooks/run guard` with `{}` on standard input, against the 10 s timeout | | | | | **Not verified.** Check 3 measured another hook: 0.44 to 0.47 s warm, 4.86 s with an empty uv cache. |
 | 14 | Ordinary shell and file calls still show the person's usual permission prompts (the guard passes with `{}`, never an allow), in the default and acceptEdits modes | | | | | **Not verified.** |
 | 15 | The hook's `HOME`, `PWD` and `TMPDIR` equal those of Claude's shell, since the guard expands variables a command does not set from its own environment | | | | | **Not verified.** Until it is, the guard assumes they are equal. |
+| 16 | A question at the 20,000-character cap is shown whole in the question box (the terminal and the desktop app), with no part cut or folded away; if it is cut, the cap must be lowered | | | | | **Not verified.** |
+
 ## Manual smoke test (before each release)
 
 On your own account, in a real Claude Code session with the plugin installed:
@@ -44,3 +46,8 @@ On your own account, in a real Claude Code session with the plugin installed:
 4. Ask again, pick **Allow**, and check exactly one message arrives.
 5. Read `~/Library/Application Support/telegram-mcp/activity.log` and check the call, the
    question, both decisions and the result are there, with no session or api_hash in it.
+6. Right after a Deny, ask Claude to send the same message again: it must be told `declined`
+   with no new question. Then say in the chat that it may try again: the question appears again.
+7. With a chat that has unread messages, check it twice through the real gateway's unread
+   check and mark (once the mark tool exists): the question names the right count, and after
+   Allow only the messages counted are read in the Telegram app.

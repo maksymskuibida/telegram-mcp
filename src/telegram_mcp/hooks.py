@@ -16,7 +16,7 @@ from telegram_mcp.paths import FixedPaths
 
 TG_PREFIX = "[tg-"
 NOT_RUN = "it was not run"
-CONFIRMATION_STEP = "Not sent yet: this is the confirmation step."
+CONFIRMATION_STEP = "Not done yet: this is the confirmation step."
 
 
 class ApprovalBroker(Protocol):
@@ -36,17 +36,26 @@ def _deny(problem: str) -> dict[str, Any]:
     return _pre_answer("deny", f"telegram-mcp could not check this call ({problem}), so {NOT_RUN}.")
 
 
-def ask_reason(question: str) -> str:
-    """The deny reason that dictates the question box (C6, NFR3.1). The question is given as
-    a JSON string so that its line break and quotes reach the box exactly. It opens by saying
+def ask_reason(question: str, descriptions: tuple[str, str]) -> str:
+    """The deny reason that dictates the question box (C6, NFR3.1). The question and the two
+    descriptions are copied from the broker's ask result, never fixed here (BR11.8), and given
+    as JSON strings so that line breaks and quotes reach the box exactly. It opens by saying
     this is a step, not a failure (BR4.1, BR5.2)."""
+    allow, deny = (json.dumps(text, ensure_ascii=False) for text in descriptions)
     return (
         CONFIRMATION_STEP
         + " Ask the person with AskUserQuestion, exactly: question "
         + json.dumps(question, ensure_ascii=False)
-        + '; options Allow (description "Send it") and Deny (description "Do not send"), '
+        + f"; options Allow (description {allow}) and Deny (description {deny}), "
         "in that order, multiSelect false; then call the tool again with the same arguments."
     )
+
+
+def _descriptions(answer: dict[str, Any]) -> tuple[str, str] | None:
+    value = answer.get("option_descriptions")
+    if isinstance(value, list) and len(value) == 2 and all(isinstance(v, str) for v in value):
+        return value[0], value[1]
+    return None
 
 
 def strip_prefix(tool_name: str) -> str:
@@ -81,8 +90,9 @@ def _decision_from(answer: Any) -> dict[str, Any]:
     decision = answer.get("decision")
     if decision == "allow":
         return _pre_answer("allow")
-    if decision == "ask" and isinstance(answer.get("question"), str):
-        return _pre_answer("deny", ask_reason(answer["question"]))
+    descriptions = _descriptions(answer)
+    if decision == "ask" and isinstance(answer.get("question"), str) and descriptions:
+        return _pre_answer("deny", ask_reason(answer["question"], descriptions))
     code, message = answer.get("code"), answer.get("message")
     if decision == "refuse" and isinstance(code, str) and isinstance(message, str):
         return _pre_answer("deny", f"{code}: {message}")

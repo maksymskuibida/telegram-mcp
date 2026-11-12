@@ -1,11 +1,19 @@
-"""The TelegramGateway interface. Each feature adds its calls here and to the fake."""
+"""The TelegramGateway interface. Each feature adds its calls here and to the fake (U2 adds
+the unread check and the mark)."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Protocol
 
-from telegram_mcp.gateway.models import ChatRef, Me, QrToken, SentCodeInfo, SentMessage
+from telegram_mcp.gateway.models import (
+    ChatRef,
+    Me,
+    QrToken,
+    SentCodeInfo,
+    SentMessage,
+    UnreadState,
+)
 
 
 class TelegramGateway(Protocol):
@@ -55,6 +63,14 @@ class TelegramGateway(Protocol):
     async def send_text(
         self, chat_id: int, text: str, reply_to: int | None, topic_id: int | None
     ) -> SentMessage: ...
+
+    async def unread_state(self, chat_id: int, topic_id: int | None) -> UnreadState:
+        """The unread count and newest message id of a chat, or of one forum topic; raises
+        ``TopicNotFound`` for a topic the forum does not have (BR14.1). Marks nothing."""
+
+    async def mark_read(self, chat_id: int, max_id: int, topic_id: int | None) -> None:
+        """Mark the chat, or one forum topic, read up to ``max_id`` and nothing beyond it, with
+        Telegram's read-history requests only (BR13.9, BR14.2)."""
 
 
 GatewayFactory = Callable[[str, int, str], TelegramGateway]
