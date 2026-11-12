@@ -65,6 +65,40 @@ name cannot pose as another chat or as the question's own text.
 A question longer than **20,000 characters** is refused, not cut; Claude is told to split the
 call into smaller ones.
 
+## What each tool checks before asking
+
+These are refused before any question, so you are never asked about something that cannot run:
+
+| Tool | Refused before the question |
+|---|---|
+| `tg_messages_edit` | A message that is not your own (`not_allowed`); text outside 1 to 4,096 characters, or equal to the current text (`invalid_arguments`). |
+| `tg_messages_delete`, `tg_messages_forward` | No ids, more than 20, or one named twice (`invalid_arguments`); an id not in the chat (`not_found`). |
+| `tg_messages_react` | An emoji longer than 16 characters. |
+| `tg_topics_create` | A chat that is not a forum; a title outside 1 to 128 characters. |
+| `tg_chats_create` | A type other than `group` or `channel`; a title outside 1 to 128 characters; more than 20 members, a member named twice, yourself as a member, a user the account cannot see, or members for a channel. |
+| `tg_chats_join` | Anything other than `@name`, `name`, `t.me/name`, `t.me/+hash` or `t.me/joinchat/hash`; a public chat you are already in; a username that is a person. |
+| `tg_chats_leave`, `tg_chats_edit`, `tg_invites_create` | A person's chat or your Saved Messages (only groups and channels). |
+| `tg_chats_edit`, `tg_profile_edit` | Nothing to change; a title, name, bio or username outside its limits (bio and description at most 255 characters, a username 5 to 32 letters, digits or underscores, or empty to remove it). |
+| `tg_invites_create` | An expiry outside 60 s to one year, a usage limit outside 1 to 99,999. |
+| `tg_admins_set` | A chat that is not a supergroup or channel; a right that is not one of the 11. |
+| `tg_files_send`, `photo_path` | A file outside the outbox folder, one of the tool's own files, a missing file, a folder or pipe, an empty file, or a file over 20 MB. |
+
+Whether your account may make a change (an admin right, a channel you do not own) is
+Telegram's to decide: it refuses after your Allow with `telegram_error`, and nothing is retried.
+
+## What runs after Allow
+
+The call runs exactly what the question showed, once: the chat ids, message ids, texts and file
+stored with your answer, never a new lookup. A title or a message that changed in Telegram
+between the question and the run does not change what is done. A join uses the username or
+link you approved. A file send checks the file again and uploads it only if it is the same file
+(same device, inode, size and modification time) you were asked about; otherwise nothing is
+sent and the tool must ask again.
+
+If Telegram asks to wait before a change is sent, the change is not sent and the tool says how
+long to wait; ask again after that. If the connection drops after a change was sent, the tool
+says the outcome is unknown and never sends it twice; look at the chat first.
+
 ## How long an answer is good for
 
 - A question you have not answered expires **120 s** after it was asked.

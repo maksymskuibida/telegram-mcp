@@ -27,6 +27,7 @@ person, sending must not be treated as safe.
 | 14 | Ordinary shell and file calls still show the person's usual permission prompts (the guard passes with `{}`, never an allow), in the default and acceptEdits modes | | | | | **Not verified.** |
 | 15 | The hook's `HOME`, `PWD` and `TMPDIR` equal those of Claude's shell, since the guard expands variables a command does not set from its own environment | | | | | **Not verified.** Until it is, the guard assumes they are equal. |
 | 16 | A question at the 20,000-character cap is shown whole in the question box (the terminal and the desktop app), with no part cut or folded away; if it is cut, the cap must be lowered | | | | | **Not verified.** |
+| 17 | The approval hook's matcher reaches every write, the mark tool and `tg_messages_read` with this plugin's prefix (a write with no hook entry is refused on every call) | | | | | **Not verified in a client.** The matcher is tested against the registry with the expected prefix. |
 
 ## Manual smoke test (before each release)
 
@@ -49,5 +50,37 @@ On your own account, in a real Claude Code session with the plugin installed:
 6. Right after a Deny, ask Claude to send the same message again: it must be told `declined`
    with no new question. Then say in the chat that it may try again: the question appears again.
 7. With a chat that has unread messages, check it twice through the real gateway's unread
-   check and mark (once the mark tool exists): the question names the right count, and after
+   check and mark (`tg_chats_mark_read`): the question names the right count, and after
    Allow only the messages counted are read in the Telegram app.
+
+### The full catalogue
+
+The real gateway's calls for the rest of the catalogue are tested only against a stubbed
+Telethon client. Before a release, on your own account, with a test group and a test channel you
+own, check each of these once (time the reads against the 5 s target, the lookup by title
+against 10 s). After every read, check in the Telegram app that the chat it read is still
+unread.
+
+8. **Reads:** `tg_folders_list` (your custom folders appear after the main list and the
+   archive); `tg_chats_info` on a person, a basic group, a supergroup, a channel and your Saved
+   Messages; `tg_chats_resolve` by an exact title, a title two chats share (candidates, no
+   choice), a partial title, an `@username` and a `t.me/` link; `tg_messages_read` with the
+   default 50, with `before_id` and with a forum `topic_id`; `tg_messages_pinned`;
+   `tg_messages_search` in one chat and across chats; `tg_topics_list`; `tg_members_list`
+   with each filter; `tg_contacts_list` (phone numbers present); `tg_users_info` by id and by
+   username (bio present); `tg_profile_get` (no session or privacy fields).
+9. **Message writes,** each asked once and done once: edit one of your messages, react,
+   pin and unpin, forward two messages, delete one only for you and one for everyone.
+10. **Chat writes:** create a topic in your forum, create a channel and a group with one member,
+    join a public chat by `@username` and a private one by invite link, edit a group's title,
+    description and photo (a picture in the outbox), create an invite link with an expiry and a
+    limit, give a member one admin right, leave the group.
+11. **Profile:** change your bio and back, set a profile photo from the outbox.
+12. **Files:** send a 20 MB file from the outbox (time it: it must finish inside 30 s);
+    replace the file between the question and the second call and check nothing is sent; try
+    a file outside the outbox and a link to `activity.log` in the outbox (both refused).
+13. **Downloads:** download a photo, a video and a file with no name; download the same one
+    twice (the second is `name (1).ext`); a file over 20 MB is refused before downloading.
+14. Read `activity.log`: every call and result is there, a file is named by path, name and
+    size only, a created invite link and a joined invite link show `t.me/+…`, and no session or
+    `api_hash` appears.
