@@ -205,7 +205,7 @@ def test_searches_above_and_ordinary_paths_pass(
     check_passed(gh, command, cwd)
 
 
-# BR2.5 with the plan's refinement 1: undecidable words
+# BR2.5: undecidable words, and relative words after a cd the guard cannot follow
 
 
 @pytest.mark.parametrize(
@@ -408,7 +408,7 @@ def test_ordinary_scripts_pass(gh: GuardHome, command: str) -> None:
     check_passed(gh, command)
 
 
-# BR2.8 with the plan's refinement 2: the tool's own commands in command position
+# BR2.8: the tool's own commands in command position, alone or after a wrapper
 
 REFUSED_OWN_COMMANDS = [
     "telegram-mcp log",

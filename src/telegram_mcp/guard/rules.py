@@ -996,7 +996,8 @@ def _names_a_data_file(word: Word) -> bool:
 
 
 def _check_position(word: Word, command: Command) -> None:
-    """A word used as a file, a program or code (BR2.5, as narrowed by the plan)."""
+    """A word used as a file, a program or code (BR2.5): an unknown value is refused, and so is a
+    relative word after a cd the guard cannot follow when it holds .. or names a data file."""
     if not word.known:
         raise Refusal(Route.UNDECIDABLE, word.render("?"))
     text = word.render()
