@@ -119,5 +119,17 @@ class Resolver:
         self._decided[path] = protected
         return protected
 
+    def holds_data(self, path: str) -> bool:
+        """True when the absolute ``path``, as written or resolved, is the data folder, lies in
+        it, or is a folder holding it: a link to any of these gives a way in."""
+        if self.is_protected(path):
+            return True
+        forms = {posixpath.normpath(path).casefold(), self.resolve(path).casefold()}
+        return any(
+            form == "/" or folder.startswith(form.rstrip("/") + "/")
+            for form in forms
+            for folder in self._folded
+        )
+
 
 _MISSING = "\0missing"

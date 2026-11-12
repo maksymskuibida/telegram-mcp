@@ -577,6 +577,8 @@ def check_command(command: Command, ctx: Context) -> None:
         check_keychain(words[found.index + 1 :])
     check_code(command, found, ctx)
     check_undecidable(command, found)
+    if program == "ln":
+        check_link(command, found, ctx)
     check_paths(command, found, ctx)
     if program == "find":
         _check_find_exec(command, found, ctx)
@@ -976,6 +978,49 @@ def check_undecidable(command: Command, found: Effective) -> None:
         if index in skip or (word.known and word.render().startswith("-")):
             continue
         _check_position(word, command)
+
+
+# ln: a link made now and read later, in this line or the next call
+
+
+def check_link(command: Command, found: Effective, ctx: Context) -> None:
+    """Refuses ``ln`` (symbolic or hard) whose source is the data folder, lies in it, or is a
+    folder holding it. A relative source of a symbolic link is read from the link's folder, so
+    it is checked against that folder and the working folder both."""
+    words = command.words[found.index + 1 :]
+    options = [w.render() for w in words if w.known and w.render().startswith("-")]
+    args = [w for w in words if not (w.known and w.render().startswith("-"))]
+    if not args or not all(w.known for w in args):
+        return  # nothing to link, or an unknown word: refused as undecidable already
+    symbolic = any("s" in option for option in options if not option.startswith("--")) or (
+        "--symbolic" in options
+    )
+    sources = args[:-1] if len(args) > 1 else args
+    folders: list[str | None] = [command.base]
+    if symbolic and len(args) > 1:
+        link = args[-1].render()
+        if link.startswith("/") or command.base is not None:
+            link_path = absolute(link, command.base or "/")
+            folders += [link_path, posixpath.dirname(link_path)]
+    for source in sources:
+        text = source.render()
+        if text.startswith("/"):
+            _check_link_source(text, ctx)
+            continue
+        if command.base is None:
+            raise Refusal(Route.UNDECIDABLE, text)
+        for folder in folders:
+            if folder is not None:
+                _check_link_source(absolute(text, folder), ctx)
+
+
+def _check_link_source(path: str, ctx: Context) -> None:
+    try:
+        reaches = ctx.resolver.holds_data(path)
+    except Unresolvable as error:
+        raise Refusal(Route.DATA_PATH, path) from error
+    if reaches:
+        raise Refusal(Route.DATA_PATH, path)
 
 
 # BR2.3: words resolving into the data folder
