@@ -26,6 +26,7 @@ MAX_RESULTS = 256
 # the 64 KiB input limit needs far less; past this, the line is refused rather than read slowly.
 MAX_WORK = 600_000
 MAX_RANGE_TEXT = 32
+MAX_VALUE = 64 * 1024  # the largest expanded word or variable value, as for the call's texts
 GLOB_CHARS = "*?["
 NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 ASSIGNMENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=")
@@ -1324,6 +1325,13 @@ class _Walker:
             else:
                 for alternative in alternatives:
                     alternative.append(UNKNOWN_PIECE)
+        for alternative in alternatives:
+            # Values can double with each assignment (a1=$a0$a0; a2=$a1$a1; …): every expanded
+            # word or value is bounded, and its size counts against the work budget.
+            size = sum(len(piece.text) for piece in alternative)
+            if size > MAX_VALUE:
+                raise Unparsable("a value grows past 64 KiB")
+            self.state.budget.spend(size)
         return alternatives
 
     def expand_param(self, param: Param, quoted_context: bool) -> Value:
