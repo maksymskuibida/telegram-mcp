@@ -35,6 +35,8 @@ STEPPED_RANGE_RE = re.compile(r"[^.,]+\.\.[^.,]+\.\.[^.,]+")
 META = frozenset(" \t\n;&|()<>")
 OPERATORS = ("&&", "||", "|&", ";;", ";&", ";|", "|", ";", "&")
 OPERATOR_CHARS = frozenset(";&|")
+# Characters no expansion acts on, outside quotes: a word made only of these is kept as it is.
+PLAIN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./:@%+,=!")
 START_KEYWORDS = frozenset({"if", "then", "else", "elif", "do", "while", "until", "{", "!"})
 END_KEYWORDS = frozenset({"fi", "done", "}"})
 REFUSED_KEYWORDS = frozenset({"case", "esac", "select", "coproc", "in"})
@@ -1230,6 +1232,10 @@ class _Walker:
         return _word(alternatives[0])
 
     def expand_word(self, raw: RawWord, mode: str) -> list[Word]:
+        plain = _plain_unquoted(raw)
+        if plain is not None and mode == "word":
+            self.state.budget.spend(len(plain))
+            return [Word((Piece(plain, False),))]
         atoms = _atoms(raw)
         if mode == "heredoc":
             alternatives = self.expand_atoms(atoms, quoted_context=True)
@@ -1397,6 +1403,17 @@ def _split_assignment(raw: RawWord) -> tuple[str, bool, RawWord] | None:
     rest = raw[0].text[match.end() :]
     value: RawWord = ((Lit(rest, False),) if rest else ()) + raw[1:]
     return match.group(1), bool(match.group(2)), value
+
+
+def _plain_unquoted(raw: RawWord) -> str | None:
+    """The text of a word that no expansion can change: one unquoted literal with no brace,
+    tilde or wildcard character and no leading ``=``. Such a word is used as it is."""
+    if len(raw) != 1 or not isinstance(raw[0], Lit) or raw[0].quoted:
+        return None
+    text = raw[0].text
+    if text.startswith("=") or not PLAIN_CHARS.issuperset(text):
+        return None
+    return text
 
 
 def _plain_text(raw: RawWord) -> str | None:
