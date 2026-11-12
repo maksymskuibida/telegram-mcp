@@ -713,3 +713,36 @@ def test_xargs_feeding_the_tool_its_subcommand_is_refused(gh: GuardHome, command
 )
 def test_xargs_with_an_allowed_subcommand_passes(gh: GuardHome, command: str) -> None:
     check_passed(gh, command)
+
+
+# Inline code that runs the tool from a list of quoted words
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 -c \"import subprocess; subprocess.run(['telegram-mcp', 'login'])\"",
+        "python3 -c \"import subprocess; subprocess.call(('telegram-mcp','--verbose','log'))\"",
+        'python3 -c \'import os; os.execvp("telegram-mcp", ["telegram-mcp", "broker"])\'',
+        "node -e \"require('child_process').spawnSync('telegram-mcp', ['serve'])\"",
+        'ruby -e \'system("/usr/local/bin/telegram-mcp", "hook", "guard")\'',
+        "python3 - <<'EOF'\nimport subprocess\n"
+        "subprocess.run([\n  'telegram-mcp',\n  'logout',\n])\nEOF",
+    ],
+)
+def test_inline_code_running_the_tool_from_quoted_words_is_refused(
+    gh: GuardHome, command: str
+) -> None:
+    check_refused(gh, command, Route.OWN_COMMAND)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 -c \"import subprocess; subprocess.run(['telegram-mcp', 'status'])\"",
+        "python3 -c \"names = ['telegram-mcp']; print(names)\"",
+        "node -e \"console.log('telegram-mcp', 'version 0.1')\"",
+    ],
+)
+def test_inline_code_naming_the_tool_otherwise_passes(gh: GuardHome, command: str) -> None:
+    check_passed(gh, command)
