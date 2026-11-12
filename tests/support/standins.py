@@ -245,7 +245,7 @@ def read_action() -> ConsentAction:
 
     async def run(gateway: Any, approval: PendingApproval | None, args: dict[str, Any]) -> Any:
         found = await gateway.read_messages(
-            args["chat"], args["limit"], args["topic_id"], args["before_id"]
+            args["chat"], args["limit"], before_id=args["before_id"], topic_id=args["topic_id"]
         )
         return {"messages": [{"id": m.id, "text": m.text} for m in found]}
 
