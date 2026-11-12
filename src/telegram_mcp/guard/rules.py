@@ -9,6 +9,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
+from functools import lru_cache
 from urllib.parse import unquote, urlsplit
 
 from telegram_mcp.guard import patterns
@@ -490,8 +491,18 @@ def _texts(command: Command) -> list[str]:
 
 
 def _program(word: Word) -> str:
-    name = posixpath.basename(word.render()).casefold()
+    return _program_name(word.render())
+
+
+@lru_cache(maxsize=1024)
+def _program_name(text: str) -> str:
+    name = _base_name(text)
     return "python" if PYTHON_RE.fullmatch(name) else name
+
+
+@lru_cache(maxsize=1024)
+def _base_name(text: str) -> str:
+    return posixpath.basename(text).casefold()
 
 
 @dataclass
@@ -599,7 +610,7 @@ def _check_find_exec(command: Command, found: Effective, ctx: Context) -> None:
 def is_tool_command(word: Word) -> bool:
     if not word.known:
         return False
-    name = posixpath.basename(word.render()).casefold()
+    name = _base_name(word.render())
     return name == COMMAND_NAME or any(
         name.startswith(COMMAND_NAME + mark) for mark in ("@", "==", "[")
     )
@@ -995,5 +1006,5 @@ def _check_shell_glob(word: Word, base: str | None, ctx: Context) -> None:
     if not pattern.startswith("/") and base is None:
         return
     target = absolute(pattern, base or "/")
-    if patterns.can_reach(target, ctx.protected.data_dir):
+    if patterns.can_match(target, ctx.protected.data_dir):
         raise Refusal(Route.DATA_PATH, word.render())

@@ -34,6 +34,7 @@ RANGE_RE = re.compile(r"(-?\d+)\.\.(-?\d+)|([A-Za-z])\.\.([A-Za-z])")
 STEPPED_RANGE_RE = re.compile(r"[^.,]+\.\.[^.,]+\.\.[^.,]+")
 META = frozenset(" \t\n;&|()<>")
 OPERATORS = ("&&", "||", "|&", ";;", ";&", ";|", "|", ";", "&")
+OPERATOR_CHARS = frozenset(";&|")
 START_KEYWORDS = frozenset({"if", "then", "else", "elif", "do", "while", "until", "{", "!"})
 END_KEYWORDS = frozenset({"fi", "done", "}"})
 REFUSED_KEYWORDS = frozenset({"case", "esac", "select", "coproc", "in"})
@@ -435,7 +436,7 @@ class _Parser:
                 nodes.append(node)
 
     def read_operator(self) -> str | None:
-        if self.at("&>"):
+        if self.peek() not in OPERATOR_CHARS or self.at("&>"):
             return None
         for operator in OPERATORS:
             if self.at(operator):

@@ -29,6 +29,40 @@ def _names_something(pattern: str) -> bool:
     return any(char not in "*?" for char in pattern)
 
 
+def can_match(pattern: str, data_dir: str) -> bool:
+    """True when the absolute wildcard ``pattern`` can match ``data_dir`` or a path inside it,
+    with each ``**`` standing for any number of folders, the data folder among them.
+
+    This is the rule for a shell word: the shell expands it to real files, so a ``**`` that
+    crosses the data folder reaches its files. It runs in one pass over the protected parts."""
+    parts = split_parts(pattern)
+    states = _closure({0}, parts)
+    for name in split_parts(data_dir):
+        following: set[int] = set()
+        for index in states:
+            if index < len(parts):
+                if parts[index] == GLOBSTAR:
+                    following.add(index)
+                elif _matches(parts[index], name):
+                    following.add(index + 1)
+        states = _closure(following, parts)
+        if not states:
+            return False
+    return True
+
+
+def _closure(states: set[int], parts: list[str]) -> set[int]:
+    """Adds, for each ``**`` reached, the position after it (a ``**`` may match no folder)."""
+    result = set(states)
+    pending = list(states)
+    while pending:
+        index = pending.pop()
+        if index < len(parts) and parts[index] == GLOBSTAR and index + 1 not in result:
+            result.add(index + 1)
+            pending.append(index + 1)
+    return result
+
+
 def can_reach(pattern: str, data_dir: str) -> bool:
     """True when the absolute wildcard ``pattern`` names its way into ``data_dir``."""
     parts = split_parts(pattern)
