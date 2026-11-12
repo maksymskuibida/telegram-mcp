@@ -1,4 +1,4 @@
-"""The TelegramGateway interface (C3). Each feature adds its calls here and to the fake."""
+"""The TelegramGateway interface. Each feature adds its calls here and to the fake."""
 
 from __future__ import annotations
 

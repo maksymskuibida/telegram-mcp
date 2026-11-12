@@ -1,4 +1,4 @@
-"""`telegram-mcp login [--qr]`: phone or QR-code login into the Keychain (C7).
+"""`telegram-mcp login [--qr]`: phone or QR-code login into the Keychain.
 
 Everything is asked in the terminal only; the api_hash and the two-step password are read
 without echo. A QR login link is shown on the terminal only. Nothing is saved until sign-in

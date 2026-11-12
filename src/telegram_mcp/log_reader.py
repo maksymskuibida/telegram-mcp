@@ -1,4 +1,4 @@
-"""`telegram-mcp log [--lines N] [--follow] [--json]`: print the activity log (C8).
+"""`telegram-mcp log [--lines N] [--follow] [--json]`: print the activity log.
 
 The command reads the fixed files ``activity.log.4`` to ``.1`` and ``activity.log`` directly,
 read-only, line by line: no broker, no Keychain, no Telegram, and nothing is ever written to

@@ -1,5 +1,5 @@
 """`telegram-mcp logout` and `telegram-mcp status`: what the person runs in their terminal to
-end the session or see where it stands (C7).
+end the session or see where it stands.
 
 Both go through the one broker, never around it: logout asks the broker to end the session
 on Telegram and clear the Keychain; status asks the broker, which checks with Telegram. Neither

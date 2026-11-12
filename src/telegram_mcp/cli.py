@@ -1,4 +1,4 @@
-"""The `telegram-mcp` command (C7): login, logout, status, log, serve, broker and hook.
+"""The `telegram-mcp` command: login, logout, status, log, serve, broker and hook.
 
 Every command first makes new files private (umask 077) and checks the platform. Exit codes:
 0 ok, 1 failed with a message, 2 refused (wrong platform, Keychain unavailable, not logged in).
