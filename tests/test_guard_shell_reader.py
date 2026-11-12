@@ -102,9 +102,7 @@ def test_a_dup_to_a_file_name_is_a_redirect_target(environ: dict[str, str], cwd:
 
 
 def test_braces_expand_up_to_256_words(environ: dict[str, str], cwd: Path) -> None:
-    assert words("echo {a,b}{1..3}", environ, cwd) == [
-        ["echo", "a1", "a2", "a3", "b1", "b2", "b3"]
-    ]
+    assert words("echo {a,b}{1..3}", environ, cwd) == [["echo", "a1", "a2", "a3", "b1", "b2", "b3"]]
     (command,) = read("echo {1..256}", environ, cwd)
     assert len(command.words) == 257
 
@@ -122,9 +120,9 @@ def test_more_than_256_brace_results_are_refused(
 
 def test_tilde_forms(environ: dict[str, str], cwd: Path) -> None:
     home = environ["HOME"]
-    assert words('echo ~ ~/x ~+ ~+/y "~" x~ ~tester/z ~nosuchuser', environ | {"USER": "tester"}, cwd) == [
-        ["echo", home, f"{home}/x", str(cwd), f"{cwd}/y", "~", "x~", f"{home}/z", UNKNOWN]
-    ]
+    assert words(
+        'echo ~ ~/x ~+ ~+/y "~" x~ ~tester/z ~nosuchuser', environ | {"USER": "tester"}, cwd
+    ) == [["echo", home, f"{home}/x", str(cwd), f"{cwd}/y", "~", "x~", f"{home}/z", UNKNOWN]]
 
 
 def test_variables_from_the_line_are_applied_in_order(environ: dict[str, str], cwd: Path) -> None:
@@ -145,7 +143,7 @@ def test_variables_from_the_line_are_applied_in_order(environ: dict[str, str], c
 
 
 def test_a_prefix_assignment_holds_only_for_its_command(environ: dict[str, str], cwd: Path) -> None:
-    assert words("A=1 env; echo \"$A\"", environ, cwd) == [["env"], ["echo", UNKNOWN]]
+    assert words('A=1 env; echo "$A"', environ, cwd) == [["env"], ["echo", UNKNOWN]]
 
 
 def test_variables_come_from_the_environment(environ: dict[str, str], cwd: Path) -> None:
@@ -174,7 +172,7 @@ def test_for_lists_set_the_variable_once_per_value(environ: dict[str, str], cwd:
         ["echo", "a"],
         ["echo", "b c"],
     ]
-    assert words("for f; do cat \"$f\"; done", environ, cwd) == [["cat", UNKNOWN]]
+    assert words('for f; do cat "$f"; done', environ, cwd) == [["cat", UNKNOWN]]
 
 
 @pytest.mark.parametrize(
@@ -182,7 +180,7 @@ def test_for_lists_set_the_variable_once_per_value(environ: dict[str, str], cwd:
     [
         ("echo ${NOPE:-dflt} ${NOPE-d2} ${TG_ONE:-x}", ["echo", "dflt", "d2", "single"]),
         ("echo ${NOPE:=set}; echo $NOPE", ["echo", "set"]),
-        ('echo "${TG_EMPTY:-was empty}" "${TG_EMPTY-kept}"', ["echo", "was empty", "kept"]),
+        ('echo "${TG_EMPTY:-was empty}" "${TG_EMPTY-not used}"', ["echo", "was empty", ""]),
         ('echo "${NOPE:-$HOME/x}"', ["echo", "<home>/x"]),
     ],
 )
@@ -357,7 +355,7 @@ def test_a_line_that_cannot_be_read_is_refused(
     "line",
     [
         "echo ${(U)x}",
-        "echo ${(f)\"$(ls)\"}",
+        'echo ${(f)"$(ls)"}',
         "echo ${~x}",
         "echo ${=x}",
         "echo ${^x}",
@@ -444,3 +442,75 @@ def test_the_reader_splits_words_like_zsh_and_bash(
     ours = [w.render() for w in last.words[2:]]
     assert ours == zsh
     assert ours == bash
+
+
+# Less common forms: each is read, or refused, on purpose
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("&>out ls", [["ls"]]),
+        ("(echo a\n)", [["echo", "a"]]),
+        ("for ((i = 0; i < 3; i++)); do echo $i; done", [["echo", UNKNOWN]]),
+        ("[[ a < b || c > d ]]", [["[[", "a", "<", "b", "||", "c", ">", "d", "]]"]]),
+        ("echo a\\", [["echo", "a\\"]]),
+        ("echo a$ b$", [["echo", "a$", "b$"]]),
+        ('echo "a\\qb" "x$" "`pwd`"', [["pwd"], ["echo", "a\\qb", "x$", UNKNOWN]]),
+        ("echo `echo \\`date\\``", [["date"], ["echo", UNKNOWN], ["echo", UNKNOWN]]),
+        ("echo $'\\q' $'\\xZ'", [["echo", "\\q", "\\xZ"]]),
+        ("echo $(( (1 + 2) * 3 ))", [["echo", UNKNOWN]]),
+        ("echo ${1} ${1:-x}", [["echo", UNKNOWN, UNKNOWN]]),
+        (
+            "echo ${NOPE:-a\\b} ${NOPE:-'q'} ${NOPE:-\"r\"} ${NOPE:-`pwd`}",
+            [["pwd"], ["echo", "ab", "q", "r", UNKNOWN]],
+        ),
+        ("echo { {'a'..c}", [["echo", "{", "{a..c}"]]),
+        ("X=a; X+=b; Y+=z; echo $X $Y", [[], [], [], ["echo", "ab", "z"]]),
+        ("cd -- /tmp; pwd", [["cd", "--", "/tmp"], ["pwd"]]),
+        ("echo ~'a'/b", [["echo", "~a/b"]]),
+        ("unset HOME; echo ~", [["unset", "HOME"], ["echo", "<home>"]]),
+        ("cd /tmp; echo ~-", [["cd", "/tmp"], ["echo", "<cwd>"]]),
+        ("cd -; echo ~+", [["cd", "-"], ["echo", UNKNOWN]]),
+        ("cat <<EOF\ncost $ 5\nEOF", [["cat"]]),
+        (
+            "echo ${#$(date)} ${NOPE%${X:-$(whoami)}}",
+            [["date"], ["whoami"], ["echo", UNKNOWN, UNKNOWN]],
+        ),
+    ],
+)
+def test_less_common_forms_are_read(
+    line: str, expected: list[list[str]], environ: dict[str, str], cwd: Path
+) -> None:
+    filled = [
+        [w.replace("<home>", environ["HOME"]).replace("<cwd>", str(cwd)) for w in c]
+        for c in expected
+    ]
+    assert words(line, environ, cwd) == filled
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "( )",
+        "echo $(cat <<EOF)",
+        "(a) (b)",
+        "(a) b",
+        "(a) > out b",
+        "for 1x in a; do :; done",
+        "[[ -n x",
+        "cat <<$X\nx\n$X",
+        "echo $(( $(date) ))",
+        "echo $(( `date` ))",
+        "echo ${.}",
+        "echo {a..C}",
+        "for x in {1..200} {1..200}; do :; done",
+        "for a in {1..20}; do for b in {1..20}; do echo $a$b; done; done",
+        "for a in {1..20}; do for b in $a$a; do :; done; done",
+        "echo > {a,b}",
+        "X=a:~/b",
+    ],
+)
+def test_less_common_forms_are_refused(line: str, environ: dict[str, str], cwd: Path) -> None:
+    with pytest.raises(Unparsable):
+        read(line, environ, cwd)

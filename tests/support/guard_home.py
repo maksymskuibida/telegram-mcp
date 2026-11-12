@@ -78,7 +78,9 @@ class GuardHome:
 
     def fill(self, text: str) -> str:
         """Replaces {home}, {data} and {project} in a test table entry."""
-        return text.format(home=self.home, data=self.data, project=self.project)
+        for key, value in (("home", self.home), ("data", self.data), ("project", self.project)):
+            text = text.replace("{" + key + "}", str(value))
+        return text
 
 
 def make_guard_home(home: Path, configured: bool) -> GuardHome:

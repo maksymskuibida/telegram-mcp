@@ -25,7 +25,7 @@ CORPUS: list[tuple[str, str]] = [
     ("", "'it''s'"),
     ("", "'a'\\''b'"),
     ("", "\\$HOME '$HOME' \"\\$HOME\""),
-    ("", '"a"b\'c\'$\'d\'"e"'),
+    ("", "\"a\"b'c'$'d'\"e\""),
     ("", "\\a\\b\\c"),
     ("", '"\\a\\b"'),
     ("", "a\\\nb"),
@@ -67,7 +67,7 @@ CORPUS: list[tuple[str, str]] = [
     ("", "~"),
     ("", "~/"),
     ("", "\"~\" '~' \\~"),
-    ("", "~/\"quoted dir\"/x"),
+    ("", '~/"quoted dir"/x'),
     ("", "~/a~b"),
     ("", "~/.config/telegram-mcp"),
     ("", "~+"),
@@ -117,7 +117,7 @@ CORPUS: list[tuple[str, str]] = [
     ("X=1; Y=2; ", '$X$Y "$X-$Y" ${X}_${Y}'),
     ("export Z=exported; ", "$Z"),
     ("EMPTY=; ", '$EMPTY kept "$EMPTY"'),
-    ("", '"$HOME"/\'$HOME\'/$HOME'),
+    ("", "\"$HOME\"/'$HOME'/$HOME"),
     ("", '"$TG_TWO" ${TG_ONE} $TG_ONE'),
     ("", '$TG_EMPTY "$TG_EMPTY" x'),
     ("", '"$HOME" "${HOME}" "$HOME"x'),
@@ -140,10 +140,12 @@ def run_bash(prefix: str, words: str, env: Mapping[str, str], cwd: str) -> list[
 
 
 def _run(argv: list[str], env: Mapping[str, str], cwd: str) -> list[str]:
+    # Bytes, not text: text mode would turn a printed \r into \n.
     result = subprocess.run(
-        argv, capture_output=True, text=True, env=dict(env), cwd=cwd, check=False, timeout=10
+        argv, capture_output=True, env=dict(env), cwd=cwd, check=False, timeout=10
     )
+    stdout = result.stdout.decode()
     assert result.returncode == 0, (argv, result.stderr)
-    assert result.stderr == "", (argv, result.stderr)
-    assert result.stdout.endswith("\0"), (argv, result.stdout)
-    return result.stdout[:-1].split("\0")
+    assert result.stderr == b"", (argv, result.stderr)
+    assert stdout.endswith("\0"), (argv, stdout)
+    return stdout[:-1].split("\0")

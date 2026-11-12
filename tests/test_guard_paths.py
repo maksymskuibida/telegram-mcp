@@ -95,9 +95,7 @@ PASSED_FILE_PATHS = [
 
 @pytest.mark.parametrize("tool", [*FILE_TOOLS, "NotebookEdit"])
 @pytest.mark.parametrize(("path", "cwd"), PASSED_FILE_PATHS)
-def test_a_file_tool_elsewhere_passes(
-    gh: GuardHome, tool: str, path: str, cwd: str | None
-) -> None:
+def test_a_file_tool_elsewhere_passes(gh: GuardHome, tool: str, path: str, cwd: str | None) -> None:
     call = file_call(gh, tool, gh.fill(path), None if cwd is None else gh.fill(cwd))
     assert gh.decide(call).verdict == "pass"
 
@@ -159,9 +157,21 @@ REFUSED_SEARCHES: list[tuple[str, dict[str, Any], str | None]] = [
     ("Grep", {"pattern": "token", "path": "{home}/link"}, None),
     ("Grep", {"pattern": "token"}, "{data}"),
     ("Grep", {"pattern": "token", "path": "telegram-mcp"}, "{home}/Library/Application Support"),
-    ("Grep", {"pattern": "x", "path": "{home}", "glob": "**/Application Support/telegram-mcp/*"}, None),
-    ("Grep", {"pattern": "x", "path": "{home}", "glob": "Library/Application Support/telegram-mcp/*"}, None),
-    ("Grep", {"pattern": "x", "path": "{home}", "glob": "**/Application*/telegram-mcp/activity.log"}, None),
+    (
+        "Grep",
+        {"pattern": "x", "path": "{home}", "glob": "**/Application Support/telegram-mcp/*"},
+        None,
+    ),
+    (
+        "Grep",
+        {"pattern": "x", "path": "{home}", "glob": "Library/Application Support/telegram-mcp/*"},
+        None,
+    ),
+    (
+        "Grep",
+        {"pattern": "x", "path": "{home}", "glob": "**/Application*/telegram-mcp/activity.log"},
+        None,
+    ),
     ("Glob", {"pattern": "{data}/*"}, None),
     ("Glob", {"pattern": "~/Library/Application Support/telegram-mcp/*"}, None),
     ("Glob", {"pattern": "**/Application Support/telegram-mcp/*"}, None),
@@ -212,7 +222,8 @@ PASSED_SEARCHES: list[tuple[str, dict[str, Any], str | None]] = [
     ("Glob", {"pattern": "~/Library/Application Support/telegram-mcp-old/*"}, None),
     ("Glob", {"pattern": "*", "path": "{home}"}, None),
     ("Glob", {"pattern": "~/Downloads/telegram-mcp/**"}, None),
-    ("Glob", {"pattern": "**/telegram-mcp/README.md", "path": "{project}"}, None),
+    ("Glob", {"pattern": "telegram-mcp/**/*.py", "path": "{project}"}, None),
+    ("Glob", {"pattern": "**/telegram-mcp/**", "path": "{home}"}, None),
     ("Glob", {"pattern": "*.log"}, "{home}/Library/Application Support"),
 ]
 
@@ -264,3 +275,35 @@ PASSED_URLS = [
 @pytest.mark.parametrize("url", PASSED_URLS)
 def test_other_fetches_pass(gh: GuardHome, url: str) -> None:
     assert gh.decide(gh.call("WebFetch", url=gh.fill(url), prompt="read it")).verdict == "pass"
+
+
+def test_a_file_url_without_a_path_is_refused(gh: GuardHome) -> None:
+    assert gh.decide(gh.call("WebFetch", url="file:", prompt="x")).route == Route.DATA_PATH
+
+
+def test_a_search_pattern_with_too_many_braces_is_refused(gh: GuardHome) -> None:
+    decision = gh.decide(gh.call("Glob", pattern="{a,b}" * 9))
+    assert decision.route == Route.UNPARSABLE
+
+
+def test_braces_without_a_comma_in_a_search_pattern_are_plain_text(gh: GuardHome) -> None:
+    assert gh.decide(gh.call("Glob", pattern="{a}/{b}*")).verdict == "pass"
+
+
+def test_a_path_holding_a_nul_cannot_exist_and_is_decided_by_its_text(gh: GuardHome) -> None:
+    assert gh.decide(gh.call("Read", file_path=f"{gh.project}/a\0b")).verdict == "pass"
+    decision = gh.decide(gh.call("Read", file_path=f"{gh.data}/a\0b"))
+    assert decision.route == Route.DATA_PATH
+
+
+def test_a_link_that_cannot_be_read_is_refused(
+    gh: GuardHome, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unreadable(path: object) -> str:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "readlink", unreadable)
+    decision = gh.decide(gh.call("Read", file_path=str(gh.home / "loglink")))
+    assert decision.route == Route.DATA_PATH
+    decision = gh.decide(gh.call("Read", file_path=str(gh.project / "README.md")))
+    assert decision.verdict == "pass"

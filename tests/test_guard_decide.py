@@ -10,7 +10,6 @@ import os
 import re
 import socket
 import subprocess
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -358,7 +357,7 @@ def snapshot(folder: Path) -> dict[str, tuple[int, int, int]]:
 
 
 @pytest.fixture
-def no_side_effects(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+def no_side_effects(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     attempts: list[str] = []
 
     def refuse(name: str) -> Any:
@@ -375,7 +374,7 @@ def no_side_effects(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
     monkeypatch.setattr(subprocess, "run", refuse("subprocess.run"))
     monkeypatch.setattr(subprocess, "Popen", refuse("subprocess.Popen"))
     monkeypatch.setattr(socket, "socket", refuse("socket"))
-    yield attempts
+    return attempts
 
 
 SIDE_EFFECT_COMMANDS = [
@@ -385,7 +384,7 @@ SIDE_EFFECT_COMMANDS = [
     "ls -la ~/Downloads",
     "telegram-mcp status",
     "curl https://example.com",
-    'git commit -m "$(cat <<\'EOF\'\nA message\nEOF\n)"',
+    "git commit -m \"$(cat <<'EOF'\nA message\nEOF\n)\"",
 ]
 
 
