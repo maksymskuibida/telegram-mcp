@@ -559,3 +559,53 @@ def test_less_common_forms_are_refused(gh: GuardHome, command: str, route: Route
 )
 def test_less_common_forms_pass(gh: GuardHome, command: str) -> None:
     check_passed(gh, command)
+
+
+# Percent-encoded file: URLs and text are decoded before they are checked
+
+ENCODED = "{home}/Library/Application%20Support/telegram-mcp/config.toml"
+
+
+@pytest.mark.parametrize(
+    ("command", "route"),
+    [
+        (f"curl file://{ENCODED}", Route.DATA_TEXT),
+        (f"curl -s 'file://{ENCODED}'", Route.DATA_TEXT),
+        (f'wget "file://{ENCODED}"', Route.DATA_TEXT),
+        (f"open file://{ENCODED}", Route.DATA_TEXT),
+        (
+            "sqlite3 'file:{home}/Library/Application%20Support/telegram-mcp/x.db?mode=ro'",
+            Route.DATA_TEXT,
+        ),
+        (
+            "curl file://{home}/Library%2FApplication%20Support%2Ftelegram-mcp%2Factivity.log",
+            Route.DATA_TEXT,
+        ),
+        ("curl file://{home}/Library/Application%2520Support/telegram-mcp/x", Route.DATA_TEXT),
+        ("curl FILE://{home}/link/config.toml", Route.DATA_PATH),
+        ("curl file://{home}/lin%6B/config.toml", Route.DATA_PATH),
+        (
+            'python3 -c "import urllib.request as u; '
+            f"print(u.urlopen('file://{ENCODED}').read())\"",
+            Route.DATA_TEXT,
+        ),
+        ("echo broker%2Esecret", Route.DATA_TEXT),
+    ],
+)
+def test_percent_encoded_paths_into_the_data_folder_are_refused(
+    gh: GuardHome, command: str, route: Route
+) -> None:
+    check_refused(gh, command, route)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl https://example.com/a%20b",
+        "curl file://{project}/README%2Emd",
+        "printf '%s %d\\n' a 1",
+        "date +%Y-%m-%d",
+    ],
+)
+def test_other_percent_signs_pass(gh: GuardHome, command: str) -> None:
+    check_passed(gh, command)
