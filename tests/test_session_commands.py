@@ -271,7 +271,15 @@ async def test_yes_flag_skips_the_question(
     client = in_process(paths, fake_gateway, brokers)
     assert await run_logout(paths, script, client, yes=True) == 0
     assert script.prompts == []
-    assert "is_authorized" not in fake_gateway.call_names()
+    # Only the logout's own calls: no status check first (that would add an "me" before them).
+    # Opening the shared connection checks the session each time it is used.
+    assert fake_gateway.call_names() == [
+        "connect",
+        "is_authorized",
+        "me",
+        "is_authorized",
+        "log_out",
+    ]
     assert memory_keyring.items == {}
 
 
