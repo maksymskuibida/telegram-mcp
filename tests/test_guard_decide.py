@@ -665,6 +665,15 @@ def test_a_command_of_exactly_64_kib_is_read(gh: GuardHome) -> None:
     assert gh.bash(command).verdict == "pass"
 
 
+def doubling(count: int, quoted: bool = False, prefix: str = "") -> str:
+    """a0=xx;a1=$a0$a0;… : each assignment doubles the value before it."""
+    parts = [f"{prefix}a0=xx"]
+    for index in range(1, count + 1):
+        value = f"$a{index - 1}$a{index - 1}"
+        parts.append(f'{prefix}a{index}="{value}"' if quoted else f"{prefix}a{index}={value}")
+    return ";".join(parts)
+
+
 WORST_CASE_LINES = {
     "dollars": "$" * (MAX_TEXT - 10),
     "dollars in quotes": 'echo "' + "$" * (MAX_TEXT - 10) + '"',
@@ -682,7 +691,24 @@ WORST_CASE_LINES = {
     "mixed": "echo " + "$'\\x41'\"$HOME\"{a,b}\\ " * (MAX_TEXT // 22 - 1),
     "many words": "echo " + "a/b " * (MAX_TEXT // 4 - 2),
     "many commands": "true;" * (MAX_TEXT // 5 - 1),
+    "30 doubling assignments": doubling(30),
+    "60 doubling assignments": doubling(60),
+    "30 quoted doubling assignments": doubling(30, quoted=True),
+    "30 doubling exports": doubling(30, prefix="export "),
 }
+DOUBLING_LINES = [name for name in WORST_CASE_LINES if "doubling" in name]
+
+
+@pytest.mark.parametrize("name", DOUBLING_LINES)
+def test_a_doubling_line_is_refused_as_unparsable(gh: GuardHome, name: str) -> None:
+    decision = gh.bash(WORST_CASE_LINES[name])
+    assert decision.verdict == "refuse"
+    assert decision.route == Route.UNPARSABLE
+
+
+def test_a_value_just_inside_64_kib_is_still_read(gh: GuardHome) -> None:
+    # 2**15 = 32 KiB doubled once more is 64 KiB: the last step that stays within the limit.
+    assert gh.bash(doubling(15) + "; echo done").verdict == "pass"
 
 
 def _traced() -> bool:

@@ -7,6 +7,7 @@ with configured outbox and downloads folders."""
 from __future__ import annotations
 
 import shlex
+import time
 from pathlib import Path
 
 import pytest
@@ -746,3 +747,26 @@ def test_inline_code_running_the_tool_from_quoted_words_is_refused(
 )
 def test_inline_code_naming_the_tool_otherwise_passes(gh: GuardHome, command: str) -> None:
     check_passed(gh, command)
+
+
+# Values that double with each assignment cannot run the guard out of time
+
+
+DOUBLING_30 = ";".join(["a0=xx", *(f"a{i}=$a{i - 1}$a{i - 1}" for i in range(1, 31))])
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        "cat ~/Library/Application\\ Support/telegram-mcp/config.toml",
+        "cd ~/Library/Application\\ Support && cat telegram-mcp/config.toml",
+    ],
+)
+def test_a_doubling_line_before_a_data_folder_read_is_refused(gh: GuardHome, read: str) -> None:
+    command = f"{DOUBLING_30}; {read}"
+    assert len(command) < 400
+    started = time.perf_counter()
+    decision = gh.bash(command)
+    took = time.perf_counter() - started
+    assert decision.verdict == "refuse"
+    assert took < 5.0, f"{took:.2f} s, against the hook's 10 s timeout"
