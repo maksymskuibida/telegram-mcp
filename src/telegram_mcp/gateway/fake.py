@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,12 +38,14 @@ FAKE_RECORD_NAME = "fake-gateway-calls.jsonl"
 
 @dataclass
 class Script:
-    """What a scripted call does instead of succeeding. ``times`` None means every call."""
+    """What a scripted call does instead of succeeding. ``times`` None means every call.
+    ``delay`` is awaited (with the fake's ``sleep``) before the call goes on or fails."""
 
     error: GatewayError | None = None
     hang: bool = False
     drop_after_send: bool = False
     times: int | None = 1
+    delay: float = 0.0
 
 
 @dataclass
@@ -70,6 +73,8 @@ class FakeGateway:
     sent: list[SentText] = field(default_factory=list)
     scripts: dict[str, list[Script]] = field(default_factory=dict)
     connected: bool = False
+    sleep: Callable[[float], Awaitable[None]] = field(default_factory=lambda: asyncio.sleep)
+    """How a scripted delay waits; tests swap in a sleep that steps a fake clock."""
     _next_message_id: int = 1000
 
     def script(
@@ -80,10 +85,18 @@ class FakeGateway:
         hang: bool = False,
         drop_after_send: bool = False,
         times: int | None = 1,
+        delay: float = 0.0,
     ) -> None:
-        """Make the next ``times`` calls of ``call`` raise, hang, or drop after sending."""
+        """Make the next ``times`` calls of ``call`` wait ``delay`` seconds, then raise, hang,
+        drop after sending, or go on."""
         self.scripts.setdefault(call, []).append(
-            Script(error=error, hang=hang, drop_after_send=drop_after_send, times=times)
+            Script(
+                error=error,
+                hang=hang,
+                drop_after_send=drop_after_send,
+                times=times,
+                delay=delay,
+            )
         )
 
     def call_names(self) -> list[str]:
@@ -96,6 +109,8 @@ class FakeGateway:
                 record.write(json.dumps({"call": name, "args": args}, default=str) + "\n")
         script = self._take_script(name)
         if script is not None:
+            if script.delay > 0:
+                await self.sleep(script.delay)
             if script.hang:
                 await asyncio.Event().wait()
             if script.error is not None:
@@ -214,6 +229,7 @@ class FakeGateway:
                 hang=bool(how.get("hang", False)),
                 drop_after_send=bool(how.get("drop_after_send", False)),
                 times=how.get("times"),
+                delay=float(how.get("delay", 0.0)),
             )
         return fake
 

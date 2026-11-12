@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from telegram_mcp.gateway.models import (
     ChatNotFound,
     ChatRef,
     FloodWait,
+    GatewayTimeout,
     NotAuthorized,
     OutcomeUnknown,
     PasswordNeeded,
@@ -138,3 +140,50 @@ async def test_from_file_builds_chats_scripts_and_a_call_record(home: Path) -> N
         "send_text",
         "send_text",
     ]
+
+
+# Delays and failing connects, for the broker's scheduling tests ----------------------------
+
+
+async def test_a_delay_is_awaited_with_the_fakes_sleep_before_the_call_goes_on(
+    fake_gateway: FakeGateway,
+) -> None:
+    waited: list[float] = []
+
+    async def record(seconds: float) -> None:
+        waited.append(seconds)
+
+    fake_gateway.sleep = record
+    fake_gateway.script("list_chats", delay=12.5)
+    fake_gateway.script("resolve_chat", delay=3, error=FloodWait(7))
+    page, _ = await fake_gateway.list_chats(None, 50, None)
+    assert len(page) == 5
+    with pytest.raises(FloodWait):
+        await fake_gateway.resolve_chat(ALICE.id)
+    await fake_gateway.list_chats(None, 50, None)
+    assert waited == [12.5, 3]
+
+
+async def test_a_connect_can_fail_a_given_number_of_times_then_succeed(
+    fake_gateway: FakeGateway,
+) -> None:
+    fake_gateway.script("connect", error=GatewayTimeout(), times=3)
+    for _ in range(3):
+        with pytest.raises(GatewayTimeout):
+            await fake_gateway.connect()
+        assert fake_gateway.connected is False
+    await fake_gateway.connect()
+    assert fake_gateway.connected is True
+    assert fake_gateway.call_names() == ["connect"] * 4
+
+
+async def test_a_real_delay_holds_the_call_and_the_file_form_reads_it(home: Path) -> None:
+    config = home / "fake-gateway.json"
+    config.write_text(json.dumps({"scripts": {"list_chats": {"delay": 0.2, "times": 1}}}))
+    fake = FakeGateway.from_file(config)
+    started = time.monotonic()
+    await fake.list_chats(None, 50, None)
+    assert time.monotonic() - started >= 0.2
+    started = time.monotonic()
+    await fake.list_chats(None, 50, None)
+    assert time.monotonic() - started < 0.1
