@@ -47,6 +47,7 @@ class Resolver:
 
     def __init__(self, protected: ProtectedSet) -> None:
         self._known_plain: set[str] = set()
+        self._decided: dict[str, bool] = {}
         self.data_dir = posixpath.normpath(protected.data_dir)
         self._folded = {self.data_dir.casefold()}
         # When the data folder's own links cannot be followed, the path as written still counts.
@@ -105,12 +106,18 @@ class Resolver:
     def is_protected(self, path: str) -> bool:
         """True when the absolute ``path``, as written or resolved, is in the data folder.
 
-        Raises Unresolvable when its links cannot be followed."""
+        Raises Unresolvable when its links cannot be followed. A path asked again within the
+        same decision is answered from memory."""
+        known = self._decided.get(path)
+        if known is not None:
+            return known
         written = posixpath.normpath(path).casefold()
-        if any(_inside(written, folder) for folder in self._folded):
-            return True
-        resolved = self.resolve(path).casefold()
-        return any(_inside(resolved, folder) for folder in self._folded)
+        protected = any(_inside(written, folder) for folder in self._folded)
+        if not protected:
+            resolved = self.resolve(path).casefold()
+            protected = any(_inside(resolved, folder) for folder in self._folded)
+        self._decided[path] = protected
+        return protected
 
 
 _MISSING = "\0missing"

@@ -86,6 +86,7 @@ OPTIONAL = {
 }
 MAX_NESTING = 8
 MAX_TEXT = 64 * 1024
+MAX_DECODING = 3
 
 OWN_TEXT_RE = re.compile(
     COMMAND_NAME
@@ -360,8 +361,20 @@ def find_data_text(text: str) -> str | None:
     return None
 
 
+def decoded_forms(text: str) -> list[str]:
+    """The text and its percent-decoded forms (``%20`` and the like, up to three times)."""
+    forms = [text]
+    while "%" in forms[-1] and len(forms) <= MAX_DECODING:
+        decoded = unquote(forms[-1])
+        if decoded == forms[-1]:
+            break
+        forms.append(decoded)
+    return forms
+
+
 def check_data_text(text: str, matched: str | None = None) -> None:
-    if find_data_text(text) is not None:
+    """Refuses data folder text in the text as written or percent-decoded."""
+    if any(find_data_text(form) is not None for form in decoded_forms(text)):
         raise Refusal(Route.DATA_TEXT, text if matched is None else matched)
 
 
@@ -970,8 +983,10 @@ def check_paths(command: Command, found: Effective, ctx: Context) -> None:
         targets = [text]
         if "=" in text[1:]:
             targets.append(text.split("=", 1)[1])
-        for target in targets:
-            if target and (target.startswith("/") or command.base is not None):
+        for target in [form for t in targets for form in decoded_forms(t)]:
+            if target[:5].casefold() == "file:":
+                check_path(unquote(urlsplit(target).path) or "/", "/", ctx)
+            elif target and (target.startswith("/") or command.base is not None):
                 check_path(target, command.base or "/", ctx)
 
 

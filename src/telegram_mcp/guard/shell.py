@@ -19,6 +19,7 @@ import posixpath
 import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 
 MAX_RESULTS = 256
 # All the expansion one decision may do, nested lines and loop values included. A line within
@@ -159,11 +160,17 @@ UNKNOWN_PIECE = Piece("", True, True)
 class Word:
     pieces: tuple[Piece, ...]
 
-    @property
+    @cached_property
     def known(self) -> bool:
         return not any(piece.unknown for piece in self.pieces)
 
+    @cached_property
+    def _text(self) -> str:
+        return "".join(piece.text for piece in self.pieces)
+
     def render(self, marker: str = "") -> str:
+        if not marker or self.known:
+            return self._text
         return "".join(marker if piece.unknown else piece.text for piece in self.pieces)
 
     def fixed_part(self) -> str:
