@@ -53,6 +53,8 @@ class ConsentAction:
     describe: Describer | None = None
     run: Runner | None = None
     newest_returned: NewestReturned | None = None
+    log_result: Callable[[Any], str | None] | None = None
+    """What the result entry names (a file's path, name and size), never content (NFR8.5)."""
 
     @property
     def tool(self) -> str:

@@ -67,7 +67,14 @@ def file_send_action(context: CatalogContext) -> ConsentAction:
             "size_bytes": record.size_bytes,
         }
 
-    return ConsentAction(DECLS[FILES_SEND], _validate_send, describe, run)
+    return ConsentAction(DECLS[FILES_SEND], _validate_send, describe, run, log_result=file_line)
+
+
+def file_line(data: Any) -> str | None:
+    """The result entry of a file send or a download: path, name and size, never content."""
+    if not isinstance(data, dict) or "path" not in data:
+        return None
+    return f"{data['path']} ({data['name']}, {data['size_bytes']} bytes)"
 
 
 def write_actions(context: CatalogContext) -> list[ConsentAction]:
@@ -120,7 +127,7 @@ def download_action(context: CatalogContext) -> ConsentAction:
             ["path", "name"],
         )
 
-    return ConsentAction(DECLS[MEDIA_DOWNLOAD], _validate_download, run=run)
+    return ConsentAction(DECLS[MEDIA_DOWNLOAD], _validate_download, run=run, log_result=file_line)
 
 
 def read_actions(context: CatalogContext) -> list[ConsentAction]:

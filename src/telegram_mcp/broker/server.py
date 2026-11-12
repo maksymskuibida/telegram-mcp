@@ -825,7 +825,8 @@ class Broker:
         except ToolFailure as failure:
             self._log_result(connection, tool, failure.code, failure.approval, raw)
             return failure.as_result()
-        self._log_result(connection, tool, "ok", approval, raw)
+        content = action.log_result(data) if action.log_result is not None else None
+        self._log_result(connection, tool, "ok", approval, raw, content)
         return {"ok": True, "data": data}
 
     async def _call_action(
@@ -1360,6 +1361,7 @@ class Broker:
         result: str,
         approval: PendingApproval | None,
         raw: object,
+        content: str | None = None,
     ) -> None:
         chat_id = approval.chat_id if approval is not None else _peek(raw)[0]
         self._log_entry(
@@ -1369,6 +1371,7 @@ class Broker:
             result,
             approval_id=approval.id if approval is not None else None,
             chat_id=chat_id,
+            content=content,
         )
 
     def _log_gate_events(self, connection: Connection) -> None:
@@ -1527,14 +1530,19 @@ def _failure_for(method: str) -> Any:
 
 
 def _peek(raw: object) -> tuple[int | None, str | None]:
-    """The chat id and text of raw arguments, for the log only, never for a decision."""
+    """The chat id and the text, query or target of raw arguments, for the log only, never for a
+    decision (NFR8.4, NFR8.6: what Claude looked for is logged too)."""
     if not isinstance(raw, dict):
         return None, None
-    chat, text = raw.get("chat"), raw.get("text")
+    chat = next((raw[k] for k in ("chat", "to_chat") if raw.get(k) is not None), None)
     chat_id = chat if isinstance(chat, int) and not isinstance(chat, bool) else None
     if isinstance(chat, str) and chat.lstrip("-").isdigit():
         chat_id = int(chat)
-    return chat_id, text if isinstance(text, str) else None
+    for key in ("text", "query", "caption", "link_or_username", "path"):
+        value = raw.get(key)
+        if isinstance(value, str):
+            return chat_id, value
+    return chat_id, None
 
 
 def _text_list(value: object) -> list[str] | None:
