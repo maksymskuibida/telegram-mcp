@@ -240,3 +240,28 @@ async def test_during_a_back_off_checks_refuse_at_once_and_the_change_is_reporte
     assert "connect to Telegram failed (GatewayTimeout, 1 in a row)" in diagnostics
     assert "calls fail at once for 1 s" in diagnostics
     assert "Telegram reachable again after 1 failed connects" in diagnostics
+
+
+async def test_an_unexpected_connect_failure_backs_off_and_the_next_call_tries_again(
+    fake_gateway: FakeGateway, clock: FakeClock, stored: StoredSession
+) -> None:
+    attempts = 0
+
+    def factory(session: str, api_id: int, api_hash: str) -> FakeGateway:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValueError("malformed stored session")
+        return fake_gateway
+
+    link = TelegramLink(factory, clock=clock, connect_limit=30.0)
+    with pytest.raises(Unreachable):
+        await link.open(stored)
+    assert state_of(link) is LinkState.BACKING_OFF
+    with pytest.raises(Unreachable):
+        await link.open(stored)
+    assert link.connects_started == 1
+    clock.advance(backoff_seconds(1))
+    assert await link.open(stored) is fake_gateway
+    assert link.connects_started == 2
+    assert state_of(link) is LinkState.OPEN

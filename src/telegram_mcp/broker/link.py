@@ -133,13 +133,15 @@ class TelegramLink:
                 authorized = await gateway.is_authorized()
         except NotAuthorized:
             authorized = False
-        except (GatewayError, TimeoutError, OSError) as error:
-            self._attempt = None
-            raise self._failed(error) from error
         except asyncio.CancelledError:
             self._attempt = None
             self.state = LinkState.CLOSED
             raise
+        except Exception as error:
+            # Any failure, not only network ones (a malformed stored session makes the factory
+            # raise ValueError), is a failed connect: back off and let the next call try again.
+            self._attempt = None
+            raise self._failed(error) from error
         self._attempt = None
         if not authorized:
             await self._discard()
