@@ -395,6 +395,75 @@ async def test_a_stop_during_logout_waits_until_logout_has_answered(
     await asyncio.wait_for(broker.wait_stopped(), 2)
 
 
+@pytest.mark.usefixtures("logged_in")
+async def test_a_failed_account_lookup_still_logs_out(
+    start_broker: Callable[..., Any],
+    paths: FixedPaths,
+    fake_gateway: FakeGateway,
+    memory_keyring: MemoryKeyring,
+) -> None:
+    fake_gateway.script("me", error=TelegramError("INTERNAL"))
+    await start_broker()
+    result = await (await cli(paths)).result("session.logout")
+    assert result["account"] is None
+    assert result["telegram_confirmed"] is True
+    assert memory_keyring.items == {}
+    assert "account lookup failed: TelegramError" in paths.diagnostics.read_text()
+
+
+@pytest.mark.usefixtures("logged_in")
+async def test_a_keychain_locked_at_logout_calls_no_telegram_and_clears_nothing(
+    start_broker: Callable[..., Any],
+    paths: FixedPaths,
+    fake_gateway: FakeGateway,
+    memory_keyring: MemoryKeyring,
+) -> None:
+    await start_broker()
+    memory_keyring.locked = True
+    result = await (await cli(paths)).result("session.logout")
+    assert (result["telegram_confirmed"], result["telegram_reason"]) == (False, "telegram_error")
+    assert (result["keychain_cleared"], result["keychain_cause"]) == (False, "locked")
+    assert "log_out" not in fake_gateway.call_names()
+    assert [e["result"] for e in log_entries(paths)] == ["keychain_locked"]
+
+
+@pytest.mark.usefixtures("logged_in")
+async def test_a_send_still_queued_when_logout_arrives_is_refused_not_sent(
+    start_broker: Callable[..., Any], paths: FixedPaths, fake_gateway: FakeGateway
+) -> None:
+    await start_broker()
+    first = {"chat": ALICE.id, "text": "running"}
+    queued = {"chat": FAMILY.id, "text": "queued"}
+    await confirm(paths, first)
+    await confirm(paths, queued)
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    original = fake_gateway.send_text
+
+    async def slow_send(chat_id: int, text: str, reply_to: int | None, topic_id: int | None) -> Any:
+        if text == "running":
+            entered.set()
+            await release.wait()
+        return await original(chat_id, text, reply_to, topic_id)
+
+    fake_gateway.send_text = slow_send  # type: ignore[method-assign]
+    servers = [await RawClient.connect(paths) for _ in range(2)]
+    running = asyncio.create_task(servers[0].result("tool.call", {"tool": SEND, "args": first}))
+    await asyncio.wait_for(entered.wait(), 2)
+    waiting = asyncio.create_task(servers[1].result("tool.call", {"tool": SEND, "args": queued}))
+    await asyncio.sleep(0.05)  # the second send has used its approval and waits for the lock
+    logout = asyncio.create_task((await cli(paths)).result("session.logout"))
+    await asyncio.sleep(0.05)
+    release.set()
+
+    assert (await asyncio.wait_for(running, 2))["ok"] is True
+    refused = await asyncio.wait_for(waiting, 2)
+    assert refused["ok"] is False
+    assert refused["error"]["code"] == "no_session"
+    assert (await asyncio.wait_for(logout, 2))["telegram_confirmed"] is True
+    assert [sent.text for sent in fake_gateway.sent] == ["running"]
+
+
 # broker.status -------------------------------------------------------------------------------
 
 
@@ -442,6 +511,17 @@ async def test_a_session_ended_elsewhere_is_reported_and_forgotten(
     )
     assert broker.link.state.value == "closed"
     assert log_entries(paths) == []
+
+
+@pytest.mark.usefixtures("logged_in")
+async def test_a_session_that_ends_during_the_check_is_reported_ended(
+    start_broker: Callable[..., Any], paths: FixedPaths, fake_gateway: FakeGateway
+) -> None:
+    broker = await start_broker()
+    fake_gateway.script("me", error=NotAuthorized())
+    status = await (await cli(paths)).result("broker.status")
+    assert status["session_state"] == "ended"
+    assert broker._gateway is None
 
 
 @pytest.mark.usefixtures("logged_in")

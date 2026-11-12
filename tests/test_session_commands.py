@@ -99,7 +99,8 @@ async def scripted_broker(
     paths: FixedPaths, replies: dict[str, list[Any]]
 ) -> AsyncIterator[list[str]]:
     """A socket that answers hello, then each method with its next scripted reply: a result,
-    "drop" (close the connection) or "hang" (never answer). Yields the methods received."""
+    {"rpc_error": {...}} (a JSON-RPC error), "drop" (close the connection) or "hang" (never
+    answer). A scripted "hello" replaces the greeting. Yields the methods received."""
     paths.data_dir.mkdir(parents=True, exist_ok=True)
     paths.secret.write_text("0" * 64)
     received: list[str] = []
@@ -111,18 +112,24 @@ async def scripted_broker(
                 message = json.loads(line)
                 method = message["method"]
                 received.append(method)
-                if method == "hello":
-                    reply: Any = {"broker_version": "test", "pid": 4321}
+                queue = replies.get(method, [])
+                if queue:
+                    reply: Any = queue.pop(0)
+                elif method == "hello":
+                    reply = {"broker_version": "test", "pid": 4321}
                 else:
-                    queue = replies.get(method, [])
-                    reply = queue.pop(0) if queue else "hang"
+                    reply = "hang"
                 if reply == "drop":
                     writer.close()
                     return
                 if reply == "hang":
                     await done.wait()
                     return
-                answer = {"jsonrpc": "2.0", "id": message["id"], "result": reply}
+                answer: dict[str, Any] = {"jsonrpc": "2.0", "id": message["id"]}
+                if isinstance(reply, dict) and "rpc_error" in reply:
+                    answer["error"] = reply["rpc_error"]
+                else:
+                    answer["result"] = reply
                 writer.write(json.dumps(answer).encode() + b"\n")
                 await writer.drain()
 
@@ -476,6 +483,102 @@ async def test_logout_asks_status_with_its_own_bounded_wait(paths: FixedPaths) -
         assert await run_logout(paths, script, client) == 1
     assert script.output == ["The background connection did not answer in time."]
     assert "session.logout" not in received
+
+
+REFUSED = {"rpc_error": {"code": -32601, "message": "unknown method"}}
+
+
+@pytest.mark.parametrize(
+    ("reply", "said"),
+    [
+        (
+            REFUSED,
+            "The background connection refused the logout (unknown method); nothing changed.",
+        ),
+        (42, UNKNOWN),
+    ],
+    ids=["refused", "nonsense"],
+)
+async def test_a_logout_answer_that_is_not_an_outcome_is_reported(
+    paths: FixedPaths, memory_keyring: MemoryKeyring, reply: Any, said: str
+) -> None:
+    save_fake_session()
+    async with scripted_broker(paths, {"session.logout": [reply]}):
+        script = ScriptedTerminal()
+        client = BrokerClient(paths, "cli", spawn=lambda: None, timeouts=FAST)
+        assert await run_logout(paths, script, client, yes=True) == 1
+    assert script.output == [said]
+
+
+@pytest.mark.parametrize(
+    ("replies", "reason"),
+    [
+        ({"broker.status": [REFUSED]}, "unknown method"),
+        ({"broker.status": [42]}, "it answered nonsense"),
+        (
+            {"hello": [{"rpc_error": {"code": -32001, "message": "version_mismatch"}}]},
+            "a different version is running",
+        ),
+    ],
+    ids=["refused", "nonsense", "other version"],
+)
+async def test_a_status_answer_that_is_not_a_status_is_reported(
+    paths: FixedPaths, replies: dict[str, list[Any]], reason: str
+) -> None:
+    async with scripted_broker(paths, replies):
+        script = ScriptedTerminal()
+        client = BrokerClient(paths, "cli", spawn=lambda: None, timeouts=FAST)
+        assert await run_status(paths, script, client) == 1
+    assert script.output == [f"The background connection could not be started ({reason})."]
+
+
+async def test_a_login_that_starts_after_the_lock_check_is_still_refused(
+    paths: FixedPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telegram_mcp import session_commands
+    from telegram_mcp.broker.lock import LockProbe
+
+    save_fake_session()
+    paths.data_dir.mkdir(parents=True)
+    login_lock = BrokerLock(paths.lock)
+    assert login_lock.try_hold(LockState.LOGIN)
+    monkeypatch.setattr(session_commands, "probe_lock", lambda path: LockProbe.FREE)
+    try:
+        script = ScriptedTerminal()
+        assert await run_status(paths, script, no_broker(paths)) == 1
+        assert script.output == [LOGIN_RUNNING_STATUS]
+        script = ScriptedTerminal()
+        assert await run_logout(paths, script, no_broker(paths)) == 1
+        assert script.output == [LOGIN_RUNNING_LOGOUT]
+    finally:
+        login_lock.release()
+
+
+def test_the_entry_points_run_with_their_own_client_and_survive_ctrl_c(
+    paths: FixedPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telegram_mcp import session_commands
+
+    paths.data_dir.mkdir(parents=True)
+    login_lock = BrokerLock(paths.lock)
+    assert login_lock.try_hold(LockState.LOGIN)
+    try:
+        script = ScriptedTerminal()
+        assert session_commands.run_status(paths, script.terminal()) == 1
+        assert session_commands.run_logout(paths, script.terminal(), True) == 1
+        assert script.output == [LOGIN_RUNNING_STATUS, LOGIN_RUNNING_LOGOUT]
+    finally:
+        login_lock.release()
+
+    def interrupted(coroutine: Any) -> int:
+        coroutine.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(asyncio, "run", interrupted)
+    script = ScriptedTerminal()
+    assert session_commands.run_status(paths, script.terminal()) == 1
+    assert session_commands.run_logout(paths, script.terminal(), True) == 1
+    assert script.output == [UNKNOWN]
 
 
 def test_the_command_waits_match_the_design() -> None:
