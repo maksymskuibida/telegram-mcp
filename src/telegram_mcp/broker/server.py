@@ -611,8 +611,15 @@ class Broker:
     ) -> PromptFields:
         """The tool's describer, inside the check budget; any failure refuses (BR11.7). A
         flood wait is waited out once, and only when it fits in what is left of the budget."""
+        return await self._within_budget(
+            arrived, lambda: self._describe_once(action, gateway, args)
+        )
+
+    async def _within_budget[T](self, arrived: datetime, call: Callable[[], Awaitable[T]]) -> T:
+        """A Telegram read made by a check. A flood wait is waited out once, and only when it
+        fits in what is left of the check's budget; otherwise the check refuses."""
         try:
-            return await self._describe_once(action, gateway, args)
+            return await call()
         except ToolFailure as failure:
             wait = failure.retry_after
             if failure.code != "flood_wait" or wait is None:
@@ -620,7 +627,13 @@ class Broker:
             if wait >= self.check_budget - self._seconds_since(arrived):
                 raise
         await self._sleep(wait)
-        return await self._describe_once(action, gateway, args)
+        return await call()
+
+    async def _resolve(self, gateway: TelegramGateway, chat_id: int) -> ChatRef:
+        try:
+            return await gateway.resolve_chat(chat_id)
+        except GatewayError as error:
+            raise self._lookup_failure(error) from error
 
     async def _describe_once(
         self, action: ConsentAction, gateway: TelegramGateway, args: dict[str, Any]
@@ -671,7 +684,8 @@ class Broker:
     ) -> Decision:
         """BR13.2, BR13.4, BR13.5, BR13.7: one forum topic at a time, the unread check, then
         allow with nothing unread or one question."""
-        chat = await self._lookup(gateway, int(args["chat"]), arrived)
+        chat_id = int(args["chat"])
+        chat = await self._within_budget(arrived, lambda: self._resolve(gateway, chat_id))
         topic_id = args.get("topic_id")
         _check_forum(chat, topic_id)
         decision = self._gate_lookup(connection, action.tool, digest, ask_again)
@@ -743,36 +757,6 @@ class Broker:
                 approval_id=remembered.approval_id if remembered is not None else None,
             )
         return _refusal(decision.code, decision.message)
-
-    async def _lookup(self, gateway: TelegramGateway, chat_id: int, arrived: datetime) -> ChatRef:
-        """The chat lookup of a check. A flood wait is waited out once, and only when it fits
-        in what is left of the check's budget; otherwise the check refuses."""
-        try:
-            return await self._resolve(gateway, chat_id)
-        except ToolFailure as failure:
-            wait = failure.retry_after
-            if failure.code != "flood_wait" or wait is None:
-                raise
-            if wait >= self.check_budget - self._seconds_since(arrived):
-                raise
-        await self._sleep(wait)
-        return await self._resolve(gateway, chat_id)
-
-    async def _resolve(self, gateway: TelegramGateway, chat_id: int) -> ChatRef:
-        try:
-            return await gateway.resolve_chat(chat_id)
-        except ChatNotFound as error:
-            raise ToolFailure.fixed("not_found", "not_found_chat") from error
-        except NotAuthorized as error:
-            self._forget_session()
-            raise ToolFailure.fixed("no_session") from error
-        except GatewayTimeout as error:
-            self.link.mark_dropped()
-            raise ToolFailure.fixed("telegram_timeout") from error
-        except FloodWait as error:
-            raise _flood_failure(error.seconds) from error
-        except TelegramError as error:
-            raise ToolFailure("telegram_error", "Telegram refused the chat lookup.") from error
 
     # approval.answer ------------------------------------------------------------------------
 
@@ -982,6 +966,8 @@ class Broker:
         """BR13.3, BR13.6: mark up to what was counted; with no approval, check again and
         never mark what is unread."""
         chat_id, topic_id = int(args["chat"]), args.get("topic_id")
+        if self.writes.is_full:  # refused before the approval is used, so it stays confirmed
+            raise ToolFailure("telegram_error", MESSAGES["line_full"])
         try:
             approval = self._consume(action.tool, digest)
         except ToolFailure as failure:
@@ -1069,11 +1055,6 @@ class Broker:
             try:
                 await self._queue_write(connection, approval, run)
                 return
-            except FloodWait as error:
-                if attempt == 1 and error.seconds <= LONGEST_READ_FLOOD_WAIT_SECONDS:
-                    await self._sleep(error.seconds)
-                    continue
-                raise _flood_failure(error.seconds) from error
             except ToolFailure as failure:
                 if failure.code == "flood_wait" and failure.retry_after is not None:
                     if attempt == 1 and failure.retry_after <= LONGEST_READ_FLOOD_WAIT_SECONDS:
