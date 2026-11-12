@@ -17,6 +17,8 @@ flowchart LR
     S -- JSON-RPC over Unix socket --> B[Broker<br/>telegram-mcp broker]
     H -- JSON-RPC over Unix socket --> B
     L[Login<br/>telegram-mcp login] -- stops the broker, holds the lock --> B
+    C[Logout and status<br/>telegram-mcp logout / status] -- JSON-RPC as client cli --> B
+    R[Log reader<br/>telegram-mcp log] -- reads, never writes --> A
     B --> G[Telegram gateway<br/>Telethon]
     B --> K[(macOS Keychain)]
     B --> A[(activity.log)]
@@ -28,7 +30,9 @@ approval hook before the send tool and after every question box. Both talk to on
 broker over a private Unix socket. The broker alone holds the Telegram connection, the
 approvals and the activity log. Login runs in a terminal, stops the broker, and writes the
 session to the Keychain. The guard hook runs before Claude's own shell, file, search, fetch and
-subagent calls and talks to nothing.
+subagent calls and talks to nothing. Logout and status also run in a terminal and go through the
+broker like any other client. The log command reads the log files directly and touches nothing
+else.
 
 | Component | Module | What it does |
 |---|---|---|
@@ -47,6 +51,9 @@ subagent calls and talks to nothing.
 | Session vault | `vault.py` | The session, `api_id` and `api_hash` in the macOS Keychain only. |
 | Settings | `settings.py`, `paths.py` | Fixed paths derived from the home folder, and the two folder settings of `config.toml`. |
 | Activity log | `activity_log.py` | One JSON line per call, question, decision and result; secrets redacted. |
+| Login | `login.py`, `qr.py` | Phone or QR-code login in the terminal; `qr.py` draws a login link as a QR code. |
+| Logout and status | `session_commands.py` | The `logout` and `status` commands, as clients of the broker. |
+| Log reader | `log_reader.py` | The `log` command: the rotated files oldest first, escaped text, `--json`, `--follow`. |
 
 ## Files
 
@@ -69,9 +76,25 @@ The session, `api_id` and `api_hash` are three generic-password items of the Key
 `telegram-mcp`. They are written together after a successful login, or not at all. Nothing is
 ever stored on disk in their place.
 
+## Commands
+
+| Command | Exit codes |
+|---|---|
+| `telegram-mcp login [--qr]` | 0 logged in or nothing changed; 1 failed; 2 Keychain unavailable |
+| `telegram-mcp logout [--yes]` | 0 logged out, nothing to do, or declined; 1 login running, no broker or result unknown; 2 Keychain unavailable |
+| `telegram-mcp status` | 0 logged in; 1 login running, Telegram unreachable or no broker; 2 not logged in or Keychain unavailable |
+| `telegram-mcp log [--lines N] [--follow] [--json]` | 0; 1 bad option or unreadable file |
+
+Each one first sets the umask to 077 and checks that it runs on macOS. Secrets are typed at
+prompts only, never passed as arguments or environment variables.
+
 ## Login
 
-`telegram-mcp login` asks, in the terminal only, for `api_id`, `api_hash` (hidden), the phone
+`telegram-mcp login` first asks "Log in with (1) phone number or (2) QR code?"; `--qr` chooses
+the QR code without asking. The question comes after the lock is taken and after any
+"Replace it?" question about an account already stored.
+
+Phone login asks, in the terminal only, for `api_id`, `api_hash` (hidden), the phone
 number, the code, and the two-step password (hidden) when the account has one. Every typed
 value is trimmed; the hidden `api_hash` also loses the terminal's bracketed-paste markers and
 any other control or format character before it is checked, because the person cannot see them
@@ -82,6 +105,106 @@ call, a flash or missed call, email with the masked address Telegram gives, or F
 Telegram offers no other way it says so; when it offers one it says how long to wait and that
 pressing Enter with no code asks for the code that way. An empty code never counts as one of
 the three tries.
+
+QR login asks for `api_id` and `api_hash` the same way, then asks Telegram for a login token
+and draws its `tg://login?token=…` link as a QR code in the terminal (half-block characters,
+two module rows per text line, a 2-module quiet zone), with the link printed under it and
+where to scan it: Telegram → Settings → Devices → Link Desktop Device on the phone. A token
+lives about 30 s; an expired one is replaced by a new code automatically. Each wait for a scan
+ends at the earlier of the token's expiry and a deadline 180 s after the first code, and no
+new code is asked for with under 5 s left, so QR login gives up exactly three minutes after it
+started. After a scan, an account with a two-step password is asked for it, three tries. The
+link is a login secret: it goes to the terminal only, never to a file, the log or an error
+message, and errors name only their type.
+
+Both ways save the session exactly the same: the three Keychain items together or not at all,
+and replacing a stored account restores it if a write fails. Every way out (success, failure,
+Ctrl-C, end of input) disconnects from Telegram and releases the lock.
+
+## Logout
+
+`telegram-mcp logout` refuses while a login holds the lock, and stops with exit 2 when the
+Keychain is locked. With nothing stored it deletes whatever a half-written login left, says so
+and exits. Otherwise it asks the broker for status and asks "Log out of Telegram as
+<account>? [y/N]" (`--yes` skips the question); only `y` or `yes` goes on.
+
+The logout itself runs inside the broker, as `session.logout`:
+
+```mermaid
+sequenceDiagram
+    participant C as logout command
+    participant B as broker
+    participant T as Telegram
+    participant K as Keychain
+    C->>B: session.logout
+    B->>B: refuse every new call and approval step (no_session)
+    B->>B: wait for a running send to finish, drop open approvals (logged as expired)
+    B->>T: auth.logOut (30 s)
+    T-->>B: confirmed, refused, flood wait, already ended, or no answer
+    B->>K: delete session, api_id, api_hash (whatever Telegram answered)
+    B->>B: one log entry: result, tool logout, client cli
+    B-->>C: {ok, account, telegram_confirmed, telegram_reason, retry_after, keychain_cleared, keychain_cause}
+    B->>B: stop (lock released, socket and secret deleted)
+```
+
+Text version: from the moment the broker receives `session.logout` it refuses every new tool
+call and approval step with `no_session`. A send already running finishes first and is never
+interrupted. Every open approval is dropped and logged as expired. The broker then asks
+Telegram to end the session within 30 s, deletes the three Keychain items whatever Telegram
+answered, writes one log entry, answers, and stops. A `broker.stop` that arrives meanwhile
+(a login starting) waits until the logout has answered.
+
+The log entry's `result` is `keychain_locked` when the Keychain could not be cleared, otherwise
+the Telegram reason when Telegram did not confirm (`telegram_error`, `telegram_timeout`,
+`flood_wait`, `no_session` for a session already ended elsewhere), otherwise `ok`. Its
+`content` is the account as name, @username and id.
+
+The command prints one of: logged out (naming the account); this Mac is logged out but
+Telegram did not confirm, with how to end the session from another device; the session had
+already been ended elsewhere; or the Keychain could not delete it (exit 2). It waits at most
+120 s for the answer and never sends `session.logout` twice: a lost answer is reported as
+unknown, pointing to `telegram-mcp status`.
+
+## Status
+
+`telegram-mcp status` refuses while a login holds the lock, notes whether a broker is already
+running, and connects as client `cli`, starting a broker when none runs (the same broker a
+tool call would start). It waits at most 20 s for `broker.status` and retries once when the
+connection drops, since status changes nothing.
+
+The broker reads the Keychain and, with a session, asks Telegram whether it is still
+authorized and who the account is, within 15 s. The answer's `session_state` is `logged_in`,
+`no_session`, `ended` (the session was ended from another device; the broker forgets it),
+`keychain_locked` (with `cause`) or `unreachable`. Status writes nothing to the activity log.
+
+It prints three lines: the session state, "Background connection: running (pid N)." or
+"started now (pid N).", and "Claude sessions using it: N.", counting the connections whose
+hello said `mcp-server`. It exits 0 when logged in, 2 when not logged in or the Keychain is
+locked, and 1 when Telegram could not be reached.
+
+## The log command
+
+`telegram-mcp log` reads `activity.log.4` to `.1` and then `activity.log`, oldest first,
+directly from the data folder: no broker, no Keychain, no Telegram. It opens the files
+read-only, reads them a line at a time (`--lines N` keeps only the last N in memory), and never
+writes, creates or changes anything there.
+
+- **Snapshot.** It opens `activity.log` first, then `.1` to `.4`, and skips a file whose inode
+  it already opened, so a rotation during the read neither repeats nor drops an entry.
+- **Readable lines.** `<local time>  <event>  <tool>`, then the fields present (`chat`,
+  `approval`, the decision, `→ result` for result entries, `client`), then the content in full:
+  after ` | ` when it is one line, otherwise on lines indented by four spaces.
+- **Escaping.** Logged text came from Telegram and from the AI. Every control and format
+  character, the line and paragraph separators and a lone surrogate are shown as `\xNN`,
+  `\uNNNN` or `\UNNNNNNNN`, and a backslash as `\\`; only a tab is kept. Nothing logged can
+  move the cursor, recolour the terminal or reverse the text.
+- **`--json`.** Each valid entry is parsed and written again as one JSON line, with the same
+  characters as JSON `\uNNNN` escapes, so every line parses and none carries a raw control
+  character. A line that is not a valid entry prints as `(unreadable entry) …`, or as
+  `{"unreadable": "…"}` with `--json`.
+- **`--follow`.** After the existing entries it checks `activity.log` every 0.5 s and prints
+  each new complete line; a partly written line waits for its line feed. When the file is
+  rotated, it finishes the old file before starting on the new one. Ctrl-C ends it with exit 0.
 
 ## The broker protocol
 
@@ -97,8 +220,9 @@ secret closes the connection.
 | `tool.call {tool, args}` | MCP server | `{ok: true, data}` or `{ok: false, error: {code, message, retry_after?}}` |
 | `approval.check {tool, args}` | approval hook (pre) | `{decision: allow}`, `{decision: ask, approval_id, question, options, option_descriptions, multi_select}` or `{decision: refuse, code, message}` |
 | `approval.answer {question, options, option_descriptions, multi_select, pick}` | approval hook (post) | `{outcome: confirmed \| declined \| unknown}` |
-| `broker.status` | any | `{logged_in, account, clients, idle_seconds}`: `clients` counts the Claude Code sessions connected (hook and command connections are not counted); `idle_seconds` is how long the broker had been idle before this request |
-| `broker.stop` | login | `{ok: true}`, then the broker exits cleanly |
+| `broker.status` | any | `{logged_in, account, clients, idle_seconds, session_state, cause, pid, mcp_clients}`: `clients` and `mcp_clients` count the Claude Code sessions connected (hook and command connections are not counted); `idle_seconds` is how long the broker had been idle before this request (see Status) |
+| `broker.stop` | login | `{ok: true}`, then the broker exits cleanly (after a running logout has answered) |
+| `session.logout` | logout command | `{ok, account, telegram_confirmed, telegram_reason, retry_after, keychain_cleared, keychain_cause}`, then the broker stops (see Logout) |
 
 Protocol errors: -32700 parse error, -32600 invalid request, -32601 unknown method,
 -32001 version mismatch, -32002 bad secret. Tool refusals are never protocol errors.
@@ -355,9 +479,8 @@ from the line (tool and approval id, never the text), and a failed log rotation.
 
 ## What is not here yet
 
-This is an early version: phone login, `tg_chats_list` and `tg_messages_send`, with the guard
-hook above, a shared Telegram connection, idle exit and log rotation. Other tools, QR login,
-logout, status and log commands come later. The guard covers Claude's own tools only: another
-program running as the same macOS user can still read `broker.secret`. This version is for
-trying out, not for daily
-use.
+This version has phone and QR-code login, logout, status, the log command, `tg_chats_list` and
+`tg_messages_send`, with the guard hook above, a shared Telegram connection, idle exit and log
+rotation. Other tools come later. The guard covers Claude's own tools only: another program
+running as the same macOS user can still read `broker.secret`. This version is for trying out,
+not for daily use.

@@ -15,6 +15,7 @@ import pytest
 from support.brokers import FakeClock, running_broker, subprocess_brokers
 from support.file_keyring import FileKeyring
 from support.flows import SEND, post_hook_input, pre_hook_input, question_from
+from support.rpc import RawClient
 from support.samples import ALICE, FAMILY, sample_chats
 from telegram_mcp.broker.client import BrokerClient
 from telegram_mcp.gateway.fake import FakeGateway
@@ -22,6 +23,8 @@ from telegram_mcp.gateway.models import TelegramError
 from telegram_mcp.hooks import approval_post, approval_pre
 from telegram_mcp.login import Terminal, login
 from telegram_mcp.paths import FixedPaths
+from telegram_mcp.session_commands import logout, status
+from telegram_mcp.vault import SessionVault, StoredSession
 
 __all__ = ["subprocess_brokers"]
 
@@ -59,7 +62,11 @@ async def test_no_secret_reaches_any_file_log_or_result(paths: FixedPaths) -> No
 
     assert (
         await login(
-            paths, terminal, gateway_factory=lambda s, i, h: login_gateway, stop_broker=no_broker
+            paths,
+            terminal,
+            gateway_factory=lambda s, i, h: login_gateway,
+            stop_broker=no_broker,
+            method="phone",
         )
         == 0
     )
@@ -133,3 +140,83 @@ async def test_files_are_private_even_with_a_022_umask(paths: FixedPaths, home: 
         if process.returncode is None:
             process.kill()
             await process.wait()
+
+
+# QR login, status and logout -----------------------------------------------------------------
+
+
+def files_holding(home: Path, secret: str) -> list[str]:
+    return [
+        str(path.relative_to(home))
+        for path in home.rglob("*")
+        if path.is_file() and secret.encode() in path.read_bytes()
+    ]
+
+
+@pytest.mark.parametrize("scanned", [True, False], ids=["scanned", "refused"])
+async def test_a_qr_token_is_shown_on_the_terminal_only(
+    paths: FixedPaths, home: Path, scanned: bool
+) -> None:
+    token = "tg://login?token=SECRETQR" + os.urandom(16).hex()
+    clock = FakeClock()
+    gateway = FakeGateway(
+        authorized=False,
+        clock=clock,
+        qr_time_passes=clock.advance,
+        qr_tokens=[token],
+        qr_scan_on_wait=1 if scanned else None,
+    )
+    if not scanned:
+        gateway.script("wait_qr", error=TelegramError(f"refused {token}"))
+    answers = iter(["4242"])
+    output: list[str] = []
+    terminal = Terminal(
+        ask=lambda p: next(answers), ask_secret=lambda p: os.urandom(16).hex(), say=output.append
+    )
+
+    async def no_broker() -> None:
+        return None
+
+    code = await login(
+        paths,
+        terminal,
+        gateway_factory=lambda s, i, h: gateway,
+        stop_broker=no_broker,
+        method="qr",
+        clock=clock,
+    )
+    assert code == (0 if scanned else 1)
+    assert [line for line in output if token in line] == [token]
+    assert files_holding(home, token) == []
+    assert files_holding(home, token.split("=", 1)[1]) == []
+
+
+async def test_status_and_logout_never_show_a_secret_or_the_phone_number(
+    paths: FixedPaths, home: Path
+) -> None:
+    phone = "+15550009876"
+    session = "1Bsecret-session-" + os.urandom(24).hex()
+    api_id, api_hash = 918273645, os.urandom(16).hex()
+    SessionVault().save(StoredSession(session, api_id, api_hash))
+    gateway = FakeGateway(chats=list(sample_chats()))
+    secrets = [session, api_hash, str(api_id), phone, phone.lstrip("+")]
+    shown: list[str] = []
+    terminal = Terminal(ask=lambda p: "y", ask_secret=lambda p: "", say=shown.append)
+
+    async with running_broker(paths, gateway) as broker:
+        raw = await RawClient.connect(paths, client="cli", client_name=None)
+        shown.append(repr(await raw.result("broker.status")))
+        client = BrokerClient(paths, "cli", spawn=never_spawn)
+        assert await status(paths, terminal, client=client) == 0
+        assert await logout(paths, terminal, yes=False, client=client) == 0
+        await client.close()
+        await raw.close()
+        await asyncio.wait_for(broker.wait_stopped(), 2)
+
+    assert any("Logged out of Telegram as Test Person" in line for line in shown)
+    log = paths.log.read_text()
+    assert '"tool":"logout"' in log
+    everything = "\n".join(shown) + log + paths.diagnostics.read_text()
+    for secret in secrets:
+        assert secret not in everything
+        assert files_holding(home / "Library", secret) == []

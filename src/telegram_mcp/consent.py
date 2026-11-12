@@ -289,6 +289,15 @@ class ConsentGate:
         self._approvals = {k: a for k, a in self._approvals.items() if _is_open(a)}
         return expired
 
+    def drop_open(self) -> list[PendingApproval]:
+        """Expire every open approval now (logout): none can be confirmed or used any more.
+        They are returned, and the next ``sweep`` reports each with the status it had."""
+        dropped = [a for a in self._approvals.values() if _is_open(a)]
+        for approval in dropped:
+            self._newly_expired.append((approval, approval.status))
+            approval.status = ApprovalStatus.EXPIRED
+        return dropped
+
     def _expire_due(self) -> None:
         now = self._clock()
         for approval in self._approvals.values():

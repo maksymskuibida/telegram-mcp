@@ -13,6 +13,8 @@ from telegram_mcp.gateway.models import (
     NotAuthorized,
     OutcomeUnknown,
     PasswordNeeded,
+    QrExpired,
+    QrToken,
     SentMessage,
     TelegramError,
 )
@@ -32,6 +34,8 @@ __all__ = [
     "NotAuthorized",
     "OutcomeUnknown",
     "PasswordNeeded",
+    "QrExpired",
+    "QrToken",
     "SentMessage",
     "TelegramError",
     "TelegramGateway",

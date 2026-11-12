@@ -30,6 +30,8 @@ from telegram_mcp.gateway.models import (
     NotAuthorized,
     OutcomeUnknown,
     PasswordNeeded,
+    QrExpired,
+    QrToken,
     SentCodeInfo,
     SentMessage,
     TelegramError,
@@ -66,13 +68,21 @@ class TelethonGateway:
         # The account's own id, read once per connection to mark its Saved Messages (NFR4.4).
         self._own_id: int | None = None
         self._own_id_read = False
+        self._qr: Any = None
 
-    async def _call(self, make: Callable[[], Awaitable[T]], *, write: bool = False) -> T:
-        """Run one Telegram call with the 30 s limit, mapping every failure to a gateway error.
-        For a write, any failure after the connection is up is ``OutcomeUnknown``."""
+    async def _call(
+        self,
+        make: Callable[[], Awaitable[T]],
+        *,
+        write: bool = False,
+        extra_seconds: float = 0.0,
+    ) -> T:
+        """Run one Telegram call with the 30 s limit (plus ``extra_seconds`` for a call that
+        waits on purpose, like a QR scan), mapping every failure to a gateway error. For a
+        write, any failure after the connection is up is ``OutcomeUnknown``."""
         await self._ensure_connected()
         try:
-            return await asyncio.wait_for(make(), self._timeout)
+            return await asyncio.wait_for(make(), self._timeout + extra_seconds)
         except GatewayError:
             raise
         except errors.RPCError as error:
@@ -130,6 +140,39 @@ class TelethonGateway:
         await self._call(lambda: self._client.sign_in(password=password))
         return await self.me()
 
+    async def sign_in_qr(self) -> QrToken:
+        """The first call starts Telethon's QR login; each later call asks for a new token."""
+
+        async def token() -> Any:
+            if self._qr is None:
+                self._qr = await self._client.qr_login()
+            else:
+                await self._qr.recreate()
+            return self._qr
+
+        qr = await self._call(token)
+        return QrToken(url=str(qr.url), expires_at=qr.expires)
+
+    async def wait_qr(self, timeout_seconds: float) -> Me:
+        qr = self._qr
+        if qr is None:
+            raise QrExpired()
+
+        async def scanned() -> Any:
+            try:
+                return await qr.wait(timeout_seconds)
+            except TimeoutError as error:
+                raise QrExpired() from error
+
+        user = await self._call(scanned, extra_seconds=max(0.0, timeout_seconds))
+        return _me_from_user(user)
+
+    async def log_out(self) -> bool:
+        """``auth.logOut`` sent directly, so that a flood wait, an ended session and a timeout
+        keep their own errors (Telethon's ``log_out()`` turns every refusal into False)."""
+        await self._call(lambda: self._client(functions.auth.LogOutRequest()))
+        return True
+
     def export_session(self) -> str:
         return str(self._client.session.save())
 
@@ -137,7 +180,7 @@ class TelethonGateway:
         user = await self._call(self._client.get_me)
         if user is None:
             raise NotAuthorized()
-        return Me(id=int(user.id), name=utils.get_display_name(user), username=user.username)
+        return _me_from_user(user)
 
     async def _account_id(self) -> int | None:
         """The logged-in account's own id, read with ``me()`` once per connection. None when
@@ -262,6 +305,10 @@ def _map_rpc_error(error: Any) -> GatewayError:
     if isinstance(error, errors.UnauthorizedError | errors.AuthKeyError):
         return NotAuthorized()
     return TelegramError(str(error.message))
+
+
+def _me_from_user(user: Any) -> Me:
+    return Me(id=int(user.id), name=utils.get_display_name(user), username=user.username)
 
 
 def _chat_type(entity: Any) -> ChatType:

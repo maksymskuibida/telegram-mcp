@@ -10,6 +10,7 @@ from telegram_mcp.vault import (
     ITEMS,
     SessionVault,
     StoredSession,
+    VaultDeleteResult,
     VaultError,
     VaultOutcome,
 )
@@ -88,6 +89,38 @@ def test_a_failed_restore_deletes_everything_and_says_so(memory_keyring: MemoryK
         vault.replace(new, old)
     assert failed.value.logged_out
     assert memory_keyring.items == {}
+
+
+def test_delete_removes_all_three_items(memory_keyring: MemoryKeyring) -> None:
+    vault = SessionVault()
+    vault.save(stored())
+    assert vault.delete() == VaultDeleteResult(cleared=True, cause=None)
+    assert memory_keyring.items == {}
+    assert vault.load().outcome is VaultOutcome.NO_SESSION
+
+
+def test_missing_items_count_as_removed(memory_keyring: MemoryKeyring) -> None:
+    memory_keyring.items[(SERVICE, "session")] = "half-written"
+    assert SessionVault().delete() == VaultDeleteResult(cleared=True, cause=None)
+    assert memory_keyring.items == {}
+    assert SessionVault().delete().cleared
+
+
+def test_a_refused_delete_is_reported_and_the_other_items_are_still_deleted(
+    memory_keyring: MemoryKeyring,
+) -> None:
+    SessionVault().save(stored())
+    memory_keyring.fail_delete_items = {"api_id"}
+    assert SessionVault().delete() == VaultDeleteResult(cleared=False, cause="access denied")
+    assert set(memory_keyring.items) == {(SERVICE, "api_id")}
+
+
+def test_a_locked_keychain_cannot_be_cleared(memory_keyring: MemoryKeyring) -> None:
+    SessionVault().save(stored())
+    memory_keyring.locked = True
+    assert SessionVault().delete() == VaultDeleteResult(cleared=False, cause="locked")
+    memory_keyring.locked = False
+    assert len(memory_keyring.items) == 3
 
 
 def test_secrets_never_appear_in_a_repr() -> None:

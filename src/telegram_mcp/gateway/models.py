@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Literal
 
@@ -71,6 +71,21 @@ class Me:
     username: str | None
 
 
+def account_label(me: Me) -> str:
+    """How every command names the account: name, @username and id, never the phone number."""
+    handle = f"@{me.username}, " if me.username else ""
+    return f"{me.name} ({handle}id {me.id})"
+
+
+@dataclass(frozen=True)
+class QrToken:
+    """One QR login token. ``url`` (``tg://login?token=…``) is a login secret: it is shown on
+    the terminal only and never appears in a repr, a log or an error."""
+
+    url: str = field(repr=False)
+    expires_at: datetime
+
+
 class GatewayError(Exception):
     """Base of every error the gateway raises."""
 
@@ -117,6 +132,10 @@ class BadPassword(GatewayError):
 
 class PasswordNeeded(GatewayError):
     """The account has a two-step password; ask for it next."""
+
+
+class QrExpired(GatewayError):
+    """No phone scanned the QR token before the wait ended; ask for a new token."""
 
 
 _CURSOR = re.compile(r"^v1\.(-?\d{1,20})\.(-?\d{1,20})\.(-?\d{1,20})$")

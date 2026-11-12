@@ -7,7 +7,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,8 @@ from telegram_mcp.gateway.models import (
     NotAuthorized,
     OutcomeUnknown,
     PasswordNeeded,
+    QrExpired,
+    QrToken,
     SentCodeInfo,
     SentMessage,
     TelegramError,
@@ -75,6 +77,17 @@ class FakeGateway:
     connected: bool = False
     sleep: Callable[[float], Awaitable[None]] = field(default_factory=lambda: asyncio.sleep)
     """How a scripted delay waits; tests swap in a sleep that steps a fake clock."""
+    qr_tokens: list[str] = field(default_factory=list)
+    """The QR login links to hand out, in order; past the end, fake links are made up."""
+    qr_lifetime_seconds: float = 30.0
+    qr_scan_on_wait: int | None = None
+    """The wait (1-based) during which a phone scans the code; None means nobody scans."""
+    qr_time_passes: Callable[[float], None] | None = None
+    """Told how long each wait that ends unscanned lasted, so a test clock can move on."""
+    clock: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
+    log_out_result: bool = True
+    qr_issued: int = 0
+    qr_waits: int = 0
     _next_message_id: int = 1000
 
     def script(
@@ -163,6 +176,35 @@ class FakeGateway:
             raise BadPassword()
         self.authorized = True
         return self.account
+
+    async def sign_in_qr(self) -> QrToken:
+        await self._enter("sign_in_qr")
+        index = self.qr_issued
+        self.qr_issued += 1
+        if index < len(self.qr_tokens):
+            url = self.qr_tokens[index]
+        else:
+            url = f"tg://login?token=FAKE{index:04d}"
+        expires = self.clock() + timedelta(seconds=self.qr_lifetime_seconds)
+        return QrToken(url=url, expires_at=expires)
+
+    async def wait_qr(self, timeout_seconds: float) -> Me:
+        await self._enter("wait_qr", timeout_seconds=timeout_seconds)
+        self.qr_waits += 1
+        if self.qr_scan_on_wait is None or self.qr_waits < self.qr_scan_on_wait:
+            if self.qr_time_passes is not None:
+                self.qr_time_passes(timeout_seconds)
+            raise QrExpired()
+        if self.password is not None:
+            raise PasswordNeeded()
+        self.authorized = True
+        return self.account
+
+    async def log_out(self) -> bool:
+        await self._enter("log_out")
+        if self.log_out_result:
+            self.authorized = False
+        return self.log_out_result
 
     def export_session(self) -> str:
         return self.session_after_login

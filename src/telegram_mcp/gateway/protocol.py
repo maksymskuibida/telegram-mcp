@@ -1,11 +1,11 @@
-"""The TelegramGateway interface (C3, U1's calls). Later Units add calls here and to the fake."""
+"""The TelegramGateway interface. Each feature adds its calls here and to the fake."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Protocol
 
-from telegram_mcp.gateway.models import ChatRef, Me, SentCodeInfo, SentMessage
+from telegram_mcp.gateway.models import ChatRef, Me, QrToken, SentCodeInfo, SentMessage
 
 
 class TelegramGateway(Protocol):
@@ -26,6 +26,18 @@ class TelegramGateway(Protocol):
 
     async def sign_in_password(self, password: str) -> Me:
         """Finish sign-in with the two-step password; raises ``BadPassword``."""
+
+    async def sign_in_qr(self) -> QrToken:
+        """Ask Telegram for a QR login token; every call returns a new one."""
+
+    async def wait_qr(self, timeout_seconds: float) -> Me:
+        """Wait up to ``timeout_seconds`` for a phone to scan the latest token. Raises
+        ``QrExpired`` when nobody scanned it in time, ``PasswordNeeded`` when the account has a
+        two-step password (then ``sign_in_password`` finishes the login)."""
+
+    async def log_out(self) -> bool:
+        """End this session on Telegram. True when Telegram confirmed it; a refusal raises
+        the mapped gateway error (``FloodWait``, ``NotAuthorized``, ``TelegramError``...)."""
 
     def export_session(self) -> str:
         """The session string to store in the Keychain after sign-in."""

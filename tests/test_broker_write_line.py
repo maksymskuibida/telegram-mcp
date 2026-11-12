@@ -406,3 +406,32 @@ async def test_writes_run_one_at_a_time_in_arrival_order(
     results = await asyncio.gather(*tasks)
     assert all(result["ok"] for result in results)
     assert [sent.text for sent in fake_gateway.sent] == texts
+
+
+async def test_waiting_for_a_quiet_line_returns_once_the_running_and_waiting_writes_are_done(
+    clock: FakeClock,
+) -> None:
+    line = WriteLine(clock=clock)
+    await asyncio.wait_for(line.wait_idle(), 1)  # an empty line is quiet at once
+    line.start()
+    release = asyncio.Event()
+    order: list[str] = []
+
+    async def blocked(name: str) -> str:
+        await release.wait()
+        order.append(name)
+        return name
+
+    first = asyncio.create_task(line.submit(line_item(clock, lambda: blocked("first"))))
+    await wait_until(lambda: line.running is not None)
+    second = asyncio.create_task(line.submit(line_item(clock, lambda: blocked("second"))))
+    await wait_until(lambda: line.waiting == 1)
+    quiet = asyncio.create_task(line.wait_idle())
+    await asyncio.sleep(0.05)
+    assert not quiet.done()
+    release.set()
+    await asyncio.wait_for(quiet, 1)
+    assert order == ["first", "second"]
+    assert (await first, await second) == ("first", "second")
+    assert not line.busy
+    await line.close()

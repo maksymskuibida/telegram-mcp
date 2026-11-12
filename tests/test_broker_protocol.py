@@ -160,7 +160,16 @@ async def test_status_and_stop(paths: FixedPaths, fake_gateway: FakeGateway) -> 
     raw = await RawClient.connect(paths, client="cli")
     status = await raw.result("broker.status")
     # clients counts Claude Code sessions; the status command itself is not one.
-    assert status == {"logged_in": True, "account": None, "clients": 0, "idle_seconds": 0}
+    assert status == {
+        "logged_in": True,
+        "account": "Test Person (@tester, id 4242)",
+        "clients": 0,
+        "idle_seconds": 0,
+        "session_state": "logged_in",
+        "cause": None,
+        "pid": os.getpid(),
+        "mcp_clients": 0,
+    }
     assert await raw.result("broker.stop") == {"ok": True}
     await asyncio.wait_for(broker.wait_stopped(), 2)
     assert not paths.socket.exists()

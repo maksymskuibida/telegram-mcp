@@ -45,6 +45,8 @@ class Timeouts:
     check: float = 12.0
     call: float = 75.0
     start: float = 5.0
+    status: float = 20.0  # the broker's 15 s Telegram check plus margin
+    logout: float = 120.0  # a running send (75 s), the 30 s log-out call, a Keychain prompt
 
 
 class BrokerUnavailable(Exception):
@@ -152,6 +154,20 @@ class BrokerClient:
 
     async def stop_broker(self) -> Any:
         return await self.request("broker.stop", {}, self.timeouts.answer)
+
+    async def status(self) -> Any:
+        """broker.status changes nothing, so a dropped connection is retried once (a broker
+        is started when none runs); a wait that ran out is not."""
+        try:
+            return await self.request("broker.status", {}, self.timeouts.status)
+        except RequestLost as lost:
+            if lost.timed_out:
+                raise
+        return await self.request("broker.status", {}, self.timeouts.status)
+
+    async def logout(self) -> Any:
+        """session.logout is sent at most once: a lost answer is never retried."""
+        return await self.request("session.logout", {}, self.timeouts.logout)
 
     async def close(self) -> None:
         self._drop()

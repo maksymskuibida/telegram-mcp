@@ -20,9 +20,12 @@ from telegram_mcp.gateway.models import (
     FloodWait,
     GatewayError,
     GatewayTimeout,
+    Me,
     NotAuthorized,
     OutcomeUnknown,
     PasswordNeeded,
+    QrExpired,
+    QrToken,
     SentCodeInfo,
     TelegramError,
 )
@@ -378,3 +381,143 @@ async def test_resolve_chat_scans_recent_chats_once_then_reports_not_found() -> 
     me = await gateway.me()
     assert (me.name, me.username) == ("Ada L", "ada")
     assert gateway.export_session() == "saved-session"
+
+
+# QR login and log-out ----------------------------------------------------------------------
+
+QR_EXPIRES = datetime(2026, 11, 12, 10, 0, 30, tzinfo=UTC)
+
+
+class StubQr:
+    """Stands in for Telethon's QRLogin."""
+
+    def __init__(self, client: QrStubClient) -> None:
+        self.client = client
+        self.recreated = 0
+        self.waits: list[float | None] = []
+
+    @property
+    def url(self) -> str:
+        return f"tg://login?token=STUB{self.recreated}"
+
+    @property
+    def expires(self) -> datetime:
+        return QR_EXPIRES
+
+    async def recreate(self) -> None:
+        await self.client._maybe_fail("recreate")
+        self.recreated += 1
+
+    async def wait(self, timeout: float | None = None) -> Any:  # noqa: ASYNC109 (Telethon's)
+        self.waits.append(timeout)
+        await self.client._maybe_fail("qr_wait")
+        return types.User(id=9, first_name="Grace", last_name="H", username=None)
+
+
+class QrStubClient(StubClient):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.qr: StubQr | None = None
+
+    async def qr_login(self) -> StubQr:
+        await self._maybe_fail("qr_login")
+        self.qr = StubQr(self)
+        return self.qr
+
+    async def __call__(self, request: Any) -> Any:
+        if isinstance(request, functions.auth.LogOutRequest):
+            await self._maybe_fail("log_out")
+            self.requests.append(request)
+            return types.auth.LoggedOut()
+        return await super().__call__(request)
+
+
+def make_qr_gateway(timeout: float = 30.0) -> tuple[TelethonGateway, QrStubClient]:
+    holder: list[QrStubClient] = []
+
+    def factory(*args: Any, **kwargs: Any) -> QrStubClient:
+        holder.append(QrStubClient(*args, **kwargs))
+        return holder[0]
+
+    gateway = TelethonGateway("", 1, API_HASH, client_factory=factory, call_timeout=timeout)
+    return gateway, holder[0]
+
+
+async def test_the_first_qr_token_starts_qr_login_and_later_ones_recreate_it() -> None:
+    gateway, client = make_qr_gateway()
+    first = await gateway.sign_in_qr()
+    second = await gateway.sign_in_qr()
+    assert first == QrToken(url="tg://login?token=STUB0", expires_at=QR_EXPIRES)
+    assert second.url == "tg://login?token=STUB1"
+    assert client.qr is not None
+    assert client.qr.recreated == 1
+    assert "STUB" not in repr(first)
+
+
+async def test_a_scan_returns_the_account_and_the_wait_is_bounded() -> None:
+    gateway, client = make_qr_gateway()
+    await gateway.sign_in_qr()
+    me = await gateway.wait_qr(12.5)
+    assert me == Me(id=9, name="Grace H", username=None)
+    assert client.qr is not None
+    assert client.qr.waits == [12.5]
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected"),
+    [
+        (TimeoutError(), QrExpired),
+        (errors.SessionPasswordNeededError(request=None), PasswordNeeded),
+        (errors.FloodWaitError(request=None, capture=17), FloodWait),
+        (errors.RPCError(request=None, message="AUTH_TOKEN_EXPIRED"), TelegramError),
+    ],
+)
+async def test_qr_wait_failures_are_mapped(
+    raised: BaseException, expected: type[GatewayError]
+) -> None:
+    gateway, client = make_qr_gateway()
+    await gateway.sign_in_qr()
+    client.fail["qr_wait"] = raised
+    with pytest.raises(expected):
+        await gateway.wait_qr(1.0)
+
+
+async def test_a_hanging_exchange_after_the_scan_is_a_gateway_timeout() -> None:
+    gateway, client = make_qr_gateway(timeout=0.05)
+    await gateway.sign_in_qr()
+    client.fail["qr_wait"] = "hang"
+    with pytest.raises(GatewayTimeout):
+        await gateway.wait_qr(0.0)
+
+
+async def test_waiting_with_no_token_is_an_expiry_and_token_refusals_are_mapped() -> None:
+    gateway, client = make_qr_gateway()
+    with pytest.raises(QrExpired):
+        await gateway.wait_qr(1.0)
+    client.fail["qr_login"] = errors.FloodWaitError(request=None, capture=60)
+    with pytest.raises(FloodWait) as waited:
+        await gateway.sign_in_qr()
+    assert waited.value.seconds == 60
+
+
+async def test_log_out_sends_auth_log_out_and_confirms() -> None:
+    gateway, client = make_qr_gateway()
+    assert await gateway.log_out() is True
+    assert [type(r).__name__ for r in client.requests] == ["LogOutRequest"]
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected"),
+    [
+        (errors.FloodWaitError(request=None, capture=30), FloodWait),
+        (errors.AuthKeyUnregisteredError(request=None), NotAuthorized),
+        (errors.RPCError(request=None, message="INTERNAL"), TelegramError),
+        (ConnectionError("dropped"), TelegramError),
+        ("hang", GatewayTimeout),
+    ],
+)
+async def test_log_out_refusals_keep_their_kind(raised: Any, expected: type[GatewayError]) -> None:
+    gateway, client = make_qr_gateway(timeout=0.05)
+    client.fail["log_out"] = raised
+    with pytest.raises(expected):
+        await gateway.log_out()

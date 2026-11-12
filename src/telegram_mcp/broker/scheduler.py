@@ -81,6 +81,8 @@ class WriteLine:
         self._on_drop = on_drop
         self._items: deque[WriteItem] = deque()
         self._ready = asyncio.Event()
+        self._quiet = asyncio.Event()
+        self._quiet.set()
         self._server: asyncio.Task[None] | None = None
         self.running: WriteItem | None = None
 
@@ -95,6 +97,15 @@ class WriteLine:
     @property
     def busy(self) -> bool:
         return self.running is not None or self.waiting > 0
+
+    async def wait_idle(self) -> None:
+        """Return once no write is running or waiting in the line."""
+        while self.busy:
+            await self._quiet.wait()
+
+    def _note_quiet(self) -> None:
+        if not self.busy:
+            self._quiet.set()
 
     def start(self) -> None:
         if self._server is None:
@@ -118,6 +129,7 @@ class WriteLine:
             raise LineFull()
         item.outcome.add_done_callback(_retrieve)
         self._items.append(item)
+        self._quiet.clear()
         self._ready.set()
         left = self._start_limit - (self._clock() - item.arrived_at).total_seconds()
         timer = asyncio.get_running_loop().call_later(max(0.0, left), self._expire, item)
@@ -153,6 +165,7 @@ class WriteLine:
             item.outcome.set_exception(WriteDropped(reason))
         if self._on_drop is not None:
             self._on_drop(item, reason)
+        self._note_quiet()
 
     async def _next(self) -> WriteItem:
         while True:
@@ -179,6 +192,7 @@ class WriteLine:
             finally:
                 item.state = WriteState.DONE
                 self.running = None
+                self._note_quiet()
 
 
 def _settle(item: WriteItem, *, result: Any = None, error: BaseException | None = None) -> None:

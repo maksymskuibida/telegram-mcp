@@ -67,6 +67,7 @@ async def run(
         script.terminal(),
         gateway_factory=lambda session, api_id, api_hash: gateway,
         stop_broker=stop_broker,  # type: ignore[arg-type]
+        method="phone",
     )
 
 
