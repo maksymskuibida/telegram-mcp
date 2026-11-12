@@ -55,8 +55,8 @@ from telegram_mcp.tools import (
 
 _LINK_HOST = r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/"
 INVITE_LINK = re.compile(rf"^{_LINK_HOST}(?:\+|joinchat/)([A-Za-z0-9_-]{{1,64}})/?$")
-USERNAME_LINK = re.compile(rf"^{_LINK_HOST}([A-Za-z][A-Za-z0-9_]{{3,31}})/?$")
-USERNAME = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{3,31})$")
+USERNAME_LINK = re.compile(rf"^{_LINK_HOST}([A-Za-z][A-Za-z0-9_]{{2,31}})/?$")
+USERNAME = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{2,31})$")
 JOIN_FORMS = "link_or_username must be @name, name, t.me/name, t.me/+hash or t.me/joinchat/hash"
 
 

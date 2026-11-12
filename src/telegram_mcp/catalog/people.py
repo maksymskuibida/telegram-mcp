@@ -75,9 +75,9 @@ async def _run_admin(
 
 CONTACTS_CAP = 10_000
 _USER_LINK = re.compile(
-    r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([A-Za-z][A-Za-z0-9_]{3,31})/?$"
+    r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([A-Za-z][A-Za-z0-9_]{2,31})/?$"
 )
-_USERNAME = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{3,31})$")
+_USERNAME = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{2,31})$")
 
 
 def _validate_members(raw: object) -> dict[str, Any]:
