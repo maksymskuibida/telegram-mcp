@@ -620,3 +620,80 @@ def test_deciding_is_fast_enough_for_every_call(gh: GuardHome) -> None:
         mean, slowest = measure(gh)  # one retry of the whole test absorbs CI noise
     assert mean < MEAN_LIMIT, f"mean {mean * 1000:.2f} ms"
     assert slowest < SLOWEST_LIMIT, f"slowest {slowest * 1000:.2f} ms"
+
+
+# Input size: a text field over 64 KiB is refused; anything below is decided in under 1 s
+
+MAX_TEXT = 64 * 1024
+
+
+@pytest.mark.parametrize(
+    ("tool", "field"),
+    [
+        ("Bash", "command"),
+        ("Read", "file_path"),
+        ("Glob", "pattern"),
+        ("Grep", "glob"),
+        ("Task", "prompt"),
+        ("Agent", "description"),
+        ("WebFetch", "url"),
+    ],
+)
+def test_a_text_field_over_64_kib_is_refused(gh: GuardHome, tool: str, field: str) -> None:
+    tool_input: dict[str, Any] = {
+        "command": "ls",
+        "file_path": "README.md",
+        "pattern": "x",
+        "prompt": "hi",
+        "url": "https://example.com",
+    }
+    tool_input[field] = "a" * (MAX_TEXT + 1)
+    decision = gh.decide(gh.call(tool, **tool_input))
+    assert decision.verdict == "refuse"
+    assert decision.route == Route.UNPARSABLE
+    assert decision.reason is not None
+    assert "64 KiB" in decision.reason
+
+
+def test_a_cwd_over_64_kib_is_refused(gh: GuardHome) -> None:
+    decision = gh.decide(gh.call("Bash", "/" + "a" * MAX_TEXT, command="ls"))
+    assert decision.route == Route.UNPARSABLE
+
+
+def test_a_command_of_exactly_64_kib_is_read(gh: GuardHome) -> None:
+    command = "echo " + "a" * (MAX_TEXT - 5)
+    assert gh.bash(command).verdict == "pass"
+
+
+WORST_CASE_LINES = {
+    "dollars": "$" * (MAX_TEXT - 10),
+    "dollars in quotes": 'echo "' + "$" * (MAX_TEXT - 10) + '"',
+    "single quotes": "echo " + "'a'" * (MAX_TEXT // 3 - 3),
+    "empty double quotes": "echo " + '""' * (MAX_TEXT // 2 - 3),
+    "backslashes": "echo " + "\\\\" * (MAX_TEXT // 2 - 3),
+    "escaped dollars": "echo " + "\\$" * (MAX_TEXT // 2 - 3),
+    "brace pairs": "echo " + "{a,b}" * (MAX_TEXT // 5 - 2),
+    "plain braces": "echo " + "{a}" * (MAX_TEXT // 3 - 3),
+    "nested braces": "echo " + "{" * (MAX_TEXT // 2 - 3) + "}" * (MAX_TEXT // 2 - 3),
+    "open braces": "echo " + "{" * (MAX_TEXT - 10),
+    "one wide brace": "echo {" + "a," * (MAX_TEXT // 2 - 4) + "}",
+    "nested defaults": "echo " + "${a:-" * 3000 + "}" * 3000,
+    "nested substitutions": "echo " + "$(" * 3000 + ")" * 3000,
+    "mixed": "echo " + "$'\\x41'\"$HOME\"{a,b}\\ " * (MAX_TEXT // 22 - 1),
+    "many words": "echo " + "a/b " * (MAX_TEXT // 4 - 2),
+    "many commands": "true;" * (MAX_TEXT // 5 - 1),
+}
+
+
+@pytest.mark.parametrize("name", list(WORST_CASE_LINES))
+def test_a_worst_case_line_is_decided_in_under_a_second(gh: GuardHome, name: str) -> None:
+    line = WORST_CASE_LINES[name]
+    assert len(line) <= MAX_TEXT
+    for _attempt in range(2):  # one retry absorbs noise on a busy machine
+        started = time.perf_counter()
+        decision = gh.bash(line)
+        took = time.perf_counter() - started
+        if took < 1.0:
+            break
+    assert took < 1.0, f"{name}: {took:.2f} s"
+    assert decision.route != Route.GUARD_ERROR
