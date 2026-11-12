@@ -764,7 +764,7 @@ DOUBLING_30 = ";".join(["a0=xx", *(f"a{i}=$a{i - 1}$a{i - 1}" for i in range(1, 
 )
 def test_a_doubling_line_before_a_data_folder_read_is_refused(gh: GuardHome, read: str) -> None:
     command = f"{DOUBLING_30}; {read}"
-    assert len(command) < 400
+    assert len(DOUBLING_30) < 340  # a short line: the cost comes from doubling, not from size
     started = time.perf_counter()
     decision = gh.bash(command)
     took = time.perf_counter() - started
