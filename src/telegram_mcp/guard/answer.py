@@ -29,6 +29,7 @@ WHY = {
 }
 WHAT = {
     "Bash": "the shell command",
+    "Monitor": "the monitored shell command",
     "Read": "reading",
     "Write": "writing",
     "Edit": "editing",

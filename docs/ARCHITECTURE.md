@@ -200,9 +200,10 @@ Ten callers starting at once therefore yield one broker.
 Claude can run programs as the person's macOS user, so without a check its own tools could read
 the activity log, talk to the broker socket with the per-start secret, read the Keychain items,
 or run `telegram-mcp login` itself. The guard hook (`telegram-mcp hook guard`, through
-`hooks/run`) stands in front of Claude's own tools: `Bash`, `Read`, `Write`, `Edit`,
+`hooks/run`) stands in front of Claude's own tools: `Bash`, `Monitor`, `Read`, `Write`, `Edit`,
 `MultiEdit`, `NotebookEdit`, `Glob`, `Grep`, `Task`, `Agent` and `WebFetch`, with a 10 s
-timeout. It never sees this plugin's MCP tools or the person's own terminal.
+timeout. `Monitor` runs a shell command, and its command is decided exactly as `Bash`'s. The
+guard never sees this plugin's MCP tools or the person's own terminal.
 
 It **refuses**:
 

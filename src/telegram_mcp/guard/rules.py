@@ -41,6 +41,7 @@ from telegram_mcp.paths import FixedPaths
 WATCHED_TOOLS = frozenset(
     {
         "Bash",
+        "Monitor",
         "Read",
         "Write",
         "Edit",
@@ -63,6 +64,7 @@ RULES = {
     "Grep": "check_search_tool",
     "WebFetch": "check_fetch_tool",
     "Bash": "check_bash",
+    "Monitor": "check_bash",  # Monitor runs a shell command, read exactly as Bash's
     "Task": "check_subagent",
     "Agent": "check_subagent",
 }
@@ -75,6 +77,7 @@ REQUIRED = {
     "Glob": "pattern",
     "Grep": "pattern",
     "Bash": "command",
+    "Monitor": "command",
     "Task": "prompt",
     "Agent": "prompt",
     "WebFetch": "url",

@@ -12,7 +12,7 @@
         ]
       },
       {
-        "matcher": "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Glob|Grep|Task|Agent|WebFetch",
+        "matcher": "Bash|Monitor|Read|Write|Edit|MultiEdit|NotebookEdit|Glob|Grep|Task|Agent|WebFetch",
         "hooks": [
           {
             "type": "command",
