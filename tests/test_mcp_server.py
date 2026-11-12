@@ -154,5 +154,5 @@ async def test_one_broker_connection_is_kept_for_the_session(
     async with running_broker(paths, fake_gateway) as broker, client(paths) as session:
         for _ in range(3):
             assert not (await session.call_tool("tg_chats_list", {})).is_error
-        status = await broker._status(None, {})  # type: ignore[arg-type]
+        status = await broker._status(None, {})
         assert status["clients"] == 1

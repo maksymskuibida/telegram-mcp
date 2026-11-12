@@ -1,10 +1,18 @@
 """The ConnectionBroker (`telegram-mcp broker`): the one process that holds the Telegram
-connection, the approvals and the activity log (C1; rules BR2.x, BR3.6, BR3.10, BR3.11).
+connection, the approvals and the activity log.
 
-Every tool call and approval check runs its checks in one fixed order (BR3.11):
-authenticated connection, client allowed for writes, vault and session, kind, arguments and
-digest, then either the chat lookup and the question (approval.check) or the single use of a
-confirmed approval and the Telegram call (tool.call)."""
+Every tool call and approval check runs its checks in one fixed order: authenticated
+connection, client allowed for writes, vault and session, kind, arguments and digest, the
+Telegram connection, then either the chat lookup and the question (approval.check) or, for a
+write, the room in the write line, the single use of a confirmed approval and the send.
+
+A write's approval is used when the write enters the write line. Every refusal before that
+keeps the approval; whatever happens after it (dropped unsent, flood wait, timeout, sent), the
+approval is spent and the write is never sent again. Reads, checks, answers and status never
+wait for the write line.
+
+The broker stops by itself after ten minutes with no request, never while a request runs, and
+replaces its secret every hour."""
 
 from __future__ import annotations
 
@@ -12,7 +20,6 @@ import asyncio
 import contextlib
 import hmac
 import os
-import secrets
 import signal
 import stat
 from collections.abc import Awaitable, Callable
@@ -31,7 +38,22 @@ from telegram_mcp.activity_log import (
     utc_now,
 )
 from telegram_mcp.broker import jsonrpc
+from telegram_mcp.broker.link import (
+    DISCONNECT_LIMIT_SECONDS,
+    SessionRefused,
+    TelegramLink,
+    Unreachable,
+)
 from telegram_mcp.broker.lock import PROTOCOL_VERSION, BrokerLock, LockState
+from telegram_mcp.broker.scheduler import (
+    DropReason,
+    LineFull,
+    ReadPlaces,
+    WriteDropped,
+    WriteItem,
+    WriteLine,
+)
+from telegram_mcp.broker.secret import new_secret, remove_leftovers, write_secret
 from telegram_mcp.consent import (
     OPTION_DESCRIPTIONS,
     ActionKind,
@@ -65,10 +87,15 @@ from telegram_mcp.tools import (
 from telegram_mcp.vault import SessionVault, StoredSession, VaultOutcome, VaultReadResult
 
 CHECK_BUDGET_SECONDS = 10.0
-SWEEP_INTERVAL_SECONDS = 10.0
+SWEEP_INTERVAL_SECONDS = 5.0
+CALL_LIMIT_SECONDS = 30.0
+IDLE_LIMIT_SECONDS = 600.0
+SECRET_ROTATION_SECONDS = 3600.0
+READ_ANSWER_LIMIT_SECONDS = 70.0
+LONGEST_READ_FLOOD_WAIT_SECONDS = 30
 STREAM_LIMIT = 2**20
-SECRET_BYTES = 32
 CLIENT_KINDS = ("mcp-server", "approval-hook", "cli")
+SESSION_CLIENT = "mcp-server"
 CLAUDE_CODE = "claude-code"
 PRIVATE_FILE = 0o600
 PRIVATE_FOLDER = 0o700
@@ -93,7 +120,13 @@ MESSAGES = {
     "not_found_chat": "This account cannot see a chat with that id; tg_chats_list shows the ids.",
     "not_found_tool": "This version has no tool with that name.",
     "log_failed": "The message was not sent: could not write the activity log.",
+    "not_sent": (
+        "Not sent: other sends were still running; ask again (a new confirmation is needed)."
+    ),
+    "line_full": "Not sent: too many sends waiting; try again in a moment.",
 }
+
+Sleep = Callable[[float], Awaitable[None]]
 
 
 class BrokerStartError(Exception):
@@ -119,19 +152,31 @@ class ToolFailure(Exception):
         return {"ok": False, "error": error}
 
 
-@dataclass
+@dataclass(eq=False)
 class Connection:
     authenticated: bool = False
     client: str | None = None
     package_version: str | None = None
     client_name: str | None = None
     client_version: str | None = None
+    reader: asyncio.StreamReader | None = None
+    closed: bool = False
+    arrived_at: datetime | None = None
+    """When the request being served reached the broker."""
+    activity_before: datetime | None = None
+    """The broker's last activity before that request arrived."""
 
     @property
     def label(self) -> str:
         if self.client == "mcp-server":
             return f"mcp-server:{self.client_name or 'unknown'}"
         return self.client or "unknown"
+
+    def is_open(self) -> bool:
+        """False once the caller has closed its side, so its answer can no longer arrive."""
+        if self.closed:
+            return False
+        return self.reader is None or not self.reader.at_eof()
 
 
 Handler = Callable[[Connection, dict[str, Any]], Awaitable[Any]]
@@ -147,30 +192,45 @@ class Broker:
         clock: Callable[[], datetime] = utc_now,
         check_budget: float = CHECK_BUDGET_SECONDS,
         sweep_interval: float = SWEEP_INTERVAL_SECONDS,
+        call_limit: float = CALL_LIMIT_SECONDS,
+        idle_limit: float = IDLE_LIMIT_SECONDS,
+        secret_rotation: float = SECRET_ROTATION_SECONDS,
+        sleep: Sleep = asyncio.sleep,
     ) -> None:
         self.paths = paths
         self.check_budget = check_budget
+        self.call_limit = call_limit
+        self.idle_limit = idle_limit
+        self.secret_rotation = secret_rotation
         self.gate = ConsentGate(DECLS, clock=clock)
         self.redactor = Redactor()
-        self.log = ActivityLog(paths.log, self.redactor)
         self.diagnostics = Diagnostics(paths.diagnostics, self.redactor)
+        self.log = ActivityLog(
+            paths.log, self.redactor, on_rotation_failure=self._log_rotation_failed
+        )
         self.settings_refusal: SettingsError | None = None
+        self.link = TelegramLink(
+            gateway_factory, clock=clock, connect_limit=call_limit, report=self.diagnostics.write
+        )
+        self.writes = WriteLine(clock=clock, on_drop=self._write_dropped)
+        self.reads = ReadPlaces()
         self._clock = clock
-        self._gateway_factory = gateway_factory
+        self._sleep = sleep
         self._vault = vault or SessionVault(paths.keychain_service)
         self._sweep_interval = sweep_interval
         self._lock = BrokerLock(paths.lock)
         self._secret = ""
+        self._secret_written_at = clock()
         self._server: asyncio.Server | None = None
         self._sweeper: asyncio.Task[None] | None = None
+        self._stopper: asyncio.Task[None] | None = None
         self._vault_result: VaultReadResult | None = None
-        self._gateway: TelegramGateway | None = None
-        self._write_lock = asyncio.Lock()
-        self._writers: set[asyncio.StreamWriter] = set()
+        self._connections: dict[Connection, asyncio.StreamWriter] = {}
         self._stopped = asyncio.Event()
         self._finished = asyncio.Event()
         self._exit_when_idle = False
-        self._last_request = clock()
+        self._last_activity = clock()
+        self.running_requests = 0
         self._handlers: dict[str, Handler] = {
             "tool.call": self._tool_call,
             "approval.check": self._approval_check,
@@ -182,8 +242,8 @@ class Broker:
     # Start and stop -----------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Hold the lock, then create the secret and the socket with private modes (BR2.2,
-        BR2.3), read the vault once and check the settings (BR7.5)."""
+        """Hold the lock, then create the secret and the socket with private modes, read the
+        vault once and check the settings."""
         _prepare_data_dir(self.paths)
         if not self._lock.try_hold(LockState.RUNNING):
             raise BrokerStartError("another broker or a login holds the lock")
@@ -197,19 +257,17 @@ class Broker:
             raise
         await self._read_vault()
         self._check_settings()
+        self._last_activity = self._clock()
+        self.writes.start()
         self._sweeper = asyncio.create_task(self._sweep_forever())
 
     async def _open_endpoint(self) -> None:
         for leftover in (self.paths.socket, self.paths.secret):
             leftover.unlink(missing_ok=True)
-        self._secret = secrets.token_hex(SECRET_BYTES)
-        descriptor = os.open(
-            self.paths.secret, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, PRIVATE_FILE
-        )
-        try:
-            os.write(descriptor, self._secret.encode("ascii"))
-        finally:
-            os.close(descriptor)
+        remove_leftovers(self.paths.data_dir)
+        self._secret = new_secret()
+        write_secret(self.paths.secret, self._secret)
+        self._secret_written_at = self._clock()
         previous = os.umask(0o077)
         try:
             self._server = await asyncio.start_unix_server(
@@ -219,31 +277,45 @@ class Broker:
             os.umask(previous)
         os.chmod(self.paths.socket, PRIVATE_FILE)
 
-    async def stop(self) -> None:
-        """Clean exit: stop serving, rewrite the lock to released, delete socket and secret."""
+    async def stop(self, reason: str | None = None) -> None:
+        """Clean exit, in this order: stop accepting and delete the socket and the secret,
+        close every client connection, disconnect from Telegram (at most 2 s), then write
+        ``released`` to the lock and drop it. The lock is held until Telegram is
+        disconnected, so a new broker is never connected while this one still is."""
         if self._stopped.is_set():
             await self._finished.wait()
             return
         self._stopped.set()
         try:
-            await self._shut_down()
+            await self._shut_down(reason)
         finally:
             self._finished.set()
 
-    async def _shut_down(self) -> None:
-        if self._sweeper is not None:
+    async def _shut_down(self, reason: str | None) -> None:
+        if self._sweeper is not None and self._sweeper is not asyncio.current_task():
             self._sweeper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._sweeper
-        for writer in list(self._writers):
+        if reason:
+            self.diagnostics.write(reason)
+        server, self._server = self._server, None
+        if server is not None:
+            server.close()
+        for path in (self.paths.socket, self.paths.secret):
+            path.unlink(missing_ok=True)
+        for connection, writer in list(self._connections.items()):
+            connection.closed = True
             writer.close()
-        if self._gateway is not None:
+        if server is not None:
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(self._gateway.disconnect(), 5)
-        await self._close_endpoint()
+                await asyncio.wait_for(server.wait_closed(), DISCONNECT_LIMIT_SECONDS)
+        await self.writes.close()
+        await self.link.close(DISCONNECT_LIMIT_SECONDS)
+        self._lock.release()
         self.diagnostics.write("broker stopped")
 
     async def _close_endpoint(self) -> None:
+        """Undo a start that did not finish."""
         if self._server is not None:
             self._server.close()
             with contextlib.suppress(Exception):
@@ -262,16 +334,16 @@ class Broker:
     async def _serve_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        connection = Connection()
-        self._writers.add(writer)
+        connection = Connection(reader=reader)
+        self._connections[connection] = writer
         try:
             while not self._stopped.is_set():
                 try:
                     line = await reader.readline()
                 except (ValueError, ConnectionError):
                     break
-                if not line:
-                    break
+                if not line or self._stopped.is_set():
+                    break  # a request that arrives while the broker stops is not served
                 reply, close = await self._handle_line(connection, line)
                 if reply:
                     writer.write(reply)
@@ -281,10 +353,11 @@ class Broker:
         except ConnectionError:
             pass
         finally:
-            self._writers.discard(writer)
+            connection.closed = True
+            self._connections.pop(connection, None)
             writer.close()
-            if self._exit_when_idle and not self._writers:
-                asyncio.get_running_loop().create_task(self.stop())
+            if self._exit_when_idle and not self._connections:
+                self._schedule_stop(None)
 
     async def _handle_line(self, connection: Connection, line: bytes) -> tuple[bytes, bool]:
         try:
@@ -292,7 +365,19 @@ class Broker:
         except jsonrpc.RpcError as error:
             reply = jsonrpc.error_message(error.request_id, error.code, error.message)
             return reply, not connection.authenticated
-        self._last_request = self._clock()
+        connection.arrived_at = self._clock()
+        connection.activity_before = self._last_activity
+        self._last_activity = connection.arrived_at
+        self.running_requests += 1
+        try:
+            return await self._dispatch(connection, request)
+        finally:
+            self.running_requests -= 1
+            self._last_activity = self._clock()
+
+    async def _dispatch(
+        self, connection: Connection, request: jsonrpc.Request
+    ) -> tuple[bytes, bool]:
         if not connection.authenticated:
             return self._hello(connection, request)
         handler = self._handlers.get(request.method)
@@ -332,7 +417,15 @@ class Broker:
         result = {"broker_version": __version__, "pid": os.getpid()}
         return jsonrpc.result_message(request.id, result), False
 
-    # Session ----------------------------------------------------------------------------------
+    def _arrival(self, connection: Connection | None) -> datetime:
+        if connection is not None and connection.arrived_at is not None:
+            return connection.arrived_at
+        return self._clock()
+
+    def _seconds_since(self, moment: datetime) -> float:
+        return (self._clock() - moment).total_seconds()
+
+    # Session and the Telegram connection -----------------------------------------------------
 
     async def _read_vault(self) -> VaultReadResult:
         result = await asyncio.to_thread(self._vault.load)
@@ -342,7 +435,7 @@ class Broker:
         return result
 
     async def _session(self) -> StoredSession:
-        """Step 3 of BR3.11: no_session or keychain_locked before any Telegram call."""
+        """no_session or keychain_locked before any Telegram call."""
         result = self._vault_result
         if result is None or result.outcome is not VaultOutcome.LOADED:
             result = await self._read_vault()
@@ -352,19 +445,23 @@ class Broker:
             raise ToolFailure.fixed("no_session")
         return result.session
 
-    async def _authorized_gateway(self, stored: StoredSession) -> TelegramGateway:
-        if self._gateway is None:
-            self._gateway = self._gateway_factory(stored.session, stored.api_id, stored.api_hash)
-            await self._gateway.connect()
-        if not await self._gateway.is_authorized():
-            self._forget_session()
-            raise ToolFailure.fixed("no_session")
-        return self._gateway
+    async def _open_gateway(self, stored: StoredSession) -> TelegramGateway:
+        """The one Telegram connection, opened if needed. During a back-off this answers at
+        once, so nothing waits on a connection that just failed."""
+        try:
+            return await self.link.open(stored)
+        except Unreachable as unreachable:
+            seconds = unreachable.retry_after
+            message = f"Telegram could not be reached; trying again in {seconds} s."
+            raise ToolFailure("telegram_error", message, retry_after=seconds) from unreachable
+        except SessionRefused as refused:
+            self._vault_result = None
+            raise ToolFailure.fixed("no_session") from refused
 
     def _forget_session(self) -> None:
-        """The session is no longer valid: re-read the vault on the next call (BR1.6)."""
+        """The session is no longer valid: re-read the vault and reconnect on the next call."""
         self._vault_result = None
-        self._gateway = None
+        self.link.mark_dropped()
 
     # approval.check -------------------------------------------------------------------------
 
@@ -378,6 +475,7 @@ class Broker:
             return _refusal(failure.code, failure.message)
 
     async def _decide(self, connection: Connection, params: dict[str, Any]) -> dict[str, Any]:
+        arrived = self._arrival(connection)
         stored = await self._session()
         tool = params.get("tool")
         if not isinstance(tool, str) or (tool not in DECLS and self._is_write(tool)):
@@ -385,8 +483,8 @@ class Broker:
         if not self._is_write(tool):
             return {"decision": "allow"}
         args, digest = _validated(tool, params.get("args"))
-        gateway = await self._authorized_gateway(stored)
-        chat = await _resolve(gateway, int(args["chat"]))
+        gateway = await self._open_gateway(stored)
+        chat = await self._lookup(gateway, int(args["chat"]), arrived)
         decision = self.gate.check(tool, digest, chat, args)
         if isinstance(decision, Allow):
             return {"decision": "allow"}
@@ -401,6 +499,36 @@ class Broker:
                 "multi_select": False,
             }
         return _refusal(decision.code, decision.message)
+
+    async def _lookup(self, gateway: TelegramGateway, chat_id: int, arrived: datetime) -> ChatRef:
+        """The chat lookup of a check. A flood wait is waited out once, and only when it fits
+        in what is left of the check's budget; otherwise the check refuses."""
+        try:
+            return await self._resolve(gateway, chat_id)
+        except ToolFailure as failure:
+            wait = failure.retry_after
+            if failure.code != "flood_wait" or wait is None:
+                raise
+            if wait >= self.check_budget - self._seconds_since(arrived):
+                raise
+        await self._sleep(wait)
+        return await self._resolve(gateway, chat_id)
+
+    async def _resolve(self, gateway: TelegramGateway, chat_id: int) -> ChatRef:
+        try:
+            return await gateway.resolve_chat(chat_id)
+        except ChatNotFound as error:
+            raise ToolFailure.fixed("not_found", "not_found_chat") from error
+        except NotAuthorized as error:
+            self._forget_session()
+            raise ToolFailure.fixed("no_session") from error
+        except GatewayTimeout as error:
+            self.link.mark_dropped()
+            raise ToolFailure.fixed("telegram_timeout") from error
+        except FloodWait as error:
+            raise _flood_failure(error.seconds) from error
+        except TelegramError as error:
+            raise ToolFailure("telegram_error", "Telegram refused the chat lookup.") from error
 
     def _is_write(self, tool: str) -> bool:
         return self.gate.kind_of(tool) is not ActionKind.READ
@@ -443,65 +571,117 @@ class Broker:
         try:
             if self._is_write(tool) and connection.client_name != CLAUDE_CODE:
                 raise ToolFailure.fixed("unsupported_client")
-            # BR8.2: the vault is read (and the redactor given its secrets) before any entry
-            # holding the caller's text is written, also after a start with no session.
+            # The vault is read (and the redactor given its secrets) before any entry holding
+            # the caller's text is written, also after a start with no session.
             stored = await self._session()
             self._log_call(connection, tool, raw)
             if tool not in DECLS:
                 raise ToolFailure.fixed("not_found", "not_found_tool")
             if not self._is_write(tool):
-                data = await self._run_read(tool, stored, raw)
+                data = await self._run_read(connection, tool, stored, raw)
                 self._log_result(connection, tool, "ok", None, None)
                 return {"ok": True, "data": data}
             _, digest = _validated(tool, raw)
-            gateway = await self._authorized_gateway(stored)
-            approval = self.gate.consume(tool, digest)
+            gateway = await self._open_gateway(stored)
+            if self.writes.is_full:
+                raise ToolFailure("telegram_error", MESSAGES["line_full"])
+            approval = self.gate.consume(tool, digest)  # used here: the write enters the line
             if approval is None:
                 raise ToolFailure.fixed("needs_confirmation")
-            data = await self._run_send(gateway, approval)
+            data = await self._queue_send(connection, gateway, approval)
         except ToolFailure as failure:
             self._log_result(connection, tool, failure.code, approval, raw)
             return failure.as_result()
         self._log_result(connection, tool, "ok", approval, raw)
         return {"ok": True, "data": data}
 
-    async def _run_read(self, tool: str, stored: StoredSession, raw: object) -> dict[str, Any]:
+    async def _run_read(
+        self, connection: Connection, tool: str, stored: StoredSession, raw: object
+    ) -> dict[str, Any]:
+        """A read takes one of the read places, never the write line. A flood wait of at most
+        30 s is waited out once, when the second try still answers inside 70 s of arrival."""
+        arrived = self._arrival(connection)
         args = _validated_read(tool, raw)
-        gateway = await self._authorized_gateway(stored)
+        gateway = await self._open_gateway(stored)
         try:
+            return await self._read_once(gateway, args)
+        except FloodWait as flood:
+            if not self._may_wait_out(flood.seconds, arrived):
+                raise self._read_failure(flood) from flood
+            wait = flood.seconds
+        except Exception as error:
+            raise self._read_failure(error) from error
+        await self._sleep(wait)
+        try:
+            return await self._read_once(gateway, args)
+        except Exception as error:
+            raise self._read_failure(error) from error
+
+    async def _read_once(self, gateway: TelegramGateway, args: dict[str, Any]) -> dict[str, Any]:
+        # The wait for a place counts in the call's own time limit.
+        async with asyncio.timeout(self.call_limit), self.reads.place():
             chats, next_offset = await gateway.list_chats(
                 args["folder_id"], args["limit"], args["offset"]
             )
-        except Exception as error:
-            raise self._read_failure(error) from error
         return list_result(chats, next_offset)
 
+    def _may_wait_out(self, seconds: int, arrived: datetime) -> bool:
+        if seconds > LONGEST_READ_FLOOD_WAIT_SECONDS:
+            return False
+        answered_by = self._seconds_since(arrived) + seconds + self.call_limit
+        return answered_by <= READ_ANSWER_LIMIT_SECONDS
+
+    async def _queue_send(
+        self, connection: Connection, gateway: TelegramGateway, approval: PendingApproval
+    ) -> Any:
+        item = WriteItem(
+            tool=approval.tool,
+            approval_id=approval.id,
+            arrived_at=self._arrival(connection),
+            is_open=connection.is_open,
+            run=lambda: self._run_send(gateway, approval),
+        )
+        try:
+            sent = await self.writes.submit(item)
+        except WriteDropped as dropped:
+            raise ToolFailure.fixed("telegram_timeout", "not_sent") from dropped
+        except LineFull as full:
+            raise ToolFailure("telegram_error", MESSAGES["line_full"]) from full
+        except ToolFailure:
+            raise
+        except Exception as error:
+            raise self._write_failure(error) from error
+        return send_result(sent)
+
     async def _run_send(self, gateway: TelegramGateway, approval: PendingApproval) -> Any:
-        """Send exactly what was approved, to the chat stored at check time (BR3.9). The
-        approval is already used, so nothing here is ever resent."""
-        async with self._write_lock:
-            try:
-                sent = await gateway.send_text(
+        """Send exactly what was approved, to the chat stored at check time. The approval is
+        already used, so nothing here is ever resent."""
+        try:
+            async with asyncio.timeout(self.call_limit):
+                return await gateway.send_text(
                     approval.chat_id, approval.content, approval.reply_to, approval.topic_id
                 )
-            except Exception as error:
-                raise self._write_failure(error) from error
-        return send_result(sent)
+        except Exception as error:
+            raise self._write_failure(error) from error
 
     def _read_failure(self, error: Exception) -> ToolFailure:
         if isinstance(error, GatewayTimeout | TimeoutError):
+            self.link.mark_dropped()
             return ToolFailure.fixed("telegram_timeout")
         return self._common_failure(error) or self._unexpected(error, "telegram_error")
 
     def _write_failure(self, error: Exception) -> ToolFailure:
+        if isinstance(error, FloodWait):
+            return _flood_failure(error.seconds, sent_nothing=True)
         if isinstance(error, OutcomeUnknown | GatewayTimeout | TimeoutError | ConnectionError):
+            if not isinstance(error, OutcomeUnknown):
+                self.link.mark_dropped()
             return ToolFailure.fixed("outcome_unknown")
         return self._common_failure(error) or self._unexpected(error, "outcome_unknown")
 
     def _common_failure(self, error: Exception) -> ToolFailure | None:
         if isinstance(error, FloodWait):
-            message = f"Telegram asked to wait {error.seconds} s; try again after that."
-            return ToolFailure("flood_wait", message, retry_after=error.seconds)
+            return _flood_failure(error.seconds)
         if isinstance(error, NotAuthorized):
             self._forget_session()
             return ToolFailure.fixed("no_session")
@@ -518,24 +698,54 @@ class Broker:
             return ToolFailure.fixed("outcome_unknown")
         return ToolFailure("telegram_error", "Telegram could not be reached; try again.")
 
-    # Status, stop, expiry ----------------------------------------------------------------------
+    def _write_dropped(self, item: WriteItem, reason: DropReason) -> None:
+        self.diagnostics.write(
+            f"send not started ({reason}): {item.tool}, approval {item.approval_id}"
+        )
 
-    async def _status(self, connection: Connection, params: dict[str, Any]) -> Any:
-        idle = (self._clock() - self._last_request).total_seconds()
+    # Status, stop, the sweep -------------------------------------------------------------------
+
+    async def _status(self, connection: Connection | None, params: dict[str, Any]) -> Any:
+        """``clients`` counts the Claude Code sessions connected; ``idle_seconds`` is how long
+        the broker had been idle before this status request arrived."""
+        before = self._last_activity
+        if connection is not None and connection.activity_before is not None:
+            before = connection.activity_before
         loaded = self._vault_result is not None and self._vault_result.session is not None
         return {
             "logged_in": loaded,
             "account": None,
-            "clients": len(self._writers),
-            "idle_seconds": max(0, int(idle)),
+            "clients": self.session_count(),
+            "idle_seconds": max(0, int(self._seconds_since(before))),
         }
 
+    def session_count(self) -> int:
+        return sum(
+            1
+            for connection in self._connections
+            if connection.authenticated
+            and connection.client == SESSION_CLIENT
+            and connection.is_open()
+        )
+
     async def _stop_request(self, connection: Connection, params: dict[str, Any]) -> Any:
-        asyncio.get_running_loop().call_soon(lambda: asyncio.ensure_future(self.stop()))
+        asyncio.get_running_loop().call_soon(self._schedule_stop, None)
         return {"ok": True}
 
+    def _schedule_stop(self, reason: str | None) -> None:
+        if self._stopper is None and not self._stopped.is_set():
+            self._stopper = asyncio.get_running_loop().create_task(self.stop(reason))
+
+    def sweep(self) -> None:
+        """One pass of the broker's timers: expire approvals, drop sends that can no longer
+        start, replace the secret when it is due, and stop when idle."""
+        self.sweep_expired()
+        self.writes.drop_overdue()
+        self.rotate_secret_if_due()
+        self.stop_if_idle()
+
     def sweep_expired(self) -> None:
-        """Expire approvals that are due and log each one (BR3.7)."""
+        """Expire approvals that are due and log each one."""
         for approval, previous in self.gate.sweep():
             if previous is ApprovalStatus.PENDING:
                 self._log_entry(
@@ -544,10 +754,39 @@ class Broker:
             else:
                 self._log_entry("broker", "result", approval.tool, "timed_out", approval)
 
+    def stop_if_idle(self) -> None:
+        """Stop after ten minutes with no request, never while one runs. Open but silent
+        connections, the sweep and the secret rotation are not activity."""
+        if self._stopped.is_set() or self.running_requests or self.writes.busy:
+            return
+        idle = self._seconds_since(self._last_activity)
+        if idle >= self.idle_limit:
+            self._schedule_stop(f"idle stop after {int(idle // 60)} minutes with no request")
+
+    def rotate_secret_if_due(self) -> None:
+        """Replace the secret every hour. Connections already open stay accepted; a failed
+        swap keeps the old secret in force and is tried again an hour later."""
+        if self._seconds_since(self._secret_written_at) < self.secret_rotation:
+            return
+        self._secret_written_at = self._clock()
+        value = new_secret()
+        try:
+            write_secret(self.paths.secret, value)
+        except OSError as error:
+            self.diagnostics.write(
+                f"secret rotation failed ({type(error).__name__}); the old secret stays in force"
+            )
+            return
+        self._secret = value
+        self.diagnostics.write("secret rotated")
+
     async def _sweep_forever(self) -> None:
         while True:
             await asyncio.sleep(self._sweep_interval)
-            self.sweep_expired()
+            try:
+                self.sweep()
+            except Exception as error:  # a failed pass must not end the timers
+                self.diagnostics.exception("sweep", error)
 
     def _check_settings(self) -> None:
         try:
@@ -562,8 +801,14 @@ class Broker:
 
     # Logging ---------------------------------------------------------------------------------
 
+    def _log_rotation_failed(self, error: OSError) -> None:
+        self.diagnostics.write(
+            f"activity log rotation failed ({type(error).__name__}); the entry was kept in "
+            "activity.log and the next entry tries again"
+        )
+
     def _log_call(self, connection: Connection, tool: str, raw: object) -> None:
-        """BR8.1: a write whose call entry cannot be written is refused."""
+        """A write whose call entry cannot be written is refused."""
         chat_id, content = _peek(raw)
         try:
             self.log.append(
@@ -634,6 +879,14 @@ class Broker:
 # Helpers --------------------------------------------------------------------------------------
 
 
+def _flood_failure(seconds: int, *, sent_nothing: bool = False) -> ToolFailure:
+    if sent_nothing:
+        message = f"Telegram asked to wait {seconds} s; nothing was sent. Ask again after that."
+    else:
+        message = f"Telegram asked to wait {seconds} s; try again after that."
+    return ToolFailure("flood_wait", message, retry_after=seconds)
+
+
 def _validated(tool: str, raw: object) -> tuple[dict[str, Any], str]:
     try:
         args = validate_args(tool, raw)
@@ -647,22 +900,6 @@ def _validated_read(tool: str, raw: object) -> dict[str, Any]:
         return validate_args(tool, raw if raw is not None else {})
     except InvalidArguments as error:
         raise ToolFailure("invalid_arguments", str(error)) from error
-
-
-async def _resolve(gateway: TelegramGateway, chat_id: int) -> ChatRef:
-    try:
-        return await gateway.resolve_chat(chat_id)
-    except ChatNotFound as error:
-        raise ToolFailure.fixed("not_found", "not_found_chat") from error
-    except NotAuthorized as error:
-        raise ToolFailure.fixed("no_session") from error
-    except GatewayTimeout as error:
-        raise ToolFailure.fixed("telegram_timeout") from error
-    except FloodWait as error:
-        message = f"Telegram asked to wait {error.seconds} s; try again after that."
-        raise ToolFailure("flood_wait", message, retry_after=error.seconds) from error
-    except TelegramError as error:
-        raise ToolFailure("telegram_error", "Telegram refused the chat lookup.") from error
 
 
 def _refusal(code: str, message: str) -> dict[str, Any]:
@@ -706,7 +943,7 @@ def _prepare_data_dir(paths: FixedPaths) -> None:
 
 
 def _require_private_modes(paths: FixedPaths) -> None:
-    """NFR7.3: refuse to serve when a file or the socket does not have its private mode."""
+    """Refuse to serve when a file or the socket does not have its private mode."""
     expected = {
         paths.data_dir: PRIVATE_FOLDER,
         paths.secret: PRIVATE_FILE,

@@ -299,7 +299,8 @@ async def test_ten_callers_at_once_yield_one_broker(paths: FixedPaths) -> None:
         results = await asyncio.gather(
             *(client.request("broker.status", {}, 5) for client in clients)
         )
-        assert all(result["clients"] >= 1 for result in results)
+        # Command connections are not Claude Code sessions, so none is counted.
+        assert all(result["clients"] == 0 for result in results)
         pids = {client.broker_pid for client in clients}
         assert len(pids) == 1
         assert pids != {os.getpid()}
