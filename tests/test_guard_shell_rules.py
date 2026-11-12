@@ -688,3 +688,28 @@ def test_a_link_from_a_folder_that_cannot_be_placed_is_refused(gh: GuardHome) ->
 )
 def test_other_links_pass(gh: GuardHome, command: str, cwd: str | None) -> None:
     check_passed(gh, command, cwd)
+
+
+# xargs adds the subcommand from standard input, so the tool after it needs an allowed one
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "printf login | xargs telegram-mcp",
+        "echo log | xargs -n1 telegram-mcp",
+        "xargs telegram-mcp < commands.txt",
+        "xargs -0 telegram-mcp --verbose",
+        "sudo xargs uvx telegram-mcp",
+    ],
+)
+def test_xargs_feeding_the_tool_its_subcommand_is_refused(gh: GuardHome, command: str) -> None:
+    check_refused(gh, command, Route.OWN_COMMAND)
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["echo | xargs telegram-mcp status", "xargs telegram-mcp --version", "xargs ls telegram-mcp"],
+)
+def test_xargs_with_an_allowed_subcommand_passes(gh: GuardHome, command: str) -> None:
+    check_passed(gh, command)
