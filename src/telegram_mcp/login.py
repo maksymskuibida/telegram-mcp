@@ -30,6 +30,7 @@ from telegram_mcp.gateway.models import (
     PasswordNeeded,
     SentCodeInfo,
     TelegramError,
+    account_label,
 )
 from telegram_mcp.gateway.protocol import GatewayFactory, TelegramGateway
 from telegram_mcp.paths import FixedPaths
@@ -86,8 +87,7 @@ class LoginStopped(Exception):
 
 
 def describe(me: Me) -> str:
-    handle = f"@{me.username}, " if me.username else ""
-    return f"{me.name} ({handle}id {me.id})"
+    return account_label(me)
 
 
 async def login(

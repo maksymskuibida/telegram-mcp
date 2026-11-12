@@ -40,6 +40,15 @@ class VaultReadResult:
     cause: str | None = None
 
 
+@dataclass(frozen=True)
+class VaultDeleteResult:
+    """``cleared`` is true when none of the three items is left; ``cause`` ("locked" or
+    "access denied") names why one could not be deleted."""
+
+    cleared: bool
+    cause: str | None = None
+
+
 class VaultError(Exception):
     """A Keychain write failed. ``cause`` is "locked" or "access denied"; ``logged_out`` says
     that restoring the previous session failed too, so nothing is stored any more."""
@@ -98,6 +107,18 @@ class SessionVault:
                 self._delete(list(ITEMS))
                 raise VaultError(_cause(error), logged_out=True) from error
             raise VaultError(_cause(error)) from error
+
+    def delete(self) -> VaultDeleteResult:
+        """Delete all three items (logout). A missing item counts as removed; every item is
+        tried even when an earlier one cannot be deleted."""
+        cause: str | None = None
+        for item in ITEMS:
+            try:
+                if keyring.get_password(self._service, item) is not None:
+                    keyring.delete_password(self._service, item)
+            except KeyringError as error:
+                cause = cause or _cause(error)
+        return VaultDeleteResult(cleared=cause is None, cause=cause)
 
     def _delete(self, items: list[str]) -> None:
         for item in items:

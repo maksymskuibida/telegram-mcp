@@ -409,7 +409,7 @@ async def test_status_checks_the_session_with_telegram_and_names_the_account(
     assert status["account"] == ACCOUNT
     assert status["cause"] is None
     assert status["pid"] == os.getpid()
-    assert status["clients"] == 1
+    assert status["clients"] == 0  # the status command is not a Claude Code session
     assert status["mcp_clients"] == 0
     assert "is_authorized" in fake_gateway.call_names()
     assert log_entries(paths) == []
@@ -440,7 +440,7 @@ async def test_a_session_ended_elsewhere_is_reported_and_forgotten(
         False,
         None,
     )
-    assert broker._gateway is None
+    assert broker.link.state.value == "closed"
     assert log_entries(paths) == []
 
 
@@ -486,13 +486,15 @@ async def test_status_counts_the_claude_sessions_apart_from_other_connections(
 ) -> None:
     await start_broker()
     servers = [await RawClient.connect(paths) for _ in range(3)]
-    await hook(paths)
-    status = await (await cli(paths)).result("broker.status")
-    assert (status["mcp_clients"], status["clients"]) == (3, 5)
+    approval_hook = await hook(paths)
+    command = await cli(paths)
+    status = await command.result("broker.status")
+    assert (status["mcp_clients"], status["clients"]) == (3, 3)
     await servers[0].close()
     await asyncio.sleep(0.05)
-    status = await (await cli(paths)).result("broker.status")
-    assert status["mcp_clients"] == 2
+    status = await command.result("broker.status")
+    assert (status["mcp_clients"], status["clients"]) == (2, 2)
+    await approval_hook.close()
 
 
 def test_the_default_budgets_are_fifteen_and_thirty_seconds(paths: FixedPaths) -> None:

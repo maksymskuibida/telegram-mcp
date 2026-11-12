@@ -71,6 +71,12 @@ class Me:
     username: str | None
 
 
+def account_label(me: Me) -> str:
+    """How every command names the account: name, @username and id, never the phone number."""
+    handle = f"@{me.username}, " if me.username else ""
+    return f"{me.name} ({handle}id {me.id})"
+
+
 @dataclass(frozen=True)
 class QrToken:
     """One QR login token. ``url`` (``tg://login?token=…``) is a login secret: it is shown on

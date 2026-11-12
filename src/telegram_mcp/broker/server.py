@@ -73,6 +73,7 @@ from telegram_mcp.gateway.models import (
     NotAuthorized,
     OutcomeUnknown,
     TelegramError,
+    account_label,
 )
 from telegram_mcp.gateway.protocol import GatewayFactory, TelegramGateway
 from telegram_mcp.paths import FixedPaths
@@ -84,11 +85,19 @@ from telegram_mcp.tools import (
     send_result,
     validate_args,
 )
-from telegram_mcp.vault import SessionVault, StoredSession, VaultOutcome, VaultReadResult
+from telegram_mcp.vault import (
+    SessionVault,
+    StoredSession,
+    VaultDeleteResult,
+    VaultOutcome,
+    VaultReadResult,
+)
 
 CHECK_BUDGET_SECONDS = 10.0
 SWEEP_INTERVAL_SECONDS = 5.0
 CALL_LIMIT_SECONDS = 30.0
+STATUS_BUDGET_SECONDS = 15.0
+LOGOUT_BUDGET_SECONDS = 30.0
 IDLE_LIMIT_SECONDS = 600.0
 SECRET_ROTATION_SECONDS = 3600.0
 READ_ANSWER_LIMIT_SECONDS = 70.0
@@ -182,6 +191,26 @@ class Connection:
 Handler = Callable[[Connection, dict[str, Any]], Awaitable[Any]]
 
 
+@dataclass(frozen=True)
+class _Ended:
+    """What Telegram said to a logout: ``reason`` None means it confirmed."""
+
+    account: str | None
+    reason: str | None
+    retry_after: int | None = None
+    error_type: str | None = None
+
+
+def _logout_reason(error: Exception) -> tuple[str, int | None]:
+    if isinstance(error, FloodWait):
+        return "flood_wait", error.seconds
+    if isinstance(error, NotAuthorized | SessionRefused):
+        return "no_session", None
+    if isinstance(error, GatewayTimeout | TimeoutError):
+        return "telegram_timeout", None
+    return "telegram_error", None
+
+
 class Broker:
     def __init__(
         self,
@@ -195,6 +224,8 @@ class Broker:
         call_limit: float = CALL_LIMIT_SECONDS,
         idle_limit: float = IDLE_LIMIT_SECONDS,
         secret_rotation: float = SECRET_ROTATION_SECONDS,
+        status_budget: float = STATUS_BUDGET_SECONDS,
+        logout_budget: float = LOGOUT_BUDGET_SECONDS,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
         self.paths = paths
@@ -202,6 +233,8 @@ class Broker:
         self.call_limit = call_limit
         self.idle_limit = idle_limit
         self.secret_rotation = secret_rotation
+        self.status_budget = status_budget
+        self.logout_budget = logout_budget
         self.gate = ConsentGate(DECLS, clock=clock)
         self.redactor = Redactor()
         self.diagnostics = Diagnostics(paths.diagnostics, self.redactor)
@@ -226,6 +259,8 @@ class Broker:
         self._stopper: asyncio.Task[None] | None = None
         self._vault_result: VaultReadResult | None = None
         self._connections: dict[Connection, asyncio.StreamWriter] = {}
+        self._logging_out = False
+        self._logout_answered = asyncio.Event()
         self._stopped = asyncio.Event()
         self._finished = asyncio.Event()
         self._exit_when_idle = False
@@ -237,6 +272,7 @@ class Broker:
             "approval.answer": self._approval_answer,
             "broker.status": self._status,
             "broker.stop": self._stop_request,
+            "session.logout": self._logout,
         }
 
     # Start and stop -----------------------------------------------------------------------
@@ -466,6 +502,8 @@ class Broker:
     # approval.check -------------------------------------------------------------------------
 
     async def _approval_check(self, connection: Connection, params: dict[str, Any]) -> Any:
+        if self._logging_out:
+            return _refusal("no_session", MESSAGES["no_session"])
         try:
             async with asyncio.timeout(self.check_budget):
                 return await self._decide(connection, params)
@@ -536,6 +574,8 @@ class Broker:
     # approval.answer ------------------------------------------------------------------------
 
     async def _approval_answer(self, connection: Connection, params: dict[str, Any]) -> Any:
+        if self._logging_out:
+            return {"outcome": "unknown"}
         question, pick = params.get("question"), params.get("pick")
         options = _text_list(params.get("options"))
         descriptions = _text_list(params.get("option_descriptions"))
@@ -563,6 +603,8 @@ class Broker:
     # tool.call -------------------------------------------------------------------------------
 
     async def _tool_call(self, connection: Connection, params: dict[str, Any]) -> Any:
+        if self._logging_out:
+            return ToolFailure.fixed("no_session").as_result()
         tool = params.get("tool")
         if not isinstance(tool, str):
             return ToolFailure("invalid_arguments", "tool must be a tool name").as_result()
@@ -656,6 +698,8 @@ class Broker:
     async def _run_send(self, gateway: TelegramGateway, approval: PendingApproval) -> Any:
         """Send exactly what was approved, to the chat stored at check time. The approval is
         already used, so nothing here is ever resent."""
+        if self._logging_out:  # a logout started while this send waited: the session is gone
+            raise ToolFailure.fixed("no_session")
         try:
             async with asyncio.timeout(self.call_limit):
                 return await gateway.send_text(
@@ -706,18 +750,43 @@ class Broker:
     # Status, stop, the sweep -------------------------------------------------------------------
 
     async def _status(self, connection: Connection | None, params: dict[str, Any]) -> Any:
-        """``clients`` counts the Claude Code sessions connected; ``idle_seconds`` is how long
-        the broker had been idle before this status request arrived."""
+        """The vault, then (with a session) Telegram, within 15 s. Writes no log entry.
+        ``clients`` and ``mcp_clients`` count the Claude Code sessions connected;
+        ``idle_seconds`` is how long the broker had been idle before this request arrived."""
         before = self._last_activity
         if connection is not None and connection.activity_before is not None:
             before = connection.activity_before
-        loaded = self._vault_result is not None and self._vault_result.session is not None
+        state, account, cause = await self._session_state()
+        sessions = self.session_count()
         return {
-            "logged_in": loaded,
-            "account": None,
-            "clients": self.session_count(),
+            "logged_in": state == "logged_in",
+            "account": account,
+            "clients": sessions,
             "idle_seconds": max(0, int(self._seconds_since(before))),
+            "session_state": state,
+            "cause": cause,
+            "pid": os.getpid(),
+            "mcp_clients": sessions,
         }
+
+    async def _session_state(self) -> tuple[str, str | None, str | None]:
+        """(session_state, account, cause): logged_in, no_session, ended, keychain_locked or
+        unreachable."""
+        result = await self._read_vault()
+        if result.outcome is VaultOutcome.KEYCHAIN_LOCKED:
+            return "keychain_locked", None, result.cause
+        if result.session is None:
+            return "no_session", None, None
+        try:
+            async with asyncio.timeout(self.status_budget):
+                gateway = await self.link.open(result.session)
+                return "logged_in", account_label(await gateway.me()), None
+        except (SessionRefused, NotAuthorized):
+            self._forget_session()
+            return "ended", None, None
+        except Exception as error:  # any failure reaching Telegram is "unreachable"
+            self.diagnostics.write(f"status check failed: {type(error).__name__}")
+            return "unreachable", None, None
 
     def session_count(self) -> int:
         return sum(
@@ -729,6 +798,8 @@ class Broker:
         )
 
     async def _stop_request(self, connection: Connection, params: dict[str, Any]) -> Any:
+        if self._logging_out:  # a login starting now never cuts a logout in half
+            await self._logout_answered.wait()
         asyncio.get_running_loop().call_soon(self._schedule_stop, None)
         return {"ok": True}
 
@@ -743,6 +814,73 @@ class Broker:
         self.writes.drop_overdue()
         self.rotate_secret_if_due()
         self.stop_if_idle()
+
+    # session.logout ---------------------------------------------------------------------------
+
+    async def _logout(self, connection: Connection, params: dict[str, Any]) -> Any:
+        """Refuse everything new, let a running send finish (the ones still waiting in the line
+        are refused), end the session on Telegram, clear the Keychain whatever Telegram
+        answered, log once, answer, then stop."""
+        self._logging_out = True
+        try:
+            await self.writes.wait_idle()
+            self.gate.drop_open()
+            ended = await self._end_session()
+            deleted = await asyncio.to_thread(self._vault.delete)
+            self.sweep_expired()
+            self._log_logout(connection, ended, deleted)
+            self._forget_session()
+        finally:
+            self._logout_answered.set()
+            asyncio.get_running_loop().call_soon(self._schedule_stop, None)
+        return {
+            "ok": deleted.cleared,
+            "account": ended.account,
+            "telegram_confirmed": ended.reason is None,
+            "telegram_reason": ended.reason,
+            "retry_after": ended.retry_after,
+            "keychain_cleared": deleted.cleared,
+            "keychain_cause": deleted.cause,
+        }
+
+    async def _end_session(self) -> _Ended:
+        result = await self._read_vault()
+        if result.outcome is VaultOutcome.KEYCHAIN_LOCKED:
+            return _Ended(None, "telegram_error", error_type="KeychainLocked")
+        if result.session is None:
+            return _Ended(None, "no_session")
+        account: str | None = None
+        try:
+            async with asyncio.timeout(self.status_budget):
+                gateway = await self.link.open(result.session)
+                account = account_label(await gateway.me())
+        except (SessionRefused, NotAuthorized) as refused:
+            return _Ended(None, "no_session", error_type=type(refused).__name__)
+        except Exception as error:  # the name is not essential: carry on with the logout
+            self.diagnostics.write(f"logout: account lookup failed: {type(error).__name__}")
+        try:
+            async with asyncio.timeout(self.logout_budget):
+                confirmed = await self.link.open(result.session)
+                if await confirmed.log_out():
+                    return _Ended(account, None)
+                return _Ended(account, "telegram_error", error_type="NotConfirmed")
+        except Exception as error:  # every failure is a reason, never an unanswered call
+            reason, retry_after = _logout_reason(error)
+            return _Ended(account, reason, retry_after, type(error).__name__)
+
+    def _log_logout(
+        self, connection: Connection, ended: _Ended, deleted: VaultDeleteResult
+    ) -> None:
+        if not deleted.cleared:
+            result = "keychain_locked"
+            if ended.reason is not None:
+                self.diagnostics.write(
+                    f"logout: Telegram did not confirm ({ended.reason}, {ended.error_type}) "
+                    f"and the Keychain could not delete the session ({deleted.cause})"
+                )
+        else:
+            result = ended.reason or "ok"
+        self._log_entry(connection.label, "result", "logout", result, None, content=ended.account)
 
     def sweep_expired(self) -> None:
         """Expire approvals that are due and log each one."""
