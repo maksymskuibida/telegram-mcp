@@ -43,11 +43,12 @@ def client(paths: FixedPaths, info: types.Implementation = CLAUDE) -> Client:
     return Client(build_server(paths, spawn=never_spawn), client_info=info)
 
 
-async def test_lists_the_two_tools_with_closed_schemas(paths: FixedPaths) -> None:
+async def test_lists_every_tool_with_closed_schemas(paths: FixedPaths) -> None:
     async with client(paths) as session:
         listed = await session.list_tools()
     tools = {tool.name: tool for tool in listed.tools}
-    assert set(tools) == {"tg_chats_list", SEND}
+    assert {"tg_chats_list", SEND, "tg_files_send", "tg_messages_read"} <= set(tools)
+    assert len(tools) == 30
     assert all(tool.input_schema["additionalProperties"] is False for tool in tools.values())
     description = tools[SEND].description or ""
     assert description.startswith("The first call never sends: ")

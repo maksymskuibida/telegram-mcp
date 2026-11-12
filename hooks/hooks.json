@@ -2,7 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "mcp__plugin_telegram-mcp_telegram__tg_messages_send",
+        "matcher": "mcp__plugin_telegram-mcp_telegram__tg_(messages_(send|edit|delete|forward|react|pin|unpin|read)|chats_(mark_read|create|join|leave|edit)|topics_create|invites_create|admins_set|profile_edit|files_send)",
         "hooks": [
           {
             "type": "command",
