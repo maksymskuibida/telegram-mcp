@@ -13,13 +13,14 @@ from telegram_mcp.actions import ConsentAction
 from telegram_mcp.catalog.common import (
     Args,
     CatalogContext,
+    chat_dict,
     message_dict,
     message_fields,
     named_messages,
     with_notice,
 )
 from telegram_mcp.consent import PendingApproval
-from telegram_mcp.gateway.models import ChatRef
+from telegram_mcp.gateway.models import ChatRef, SearchHit
 from telegram_mcp.gateway.protocol import TelegramGateway
 from telegram_mcp.prompts import HeadlineDetails, PromptError, PromptFields
 from telegram_mcp.tools import (
@@ -29,10 +30,14 @@ from telegram_mcp.tools import (
     MESSAGES_EDIT,
     MESSAGES_FORWARD,
     MESSAGES_PIN,
+    MESSAGES_PINNED,
     MESSAGES_REACT,
     MESSAGES_READ,
     MESSAGES_READ_LIMIT,
+    MESSAGES_SEARCH,
     MESSAGES_UNPIN,
+    QUERY_LIMIT,
+    SEARCH_LIMIT,
     TEXT_LIMIT,
 )
 
@@ -74,9 +79,7 @@ async def _describe_edit(gateway: TelegramGateway, args: dict[str, Any]) -> Prom
     chat = await gateway.resolve_chat(args["chat"])
     found = await gateway.read_messages(chat.id, 1, ids=[args["message_id"]])
     if not found:
-        raise PromptError(
-            "not_found", f"Message {args['message_id']} was not found in this chat."
-        )
+        raise PromptError("not_found", f"Message {args['message_id']} was not found in this chat.")
     message = found[0]
     if not message.outgoing:
         raise PromptError("not_allowed", "You can edit only your own messages.")
@@ -279,13 +282,63 @@ def read_action() -> ConsentAction:
     )
 
 
+# tg_messages_pinned, tg_messages_search (BR22.3) ---------------------------------------------
+
+PINNED_LIMIT = 50
+
+
+def _validate_pinned(raw: object) -> dict[str, Any]:
+    return {"chat": Args(MESSAGES_PINNED, raw, ("chat",)).chat()}
+
+
+async def _run_pinned(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    found = await gateway.read_pinned(args["chat"], PINNED_LIMIT)
+    return with_notice(
+        {"chat_id": args["chat"], "messages": [message_dict(m) for m in found]},
+        message_fields("messages[]"),
+    )
+
+
+def _validate_search(raw: object) -> dict[str, Any]:
+    args = Args(MESSAGES_SEARCH, raw, ("query", "chat", "limit"))
+    low, high, default = SEARCH_LIMIT
+    return {
+        "query": args.required_text("query", max_len=QUERY_LIMIT),
+        "chat": args.chat() if args.given("chat") else None,
+        "limit": args.integer("limit", default=default, minimum=low, maximum=high),
+    }
+
+
+async def _run_search(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    if args["chat"] is not None:
+        chat = await gateway.resolve_chat(args["chat"])
+        found = await gateway.search_chat(chat.id, args["query"], args["limit"])
+        hits = [SearchHit(chat=chat, message=message) for message in found]
+    else:
+        hits = await gateway.search_global(args["query"], args["limit"])
+    shaped = [{"chat": chat_dict(hit.chat), "message": message_dict(hit.message)} for hit in hits]
+    return with_notice(
+        {"query": args["query"], "hits": shaped},
+        ["hits[].chat.name", *message_fields("hits[].message")],
+    )
+
+
+def read_actions() -> list[ConsentAction]:
+    return [
+        ConsentAction(DECLS[MESSAGES_PINNED], _validate_pinned, run=_run_pinned),
+        ConsentAction(DECLS[MESSAGES_SEARCH], _validate_search, run=_run_search),
+    ]
+
+
 def write_actions(context: CatalogContext) -> list[ConsentAction]:
     return [
         ConsentAction(DECLS[MESSAGES_EDIT], _validate_edit, _describe_edit, _run_edit),
         ConsentAction(DECLS[MESSAGES_DELETE], _validate_delete, _describe_delete, _run_delete),
-        ConsentAction(
-            DECLS[MESSAGES_FORWARD], _validate_forward, _describe_forward, _run_forward
-        ),
+        ConsentAction(DECLS[MESSAGES_FORWARD], _validate_forward, _describe_forward, _run_forward),
         ConsentAction(
             DECLS[MESSAGES_REACT],
             _validate_react,

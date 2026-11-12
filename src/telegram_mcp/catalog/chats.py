@@ -7,40 +7,57 @@ id, and it never guesses (BR21.2, BR21.3)."""
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 from telegram_mcp.actions import ConsentAction
-from telegram_mcp.catalog.common import Args, CatalogContext, chat_dict, require_group, with_notice
+from telegram_mcp.catalog.common import (
+    CHAT_ID_TEXT,
+    Args,
+    CatalogContext,
+    chat_dict,
+    require_group,
+    with_notice,
+)
 from telegram_mcp.catalog.messages import approved, approved_chat
 from telegram_mcp.consent import PendingApproval, canonical_digest
 from telegram_mcp.files import NO_RECORD_MESSAGE, FileRefused, admit, open_admitted
-from telegram_mcp.gateway.models import ChatNotFound
+from telegram_mcp.gateway.models import ChatNotFound, ChatRef
 from telegram_mcp.gateway.protocol import TelegramGateway
-from telegram_mcp.prompts import FieldChange, HeadlineDetails, Person, PromptError, PromptFields
+from telegram_mcp.prompts import (
+    FieldChange,
+    HeadlineDetails,
+    Person,
+    PromptError,
+    PromptFields,
+    sanitize_chat_name,
+)
 from telegram_mcp.tools import (
     ABOUT_LIMIT,
     CHATS_CREATE,
     CHATS_EDIT,
+    CHATS_INFO,
     CHATS_JOIN,
     CHATS_LEAVE,
     CHATS_MARK_READ,
+    CHATS_RESOLVE,
     DECLS,
+    FOLDERS_LIST,
     INVITES_CREATE,
-    InvalidArguments,
     MAX_EXPIRE_SECONDS,
     MAX_USAGE_LIMIT,
     QUERY_LIMIT,
     TITLE_LIMIT,
     TOPICS_CREATE,
+    TOPICS_LIST,
+    InvalidArguments,
 )
 
 _LINK_HOST = r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/"
 INVITE_LINK = re.compile(rf"^{_LINK_HOST}(?:\+|joinchat/)([A-Za-z0-9_-]{{1,64}})/?$")
 USERNAME_LINK = re.compile(rf"^{_LINK_HOST}([A-Za-z][A-Za-z0-9_]{{3,31}})/?$")
 USERNAME = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{3,31})$")
-JOIN_FORMS = (
-    "link_or_username must be @name, name, t.me/name, t.me/+hash or t.me/joinchat/hash"
-)
+JOIN_FORMS = "link_or_username must be @name, name, t.me/name, t.me/+hash or t.me/joinchat/hash"
 
 
 def parse_join(value: str) -> tuple[str | None, str | None]:
@@ -92,8 +109,7 @@ def _validate_create(raw: object) -> dict[str, Any]:
     members = args.ids("members", minimum=0)
     if kind == "channel" and members:
         raise InvalidArguments(
-            "members: a channel is created without members; invite people with "
-            "tg_invites_create"
+            "members: a channel is created without members; invite people with tg_invites_create"
         )
     return {
         "type": kind,
@@ -294,6 +310,177 @@ async def _run_invite(
     expire, limit = fields.details.expire_seconds, fields.details.usage_limit
     link = await gateway.invite_link(chat.id, expire, limit)
     return {"chat_id": chat.id, "link": link, "expire_seconds": expire, "usage_limit": limit}
+
+
+# Reads: folders, lookup, details, topics (BR21.2, BR21.3, BR22) ---------------------------------
+
+RESOLVE_SCAN_LIMIT = 2000
+RESOLVE_PAGE = 200
+CANDIDATE_LIMIT = 20
+ARCHIVE_FOLDER = 1
+
+
+def _no_args(tool: str) -> Any:
+    def validate(raw: object) -> dict[str, Any]:
+        Args(tool, raw, ())
+        return {}
+
+    return validate
+
+
+async def _run_folders(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    folders = await gateway.folders()
+    return with_notice(
+        {"folders": [{"id": f.id, "title": f.title} for f in folders]}, ["folders[].title"]
+    )
+
+
+def normalize_title(text: str) -> str:
+    """ChatQuery's title form: NFKC, case-folded, trimmed, inner whitespace as one space."""
+    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def classify_query(query: str) -> tuple[str, str]:
+    """(form, normalized) of a lookup: id, username or title (entities.md ChatQuery)."""
+    text = query.strip()
+    if CHAT_ID_TEXT.match(text):
+        return "id", text
+    if INVITE_LINK.match(text):
+        raise InvalidArguments("query: an invite link is not a lookup; use tg_chats_join")
+    for pattern in (USERNAME_LINK, USERNAME):
+        match = pattern.match(text)
+        if match is not None and (pattern is USERNAME_LINK or text.startswith("@")):
+            return "username", match[1].lower()
+    return "title", normalize_title(text)
+
+
+def _validate_resolve(raw: object) -> dict[str, Any]:
+    args = Args(CHATS_RESOLVE, raw, ("query",))
+    query = args.required_text("query", max_len=QUERY_LIMIT)
+    classify_query(query)
+    return {"query": query}
+
+
+def _candidate(chat_id: int, name: str, kind: str, username: str | None, match: str) -> Any:
+    return {"chat_id": chat_id, "name": name, "type": kind, "username": username, "match": match}
+
+
+def _candidate_lines(chats: list[ChatRef]) -> str:
+    lines = [f"«{sanitize_chat_name(chat.name)}» ({chat.type}, {chat.id})" for chat in chats[:20]]
+    if len(chats) > CANDIDATE_LIMIT:
+        lines.append(f"and {len(chats) - CANDIDATE_LIMIT} more")
+    return "\n".join(lines)
+
+
+async def _scan_chats(gateway: TelegramGateway) -> tuple[list[ChatRef], bool]:
+    """Every chat of the account, the archive included, up to 2,000 (NFR11.3)."""
+    seen: dict[int, ChatRef] = {}
+    for folder in (None, ARCHIVE_FOLDER):
+        offset: str | None = None
+        while True:
+            page, offset = await gateway.list_chats(folder, RESOLVE_PAGE, offset)
+            for chat in page:
+                seen.setdefault(chat.id, chat)
+                if len(seen) >= RESOLVE_SCAN_LIMIT:
+                    return list(seen.values()), True
+            if offset is None or not page:
+                break
+    return list(seen.values()), False
+
+
+async def _run_resolve(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    form, wanted = classify_query(args["query"])
+    if form == "id":
+        chat = await gateway.resolve_chat(int(wanted))
+        found = _candidate(chat.id, chat.name, chat.type, None, "id")
+        return with_notice({"chat": found, "scan_complete": True}, ["chat.name"])
+    if form == "username":
+        try:
+            details = await gateway.chat_info(wanted)
+        except ChatNotFound as error:
+            raise PromptError(
+                "not_found", f"No chat or user has the username @{wanted}."
+            ) from error
+        found = _candidate(details.id, details.name, details.type, details.username, "username")
+        return with_notice({"chat": found, "scan_complete": True}, ["chat.name"])
+    chats, stopped = await _scan_chats(gateway)
+    stop_note = f" The scan stopped after {RESOLVE_SCAN_LIMIT} chats." if stopped else ""
+    exact = [chat for chat in chats if normalize_title(chat.name) == wanted]
+    if len(exact) == 1:
+        chat = exact[0]
+        found = _candidate(chat.id, chat.name, chat.type, None, "exact_title")
+        return with_notice({"chat": found, "scan_complete": not stopped}, ["chat.name"])
+    if exact:
+        raise PromptError(
+            "ambiguous_chat",
+            f"{len(exact)} chats have this title:\n{_candidate_lines(exact)}\n"
+            f"Name the chat by its id.{stop_note}",
+        )
+    partial = [chat for chat in chats if wanted and wanted in normalize_title(chat.name)]
+    if partial:
+        raise PromptError(
+            "not_found",
+            f"No chat has exactly this title. Chats whose title contains it:\n"
+            f"{_candidate_lines(partial)}\nName the chat by its id.{stop_note}",
+        )
+    raise PromptError("not_found", f"No chat has this title.{stop_note}")
+
+
+async def _run_info(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    found = await gateway.chat_info(args["chat"])
+    chat = {
+        "id": found.id,
+        "name": found.name,
+        "type": found.type,
+        "username": found.username,
+        "description": found.description,
+        "member_count": found.member_count,
+        "unread": found.unread,
+        "muted": found.muted,
+        "is_forum": found.is_forum,
+        "my_role": found.my_role,
+        "pinned_message_id": found.pinned_message_id,
+        "saved_messages": found.saved_messages,
+    }
+    return with_notice({"chat": chat}, ["chat.name", "chat.description"])
+
+
+TOPICS_LIMIT = 100
+
+
+async def _run_topics(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    chat = await gateway.resolve_chat(args["chat"])
+    if chat.type != "forum":
+        raise PromptError("invalid_arguments", "This chat has no topics: it is not a forum.")
+    topics = await gateway.topics_list(chat.id, TOPICS_LIMIT)
+    shaped = [
+        {
+            "topic_id": t.topic_id,
+            "title": t.title,
+            "unread": t.unread,
+            "closed": t.closed,
+            "pinned": t.pinned,
+        }
+        for t in topics
+    ]
+    return with_notice({"chat_id": chat.id, "topics": shaped}, ["topics[].title"])
+
+
+def read_actions() -> list[ConsentAction]:
+    return [
+        ConsentAction(DECLS[FOLDERS_LIST], _no_args(FOLDERS_LIST), run=_run_folders),
+        ConsentAction(DECLS[CHATS_RESOLVE], _validate_resolve, run=_run_resolve),
+        ConsentAction(DECLS[CHATS_INFO], _validate_chat_only(CHATS_INFO), run=_run_info),
+        ConsentAction(DECLS[TOPICS_LIST], _validate_chat_only(TOPICS_LIST), run=_run_topics),
+    ]
 
 
 # tg_chats_mark_read (BR24): the broker's U2 path does the unread check, the question and the

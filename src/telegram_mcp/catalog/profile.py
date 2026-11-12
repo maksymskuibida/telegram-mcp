@@ -6,13 +6,13 @@ import re
 from typing import Any
 
 from telegram_mcp.actions import ConsentAction
-from telegram_mcp.catalog.common import Args, CatalogContext
+from telegram_mcp.catalog.common import Args, CatalogContext, with_notice
 from telegram_mcp.catalog.messages import approved
 from telegram_mcp.consent import PendingApproval, canonical_digest
 from telegram_mcp.files import NO_RECORD_MESSAGE, FileRefused, admit, open_admitted
 from telegram_mcp.gateway.protocol import TelegramGateway
 from telegram_mcp.prompts import FieldChange, HeadlineDetails, PromptFields
-from telegram_mcp.tools import ABOUT_LIMIT, DECLS, PROFILE_EDIT, InvalidArguments
+from telegram_mcp.tools import ABOUT_LIMIT, DECLS, PROFILE_EDIT, PROFILE_GET, InvalidArguments
 
 FIELDS = ("first_name", "last_name", "bio", "username")
 USERNAME = re.compile(r"^[A-Za-z0-9_]{5,32}$")
@@ -64,19 +64,47 @@ def profile_edit_action(context: CatalogContext) -> ConsentAction:
     ) -> Any:
         fields = approved(approval)
         values = {change.field: change.after for change in fields.details.changes}
-        named = [values.get(name) for name in FIELDS]
+        first, last = values.get("first_name"), values.get("last_name")
+        bio, username = values.get("bio"), values.get("username")
         if fields.file is None:
-            await gateway.edit_own_profile(*named, None, None)
+            await gateway.edit_own_profile(first, last, bio, username, None, None)
             return {"changed": list(values)}
         assert approval is not None  # noqa: S101 (approved() checked it)
         record = context.files.take(approval.args_digest)
         if record is None:
             raise FileRefused("not_allowed", NO_RECORD_MESSAGE)
         with open_admitted(record, context.paths) as photo:
-            await gateway.edit_own_profile(*named, photo, record.name)
+            await gateway.edit_own_profile(first, last, bio, username, photo, record.name)
         return {"changed": [*values, "photo"]}
 
     return ConsentAction(DECLS[PROFILE_EDIT], _validate, describe, run)
+
+
+def _validate_get(raw: object) -> dict[str, Any]:
+    Args(PROFILE_GET, raw, ())
+    return {}
+
+
+async def _run_get(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    own = await gateway.own_profile()
+    profile = {
+        "id": own.id,
+        "first_name": own.first_name,
+        "last_name": own.last_name,
+        "username": own.username,
+        "bio": own.bio,
+        "phone": own.phone,
+        "has_photo": own.has_photo,
+    }
+    return with_notice(
+        {"profile": profile}, ["profile.first_name", "profile.last_name", "profile.bio"]
+    )
+
+
+def read_actions() -> list[ConsentAction]:
+    return [ConsentAction(DECLS[PROFILE_GET], _validate_get, run=_run_get)]
 
 
 def write_actions(context: CatalogContext) -> list[ConsentAction]:

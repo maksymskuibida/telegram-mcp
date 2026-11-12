@@ -89,9 +89,7 @@ def world(fake_gateway: FakeGateway, clock: FakeClock) -> FakeGateway:
 
 
 @pytest.fixture
-async def broker(
-    paths: FixedPaths, world: FakeGateway, clock: FakeClock
-) -> AsyncIterator[Broker]:
+async def broker(paths: FixedPaths, world: FakeGateway, clock: FakeClock) -> AsyncIterator[Broker]:
     logged_in()
     started = Broker(
         paths,

@@ -147,7 +147,12 @@ TOOLS = [entry[0] for entry in WRITES]
 
 @pytest.mark.parametrize(("tool", "args", "question", "write"), WRITES, ids=TOOLS)
 async def test_a_first_call_never_runs(
-    claude: RawClient, world: FakeGateway, tool: str, args: dict[str, Any], question: str, write: Any
+    claude: RawClient,
+    world: FakeGateway,
+    tool: str,
+    args: dict[str, Any],
+    question: str,
+    write: Any,
 ) -> None:
     refused = await call(claude, tool, args)
     assert refused["ok"] is False
@@ -198,7 +203,8 @@ async def test_the_admin_question_names_the_user_and_the_changed_rights(
     assert done["ok"] is True
     ((name, sent),) = write_calls(world, WRITE_CALLS)
     assert name == "set_admin_rights"
-    assert sent["user_id"] == CAROL and sent["rights"]["pin_messages"] is True
+    assert sent["user_id"] == CAROL
+    assert sent["rights"]["pin_messages"] is True
     assert sum(sent["rights"].values()) == 1
 
 

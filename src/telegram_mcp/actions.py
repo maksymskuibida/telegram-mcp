@@ -18,8 +18,8 @@ from typing import Any
 from telegram_mcp.activity_log import utc_now
 from telegram_mcp.consent import ActionDecl, PendingApproval
 from telegram_mcp.files import FileStore
-from telegram_mcp.paths import FixedPaths
 from telegram_mcp.gateway.protocol import TelegramGateway
+from telegram_mcp.paths import FixedPaths
 from telegram_mcp.prompts import HeadlineDetails, PromptFields, TopicRef
 from telegram_mcp.tools import (
     CHATS_LIST,

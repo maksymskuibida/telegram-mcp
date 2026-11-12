@@ -294,9 +294,12 @@ _U4_SPECS: tuple[ToolSpec, ...] = (
             asks=True,
         ),
     ),
-    _read(MESSAGES_PINNED, "List a chat's pinned messages, newest first (up to 50).", {
-        "chat": CHAT_PROPERTY
-    }, "chat"),
+    _read(
+        MESSAGES_PINNED,
+        "List a chat's pinned messages, newest first (up to 50).",
+        {"chat": CHAT_PROPERTY},
+        "chat",
+    ),
     _read(
         MESSAGES_SEARCH,
         "Search messages holding a text, in one chat or (without chat) across all your chats, "
@@ -308,9 +311,12 @@ _U4_SPECS: tuple[ToolSpec, ...] = (
         },
         "query",
     ),
-    _read(TOPICS_LIST, "List a forum's topics (up to 100), newest activity first.", {
-        "chat": CHAT_PROPERTY
-    }, "chat"),
+    _read(
+        TOPICS_LIST,
+        "List a forum's topics (up to 100), newest activity first.",
+        {"chat": CHAT_PROPERTY},
+        "chat",
+    ),
     _read(
         MEMBERS_LIST,
         "List a chat's members with their roles; filter all, admins or bots.",

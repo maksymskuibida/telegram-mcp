@@ -26,4 +26,6 @@ def build_actions(
     for family in (messages, chats, people, profile, media):
         actions.extend(family.write_actions(context))
     actions.extend([chats.mark_action(), messages.read_action()])
+    for reads in (chats, messages, people, profile):
+        actions.extend(reads.read_actions())
     return context, actions

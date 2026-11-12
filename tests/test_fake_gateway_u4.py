@@ -66,7 +66,8 @@ async def test_reads_return_their_seeded_data(fake: FakeGateway) -> None:
     assert (team.id, team.description, team.my_role) == (TEAM.id, "We build", "member")
     page = await fake.read_messages(ALICE.id, 2)
     assert [m.id for m in page] == [3, 2]
-    assert page[0].outgoing and page[0].sender is not None
+    assert page[0].outgoing
+    assert page[0].sender is not None
     assert [m.id for m in await fake.read_messages(ALICE.id, 5, before_id=3)] == [2, 1]
     assert [m.id for m in await fake.read_pinned(ALICE.id, 50)] == [2]
     assert [m.text for m in await fake.search_chat(ALICE.id, "HELLO", 5)] == ["hello there"]
@@ -113,7 +114,8 @@ async def test_download_writes_bytes_and_refuses_large_media(fake: FakeGateway) 
 
 async def test_message_writes_change_the_state(fake: FakeGateway) -> None:
     edited = await fake.edit(ALICE.id, 3, "changed")
-    assert edited.edited and edited.text == "changed"
+    assert edited.edited
+    assert edited.text == "changed"
     new_ids = await fake.forward(ALICE.id, [1], FAMILY.id)
     assert [m.forwarded_from for m in await fake.read_messages(FAMILY.id, 5)] == ["Alice"]
     assert len(new_ids) == 1

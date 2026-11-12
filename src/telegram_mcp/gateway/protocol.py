@@ -162,8 +162,9 @@ class TelegramGateway(Protocol):
         self, chat_id: int, expire_seconds: int | None, usage_limit: int | None
     ) -> str: ...
 
-    async def set_admin_rights(self, chat_id: int, user_id: int, rights: dict[str, bool]) -> None:
-        ...
+    async def set_admin_rights(
+        self, chat_id: int, user_id: int, rights: dict[str, bool]
+    ) -> None: ...
 
     async def edit_chat(
         self,
