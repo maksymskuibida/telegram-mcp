@@ -9,6 +9,10 @@ from typing import Any
 
 import pytest
 
+from telegram_mcp.actions import default_registry
+from telegram_mcp.consent import ActionKind
+from telegram_mcp.paths import FixedPaths
+
 ROOT = Path(__file__).resolve().parents[1]
 PINNED_RUN = [
     "--quiet",
@@ -59,7 +63,6 @@ def test_the_two_approval_hooks_run_through_the_launcher_with_their_timeouts() -
     hooks = load("hooks/hooks.json")["hooks"]
     (pre, _guard) = hooks["PreToolUse"]
     (post,) = hooks["PostToolUse"]
-    assert pre["matcher"] == "mcp__plugin_telegram-mcp_telegram__tg_messages_send"
     assert post["matcher"] == "AskUserQuestion"
     assert pre["hooks"] == [
         {
@@ -77,6 +80,43 @@ def test_the_two_approval_hooks_run_through_the_launcher_with_their_timeouts() -
     ]
     assert re.fullmatch(pre["matcher"], "mcp__plugin_telegram-mcp_telegram__tg_messages_send")
     assert not re.fullmatch(pre["matcher"], "mcp__plugin_telegram-mcp_telegram__tg_chats_list")
+
+
+PREFIX = "mcp__plugin_telegram-mcp_telegram__"
+
+
+def asking_tools() -> set[str]:
+    """Every registered tool whose kind is write or mark, or that may mark (BR27.1)."""
+    registry = default_registry(FixedPaths.from_home(ROOT))
+    return {
+        tool
+        for tool, decl in registry.decls().items()
+        if decl.kind is not ActionKind.READ or decl.marks_read_option
+    }
+
+
+def test_the_approval_matcher_covers_exactly_the_tools_that_can_ask() -> None:
+    (pre, _guard) = load("hooks/hooks.json")["hooks"]["PreToolUse"]
+    registry = default_registry(FixedPaths.from_home(ROOT))
+    asking = asking_tools()
+    assert len(asking) == 18  # 16 writes, the mark tool and the read tool
+    for tool in registry.decls():
+        matched = re.fullmatch(pre["matcher"], PREFIX + tool) is not None
+        assert matched is (tool in asking), tool
+        assert re.fullmatch(pre["matcher"], tool) is None, tool  # never without the prefix
+
+
+def test_the_approval_matcher_matches_nothing_else() -> None:
+    (pre, _guard) = load("hooks/hooks.json")["hooks"]["PreToolUse"]
+    for name in [
+        PREFIX + "tg_messages_sendx",
+        PREFIX + "tg_messages_reader",
+        "mcp__plugin_other_telegram__tg_messages_send",
+        PREFIX + "tg_media_download",
+        PREFIX + "tg_chats_resolve",
+        "Bash",
+    ]:
+        assert re.fullmatch(pre["matcher"], name) is None, name
 
 
 GUARDED_TOOLS = [
