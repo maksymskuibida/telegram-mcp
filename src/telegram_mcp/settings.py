@@ -55,6 +55,18 @@ class Settings:
         )
 
     @staticmethod
+    def folder(paths: FixedPaths, key: str) -> Path:
+        """One folder setting, checked on its own: a refused ``downloads_dir`` never stops a
+        file send, and a refused ``outbox_dir`` never stops a download (NFR2.7)."""
+        data = _read_config(paths.config)
+        value = data.get(key, DEFAULT_FOLDERS[key])
+        if not isinstance(value, str):
+            raise SettingsError(f"{key} in {paths.config} must be a text path", key)
+        folder = _expand(value, paths.home, key)
+        check_folder(folder, key, paths)
+        return folder
+
+    @staticmethod
     def ensure_folder(folder: Path, key: str, paths: FixedPaths) -> Path:
         """Create a missing folder (and missing parents) with mode 0700, then check it again."""
         check_folder(folder, key, paths)

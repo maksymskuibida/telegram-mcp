@@ -38,7 +38,7 @@ def data_files(paths: FixedPaths) -> dict[str, Path]:
     files = {}
     for name in ("activity.log", "config.toml"):
         path = paths.data_dir / name
-        path.write_text(f"{name} content\n")
+        path.write_text(f"# {name} content\n")  # a valid (empty) config.toml
         files[name] = path
     return files
 
