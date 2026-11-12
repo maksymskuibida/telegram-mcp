@@ -10,6 +10,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -547,3 +548,34 @@ def test_the_entry_reads_standard_input_and_prints_one_answer(gh: GuardHome) -> 
 def test_decide_is_the_package_entry() -> None:
     assert guard.decide is decide
     assert set(WATCHED_TOOLS) == set(rules.WATCHED_TOOLS)
+
+
+# NFR11.1, BR6.1: the hook's code path loads no Telegram, MCP, keyring or broker module
+
+IMPORT_PROBE = """
+import io, json, sys
+sys.stdin = io.StringIO(json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}}))
+from telegram_mcp import cli
+code = cli.main(["hook", "guard"])
+heavy = sorted(
+    name for name in sys.modules
+    if name.split(".")[0] in ("telethon", "mcp", "keyring")
+    or name.startswith("telegram_mcp.broker")
+    or name in ("telegram_mcp.hooks", "telegram_mcp.settings")
+)
+print(json.dumps({"code": code, "heavy": heavy}), file=sys.stderr)
+"""
+
+
+def test_the_guard_hook_loads_no_heavy_module(gh: GuardHome) -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", IMPORT_PROBE],
+        capture_output=True,
+        text=True,
+        env={"HOME": str(gh.home), "PATH": "/usr/bin:/bin"},
+        check=False,
+        timeout=30,
+    )
+    assert result.stdout.strip() == "{}"
+    report = json.loads(result.stderr.strip().splitlines()[-1])
+    assert report == {"code": 0, "heavy": []}
