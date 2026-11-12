@@ -609,3 +609,35 @@ def test_percent_encoded_paths_into_the_data_folder_are_refused(
 )
 def test_other_percent_signs_pass(gh: GuardHome, command: str) -> None:
     check_passed(gh, command)
+
+
+# A ** in a shell word can stand for any number of folders, the data folder among them
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat ~/Library/Application\\ Support/**/activity.log",
+        "cat ~/Library/**/activity.log",
+        "ls ~/**/config.toml",
+        "cat ~/Library/Application\\ Support/**",
+        "cat ~/**/*",
+        'for f in ~/Library/Application\\ Support/**/*.log; do cat "$f"; done',
+        "cd ~/Library && grep x Application\\ Support/**/broker.err",
+    ],
+)
+def test_a_shell_globstar_reaching_the_data_folder_is_refused(gh: GuardHome, command: str) -> None:
+    check_refused(gh, command, Route.DATA_PATH)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ls src/**/*.py",
+        "cat ~/project/**/README.md",
+        "ls ~/Downloads/**",
+        "wc -l ~/Library/Application\\ Support/Claude/**/*.json",
+    ],
+)
+def test_a_shell_globstar_elsewhere_passes(gh: GuardHome, command: str) -> None:
+    check_passed(gh, command)
