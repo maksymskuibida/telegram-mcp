@@ -396,6 +396,29 @@ async def test_a_stop_during_logout_waits_until_logout_has_answered(
 
 
 @pytest.mark.usefixtures("logged_in")
+async def test_a_second_logout_during_one_waits_and_gets_the_same_answer(
+    start_broker: Callable[..., Any],
+    paths: FixedPaths,
+    fake_gateway: FakeGateway,
+    memory_keyring: MemoryKeyring,
+) -> None:
+    fake_gateway.script("log_out", hang=True)
+    broker = await start_broker(logout_budget=0.5)
+    first = asyncio.create_task((await cli(paths)).result("session.logout"))
+    await wait_for_call(fake_gateway, "log_out")
+    second = asyncio.create_task((await cli(paths)).result("session.logout"))
+    await asyncio.sleep(0.1)
+    assert not second.done()
+
+    answer = await asyncio.wait_for(first, 5)
+    assert await asyncio.wait_for(second, 5) == answer
+    assert fake_gateway.call_names().count("log_out") == 1
+    assert [e["tool"] for e in log_entries(paths)].count("logout") == 1
+    assert memory_keyring.items == {}
+    await asyncio.wait_for(broker.wait_stopped(), 2)
+
+
+@pytest.mark.usefixtures("logged_in")
 async def test_a_failed_account_lookup_still_logs_out(
     start_broker: Callable[..., Any],
     paths: FixedPaths,
@@ -521,7 +544,7 @@ async def test_a_session_that_ends_during_the_check_is_reported_ended(
     fake_gateway.script("me", error=NotAuthorized())
     status = await (await cli(paths)).result("broker.status")
     assert status["session_state"] == "ended"
-    assert broker._gateway is None
+    assert broker.link.state.value == "closed"
 
 
 @pytest.mark.usefixtures("logged_in")

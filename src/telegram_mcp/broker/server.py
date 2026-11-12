@@ -261,6 +261,7 @@ class Broker:
         self._connections: dict[Connection, asyncio.StreamWriter] = {}
         self._logging_out = False
         self._logout_answered = asyncio.Event()
+        self._logout_answer: dict[str, Any] | None = None
         self._stopped = asyncio.Event()
         self._finished = asyncio.Event()
         self._exit_when_idle = False
@@ -820,7 +821,13 @@ class Broker:
     async def _logout(self, connection: Connection, params: dict[str, Any]) -> Any:
         """Refuse everything new, let a running send finish (the ones still waiting in the line
         are refused), end the session on Telegram, clear the Keychain whatever Telegram
-        answered, log once, answer, then stop."""
+        answered, log once, answer, then stop. A second logout that arrives meanwhile waits for
+        the first and gets the same answer."""
+        if self._logging_out:
+            await self._logout_answered.wait()
+            if self._logout_answer is not None:
+                return self._logout_answer
+            return ToolFailure.fixed("no_session").as_result()
         self._logging_out = True
         try:
             await self.writes.wait_idle()
@@ -830,18 +837,19 @@ class Broker:
             self.sweep_expired()
             self._log_logout(connection, ended, deleted)
             self._forget_session()
+            self._logout_answer = {
+                "ok": deleted.cleared,
+                "account": ended.account,
+                "telegram_confirmed": ended.reason is None,
+                "telegram_reason": ended.reason,
+                "retry_after": ended.retry_after,
+                "keychain_cleared": deleted.cleared,
+                "keychain_cause": deleted.cause,
+            }
         finally:
             self._logout_answered.set()
             asyncio.get_running_loop().call_soon(self._schedule_stop, None)
-        return {
-            "ok": deleted.cleared,
-            "account": ended.account,
-            "telegram_confirmed": ended.reason is None,
-            "telegram_reason": ended.reason,
-            "retry_after": ended.retry_after,
-            "keychain_cleared": deleted.cleared,
-            "keychain_cause": deleted.cause,
-        }
+        return self._logout_answer
 
     async def _end_session(self) -> _Ended:
         result = await self._read_vault()

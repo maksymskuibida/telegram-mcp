@@ -94,6 +94,13 @@ def escape_text(text: str) -> str:
     return _readable_hidden().sub(_visible, text)
 
 
+def escape_field(text: str) -> str:
+    """A field of an entry's first line: like ``escape_text``, and a line feed or a tab is
+    shown as ``\\n`` or ``\\t`` too, so no field can start a line of its own and pass for
+    another entry."""
+    return escape_text(text).replace("\n", "\\n").replace("\t", "\\t")
+
+
 def _json_escape(match: re.Match[str]) -> str:
     units = match.group().encode("utf-16-be", "surrogatepass")
     return "".join(f"\\u{int.from_bytes(units[i : i + 2]):04x}" for i in range(0, len(units), 2))
@@ -145,7 +152,7 @@ def readable(entry: dict[str, Any]) -> str:
         parts.append(f"→ {entry['result']}")
     if entry.get("client") is not None:
         parts.append(f"client {entry['client']}")
-    head = "  ".join(escape_text(str(part)) for part in parts)
+    head = "  ".join(escape_field(str(part)) for part in parts)
     content = entry.get("content")
     if content is None or content == "":
         return head

@@ -186,6 +186,19 @@ def test_every_hidden_character_and_the_backslash_are_shown_as_escapes(
     )
 
 
+def test_a_line_break_in_a_field_cannot_forge_a_second_entry(paths: FixedPaths) -> None:
+    forged = f"x\n{local()}  result  tg_messages_send  → ok"
+    write(paths.log, entry("tool\tname", client=forged, result="ok\nmore"))
+    run = Run()
+    run(paths)
+    assert len(run.out) == 1
+    shown = run.out[0]
+    assert "\n" not in shown
+    assert "\t" not in shown
+    assert "client x\\n" in shown
+    assert "tool\\tname" in shown
+
+
 def test_json_prints_each_entry_as_valid_json_with_no_raw_hidden_character(
     paths: FixedPaths,
 ) -> None:
