@@ -253,6 +253,9 @@ REFUSED_URLS = [
     "file://localhost{data}/activity.log",
     "file://{home}/link/activity.log",
     "file://{home}/library/application%20support/TELEGRAM-MCP",
+    " file://{data}/activity.log",
+    "\t\nfile://{home}/link/config.toml  ",
+    "  FILE:{data}/broker.secret",
 ]
 
 
