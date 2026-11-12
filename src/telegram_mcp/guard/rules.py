@@ -471,7 +471,7 @@ def check_search_tool(call: GuardCall, ctx: Context) -> None:
 
 
 def check_fetch_tool(call: GuardCall, ctx: Context) -> None:
-    url = call.tool_input["url"]
+    url = call.tool_input["url"].strip()  # a URL parser ignores surrounding whitespace too
     if url[:5].casefold() != "file:":
         return
     path = unquote(urlsplit(url).path)
