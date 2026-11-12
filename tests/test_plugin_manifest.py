@@ -57,7 +57,7 @@ def test_the_server_runs_the_pinned_versions() -> None:
 
 def test_the_two_approval_hooks_run_through_the_launcher_with_their_timeouts() -> None:
     hooks = load("hooks/hooks.json")["hooks"]
-    (pre,) = hooks["PreToolUse"]
+    (pre, _guard) = hooks["PreToolUse"]
     (post,) = hooks["PostToolUse"]
     assert pre["matcher"] == "mcp__plugin_telegram-mcp_telegram__tg_messages_send"
     assert post["matcher"] == "AskUserQuestion"
@@ -79,10 +79,51 @@ def test_the_two_approval_hooks_run_through_the_launcher_with_their_timeouts() -
     assert not re.fullmatch(pre["matcher"], "mcp__plugin_telegram-mcp_telegram__tg_chats_list")
 
 
-def test_no_other_hook_is_registered_yet() -> None:
+GUARDED_TOOLS = [
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Glob",
+    "Grep",
+    "Task",
+    "Agent",
+    "WebFetch",
+]
+
+
+def test_the_guard_runs_before_claudes_own_tools_with_a_10_second_timeout() -> None:
+    (_pre, guard) = load("hooks/hooks.json")["hooks"]["PreToolUse"]
+    assert guard["hooks"] == [
+        {
+            "type": "command",
+            "command": '"${CLAUDE_PLUGIN_ROOT}/hooks/run" guard',
+            "timeout": 10,
+        }
+    ]
+    for tool in GUARDED_TOOLS:
+        assert re.fullmatch(guard["matcher"], tool), tool
+    for tool in [
+        "mcp__plugin_telegram-mcp_telegram__tg_messages_send",
+        "mcp__plugin_telegram-mcp_telegram__tg_chats_list",
+        "AskUserQuestion",
+        "TodoWrite",
+        "WebSearch",
+        "BashOutput",
+    ]:
+        assert not re.fullmatch(guard["matcher"], tool), tool
+
+
+def test_exactly_the_three_hooks_are_registered() -> None:
     hooks = load("hooks/hooks.json")["hooks"]
     assert set(hooks) == {"PreToolUse", "PostToolUse"}
     commands = [h["command"] for entries in hooks.values() for e in entries for h in e["hooks"]]
     # The plugin path is quoted, so a folder name with a space cannot split the command.
     assert all(command.startswith('"${CLAUDE_PLUGIN_ROOT}/hooks/run" ') for command in commands)
-    assert not any(command.endswith(" guard") for command in commands)
+    assert sorted(command.rsplit(" ", 1)[1] for command in commands) == [
+        "approval-post",
+        "approval-pre",
+        "guard",
+    ]
