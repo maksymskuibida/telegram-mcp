@@ -23,6 +23,7 @@ from telegram_mcp.tools import (
     CHATS_EDIT,
     CHATS_JOIN,
     CHATS_LEAVE,
+    CHATS_MARK_READ,
     DECLS,
     INVITES_CREATE,
     InvalidArguments,
@@ -293,6 +294,19 @@ async def _run_invite(
     expire, limit = fields.details.expire_seconds, fields.details.usage_limit
     link = await gateway.invite_link(chat.id, expire, limit)
     return {"chat_id": chat.id, "link": link, "expire_seconds": expire, "usage_limit": limit}
+
+
+# tg_chats_mark_read (BR24): the broker's U2 path does the unread check, the question and the
+# mark; the tool only declares its kind and checks its arguments. --------------------------------
+
+
+def _validate_mark(raw: object) -> dict[str, Any]:
+    args = Args(CHATS_MARK_READ, raw, ("chat", "topic_id"))
+    return {"chat": args.chat(), "topic_id": args.integer("topic_id", minimum=1)}
+
+
+def mark_action() -> ConsentAction:
+    return ConsentAction(DECLS[CHATS_MARK_READ], _validate_mark)
 
 
 def write_actions(context: CatalogContext) -> list[ConsentAction]:

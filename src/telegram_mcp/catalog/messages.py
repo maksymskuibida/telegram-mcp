@@ -10,7 +10,14 @@ from __future__ import annotations
 from typing import Any
 
 from telegram_mcp.actions import ConsentAction
-from telegram_mcp.catalog.common import Args, CatalogContext, named_messages
+from telegram_mcp.catalog.common import (
+    Args,
+    CatalogContext,
+    message_dict,
+    message_fields,
+    named_messages,
+    with_notice,
+)
 from telegram_mcp.consent import PendingApproval
 from telegram_mcp.gateway.models import ChatRef
 from telegram_mcp.gateway.protocol import TelegramGateway
@@ -23,6 +30,8 @@ from telegram_mcp.tools import (
     MESSAGES_FORWARD,
     MESSAGES_PIN,
     MESSAGES_REACT,
+    MESSAGES_READ,
+    MESSAGES_READ_LIMIT,
     MESSAGES_UNPIN,
     TEXT_LIMIT,
 )
@@ -223,6 +232,51 @@ async def _run_unpin(
     chat, number = approved_chat(approval), approved_message_id(approval)
     await gateway.unpin(chat.id, number)
     return {"chat_id": chat.id, "message_id": number, "pinned": False}
+
+
+# tg_messages_read (BR22.3, BR24) -------------------------------------------------------------
+
+
+def _validate_read(raw: object) -> dict[str, Any]:
+    args = Args(MESSAGES_READ, raw, ("chat", "limit", "before_id", "topic_id", "mark_read"))
+    low, high, default = MESSAGES_READ_LIMIT
+    return {
+        "chat": args.chat(),
+        "limit": args.integer("limit", default=default, minimum=low, maximum=high),
+        "before_id": args.integer("before_id", minimum=1),
+        "topic_id": args.integer("topic_id", minimum=1),
+        "mark_read": args.boolean("mark_read", False),
+    }
+
+
+async def _run_read(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    found = await gateway.read_messages(
+        args["chat"], args["limit"], before_id=args["before_id"], topic_id=args["topic_id"]
+    )
+    oldest = min((message.id for message in found), default=None)
+    return with_notice(
+        {
+            "chat_id": args["chat"],
+            "topic_id": args["topic_id"],
+            "messages": [message_dict(message) for message in found],
+            "next_before_id": oldest if len(found) >= args["limit"] else None,
+        },
+        message_fields("messages[]"),
+    )
+
+
+def newest_returned(data: Any) -> int | None:
+    """The highest message id a read returned, so a mark never goes past it (BR24.1)."""
+    ids = [message["id"] for message in data.get("messages", [])]
+    return max(ids) if ids else None
+
+
+def read_action() -> ConsentAction:
+    return ConsentAction(
+        DECLS[MESSAGES_READ], _validate_read, run=_run_read, newest_returned=newest_returned
+    )
 
 
 def write_actions(context: CatalogContext) -> list[ConsentAction]:

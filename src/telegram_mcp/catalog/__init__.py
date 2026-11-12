@@ -25,4 +25,5 @@ def build_actions(
     actions: list[ConsentAction] = []
     for family in (messages, chats, people, profile, media):
         actions.extend(family.write_actions(context))
+    actions.extend([chats.mark_action(), messages.read_action()])
     return context, actions
