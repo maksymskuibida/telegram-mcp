@@ -685,17 +685,29 @@ WORST_CASE_LINES = {
 }
 
 
+def _traced() -> bool:
+    """True when a coverage tracer slows every line (sys.settrace or sys.monitoring)."""
+    if sys.gettrace() is not None:
+        return True
+    return sys.monitoring.get_tool(sys.monitoring.COVERAGE_ID) is not None
+
+
+# 1 s untraced; under a coverage tracer, which multiplies the cost of every line,
+# 5 s: still half the hook's 10 s timeout.
+WORST_CASE_LIMIT = 5.0 if _traced() else 1.0
+
+
 @pytest.mark.parametrize("name", list(WORST_CASE_LINES))
-def test_a_worst_case_line_is_decided_in_under_a_second(gh: GuardHome, name: str) -> None:
+def test_a_worst_case_line_is_decided_well_inside_the_timeout(gh: GuardHome, name: str) -> None:
     line = WORST_CASE_LINES[name]
     assert len(line) <= MAX_TEXT
     for _attempt in range(2):  # one retry absorbs noise on a busy machine
         started = time.perf_counter()
         decision = gh.bash(line)
         took = time.perf_counter() - started
-        if took < 1.0:
+        if took < WORST_CASE_LIMIT:
             break
-    assert took < 1.0, f"{name}: {took:.2f} s"
+    assert took < WORST_CASE_LIMIT, f"{name}: {took:.2f} s"
     assert decision.route != Route.GUARD_ERROR
 
 
