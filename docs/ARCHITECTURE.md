@@ -13,6 +13,7 @@ Everything runs locally on one Mac, in one Python package.
 flowchart LR
     CC[Claude Code] -- MCP over stdio --> S[MCP server<br/>telegram-mcp serve]
     CC -- PreToolUse / PostToolUse --> H[Approval hook<br/>hooks/run → telegram-mcp hook]
+    CC -- PreToolUse on Claude's own tools --> GH[Guard hook<br/>hooks/run → telegram-mcp hook guard]
     S -- JSON-RPC over Unix socket --> B[Broker<br/>telegram-mcp broker]
     H -- JSON-RPC over Unix socket --> B
     L[Login<br/>telegram-mcp login] -- stops the broker, holds the lock --> B
@@ -26,12 +27,14 @@ Text version: Claude Code starts the MCP server over standard input and output, 
 approval hook before the send tool and after every question box. Both talk to one background
 broker over a private Unix socket. The broker alone holds the Telegram connection, the
 approvals and the activity log. Login runs in a terminal, stops the broker, and writes the
-session to the Keychain.
+session to the Keychain. The guard hook runs before Claude's own shell, file, search, fetch and
+subagent calls and talks to nothing.
 
 | Component | Module | What it does |
 |---|---|---|
 | MCP server | `mcp_server.py` | Lists the tools, forwards each call to the broker on one kept connection, returns results as text JSON or as a tool error. Refuses every write for a client that is not Claude Code, before the broker is contacted. |
 | Approval hook | `hooks.py`, `hooks/run` | `approval-pre` turns the broker's approval check into Claude Code's permission decision. `approval-post` relays the person's pick from the question box. |
+| Guard hook | `guard/`, `hooks/run` | Runs before Claude's own shell, file, search, fetch and subagent calls and refuses the ones that reach the data folder, the Keychain items or the tool's own commands (below). Talks to nothing. |
 | Broker | `broker/server.py` | The one process with the Telegram connection. Runs every check in a fixed order (below), holds the approvals in memory, writes the activity log. |
 | Broker client | `broker/client.py` | How the other processes reach the broker: connects, starts a broker when none runs, retries once only when the request was never written. |
 | Lock | `broker/lock.py` | Makes sure at most one broker (or one login) runs. |
@@ -192,10 +195,73 @@ content only explains who that is: `running` (a broker), `login`, or `released`.
 
 Ten callers starting at once therefore yield one broker.
 
+## The guard hook
+
+Claude can run programs as the person's macOS user, so without a check its own tools could read
+the activity log, talk to the broker socket with the per-start secret, read the Keychain items,
+or run `telegram-mcp login` itself. The guard hook (`telegram-mcp hook guard`, through
+`hooks/run`) stands in front of Claude's own tools: `Bash`, `Read`, `Write`, `Edit`,
+`MultiEdit`, `NotebookEdit`, `Glob`, `Grep`, `Task`, `Agent` and `WebFetch`, with a 10 s
+timeout. It never sees this plugin's MCP tools or the person's own terminal.
+
+It **refuses**:
+
+- **The data folder.** A file tool whose path is in `~/Library/Application Support/telegram-mcp`
+  (written with `~`, relative to the working folder, through `..`, through a link, in any letter
+  case); a search starting there, or a wildcard pattern that names its way in; a `file:` fetch
+  of it.
+- **Shell commands that reach it.** The guard reads the command the way zsh and bash do: words,
+  quotes, escapes, `$'…'`, redirects, braces, `~` and variables (from the line and the
+  environment), with `cd` followed within the line. It refuses a command holding the data
+  folder's text or `broker.sock` / `broker.secret` in any expanded form, a word that resolves
+  into the data folder, or a wildcard that names its way in. Inline scripts (`python -c`,
+  `node -e`, `osascript -e`, `bash -c`, `eval`, `env -S`), substitutions, here-documents and text
+  piped into a shell or interpreter get the same checks.
+- **Words it cannot place.** A word holding a value the guard cannot know (an unset variable,
+  the output of `$(…)`) is refused where it is used as a file, a program, a redirect or code. A
+  relative word after a `cd` into such a value passes unless it holds `..` or names a file of
+  the data folder.
+- **The Keychain items.** `security` naming the service `telegram-mcp` or a value it cannot
+  know, `dump-keychain`, `export`, an unnamed `find-generic-password` or
+  `find-internet-password`, and interactive `security`; scripts naming `telegram-mcp` next to
+  keyring or Keychain code.
+- **The tool's own commands.** `telegram-mcp` followed by anything but `status`, `--help`, `-h`
+  or `--version`, as the program or after a wrapper (`env`, `sudo`, `xargs`, `uvx`, `uv run`,
+  `pipx run`, `nohup`, `time`, `nice`, `timeout`, `caffeinate`, `command`, `exec`);
+  `python -m telegram_mcp…`; code importing `telegram_mcp`; the plugin's `hooks/run`. The
+  person runs these in their own terminal.
+- **Subagent prompts** naming the data folder or one of the refused commands.
+- **What it cannot read**: a command using syntax it does not model, or that zsh and bash read
+  differently (zsh parameter flags, glob qualifiers, `=cmd`, here-strings, `!` history, `case`,
+  arrays, more than 256 brace results), a call that is not valid JSON or misses a field, and any
+  error while deciding.
+
+A refusal is `permissionDecision: deny` with a reason that says what was refused and what to do
+instead, quoting at most 200 characters of the call. A **pass is the empty object `{}`**, never
+an allow, so Claude Code's usual permission prompts still apply. When the hook cannot answer at
+all, `hooks/run` exits 2 and Claude Code blocks the call. The guard reads no file, writes
+nothing, and loads only the standard library and `paths.py`; a decision takes well under a
+millisecond of CPU.
+
+It is best effort. These routes are **left open on purpose**:
+
+- Searches and copies started above the data folder (`grep -r x ~`, `find ~ -name '*.log'`,
+  `cp -R ~/Library/Application\ Support …`), including a `**` that crosses it.
+- The installed plugin files and Claude Code's own settings files, which could switch the hooks
+  off.
+- Scripts written to a file first and run later: file contents are not checked.
+- A word the guard cannot place, given to a program outside its list of programs that open
+  files (for example `jq`, `vim`, `git -C`).
+- Text produced by a command and piped into a shell (`curl … | sh`, `(echo …) | sh`).
+- A guard that times out, if Claude Code then runs the call (see the real-client checks).
+
+When the guard blocks wrongly or cannot start (for example an empty `uv` cache with no
+network), the person removes or reinstalls the plugin in their own terminal, outside Claude.
+
 ## What is not here yet
 
-This is the first working slice: phone login, `tg_chats_list` and `tg_messages_send`. Other
-tools, QR login, logout, status and log commands, a guard that keeps Claude's own shell and
-file tools away from the data folder, idle exit and log rotation come later. Until the guard
-exists, another program running as the same macOS user can read `broker.secret`; this version
-is for trying out, not for daily use.
+This is the first working slice: phone login, `tg_chats_list` and `tg_messages_send`, with the
+guard hook above. Other tools, QR login, logout, status and log commands, idle exit and log
+rotation come later. The guard covers Claude's own tools only: another program running as the
+same macOS user can still read `broker.secret`. This version is for trying out, not for daily
+use.
