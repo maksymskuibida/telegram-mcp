@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
 import signal
+import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,6 +32,20 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.now += timedelta(seconds=seconds)
+
+    async def sleep(self, seconds: float) -> None:
+        """A sleep that steps this clock instead of waiting, for the broker and the fake."""
+        self.advance(seconds)
+        await asyncio.sleep(0)
+
+
+async def wait_until(condition: Callable[[], bool], seconds: float = 2.0) -> None:
+    """Poll ``condition`` until it holds; fail the test after ``seconds``."""
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() > deadline:
+            pytest.fail("the condition did not hold in time")
+        await asyncio.sleep(0.01)
 
 
 def save_fake_session() -> StoredSession:
