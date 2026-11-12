@@ -1,1 +1,253 @@
-"""Message tools: reading, pinned messages, search, and the message writes."""
+"""Message tools: the message writes (edit, delete, forward, react, pin, unpin; BR23) and the
+message reads (read, pinned, search; BR22).
+
+A describer reads what its question needs (the chat, the named messages) and fills U2's
+PromptFields; a runner makes one Telegram call with the values stored in the approval, never a
+new lookup (BR21.4, BR23.2)."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from telegram_mcp.actions import ConsentAction
+from telegram_mcp.catalog.common import Args, CatalogContext, named_messages
+from telegram_mcp.consent import PendingApproval
+from telegram_mcp.gateway.models import ChatRef
+from telegram_mcp.gateway.protocol import TelegramGateway
+from telegram_mcp.prompts import HeadlineDetails, PromptError, PromptFields
+from telegram_mcp.tools import (
+    DECLS,
+    EMOJI_LIMIT,
+    MESSAGES_DELETE,
+    MESSAGES_EDIT,
+    MESSAGES_FORWARD,
+    MESSAGES_PIN,
+    MESSAGES_REACT,
+    MESSAGES_UNPIN,
+    TEXT_LIMIT,
+)
+
+
+def approved(approval: PendingApproval | None) -> PromptFields:
+    """The fields the person approved; a write never runs without them (BR21.4)."""
+    if approval is None:
+        raise ValueError("a write runs only with its approval")
+    return approval.prompt
+
+
+def approved_chat(approval: PendingApproval | None) -> ChatRef:
+    chat = approved(approval).chat
+    if chat is None:
+        raise ValueError("the approval names no chat")
+    return chat
+
+
+def approved_message_id(approval: PendingApproval | None) -> int:
+    number = approved(approval).details.message_id
+    if number is None:
+        raise ValueError("the approval names no message")
+    return number
+
+
+# tg_messages_edit (BR23.3) ---------------------------------------------------------------------
+
+
+def _validate_edit(raw: object) -> dict[str, Any]:
+    args = Args(MESSAGES_EDIT, raw, ("chat", "message_id", "text"))
+    return {
+        "chat": args.chat(),
+        "message_id": args.required_int("message_id"),
+        "text": args.required_text("text", max_len=TEXT_LIMIT),
+    }
+
+
+async def _describe_edit(gateway: TelegramGateway, args: dict[str, Any]) -> PromptFields:
+    chat = await gateway.resolve_chat(args["chat"])
+    found = await gateway.read_messages(chat.id, 1, ids=[args["message_id"]])
+    if not found:
+        raise PromptError(
+            "not_found", f"Message {args['message_id']} was not found in this chat."
+        )
+    message = found[0]
+    if not message.outgoing:
+        raise PromptError("not_allowed", "You can edit only your own messages.")
+    if message.text == args["text"]:
+        raise PromptError("invalid_arguments", "The message already has this text.")
+    return PromptFields(
+        action="edit",
+        tool=MESSAGES_EDIT,
+        chat=chat,
+        content=args["text"],
+        previous=message.text,
+        details=HeadlineDetails(message_id=message.id),
+    )
+
+
+async def _run_edit(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    chat, number = approved_chat(approval), approved_message_id(approval)
+    edited = await gateway.edit(chat.id, number, approved(approval).content)
+    return {"chat_id": chat.id, "message_id": edited.id, "edited": edited.edited}
+
+
+# tg_messages_delete (BR23.4) -------------------------------------------------------------------
+
+
+def _validate_delete(raw: object) -> dict[str, Any]:
+    args = Args(MESSAGES_DELETE, raw, ("chat", "message_ids", "for_everyone"))
+    return {
+        "chat": args.chat(),
+        "message_ids": args.ids("message_ids"),
+        "for_everyone": args.boolean("for_everyone", False),
+    }
+
+
+async def _describe_delete(gateway: TelegramGateway, args: dict[str, Any]) -> PromptFields:
+    chat = await gateway.resolve_chat(args["chat"])
+    messages = await named_messages(gateway, chat.id, args["message_ids"])
+    return PromptFields(
+        action="delete",
+        tool=MESSAGES_DELETE,
+        chat=chat,
+        messages=messages,
+        details=HeadlineDetails(for_everyone=args["for_everyone"]),
+    )
+
+
+async def _run_delete(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    fields = approved(approval)
+    chat = approved_chat(approval)
+    ids = [message.id for message in fields.messages]
+    everyone = bool(fields.details.for_everyone)
+    await gateway.delete(chat.id, ids, everyone)
+    return {"chat_id": chat.id, "deleted": ids, "for_everyone": everyone}
+
+
+# tg_messages_forward (BR23.4) ------------------------------------------------------------------
+
+
+def _validate_forward(raw: object) -> dict[str, Any]:
+    args = Args(MESSAGES_FORWARD, raw, ("from_chat", "message_ids", "to_chat"))
+    return {
+        "from_chat": args.chat("from_chat"),
+        "message_ids": args.ids("message_ids"),
+        "to_chat": args.chat("to_chat"),
+    }
+
+
+async def _describe_forward(gateway: TelegramGateway, args: dict[str, Any]) -> PromptFields:
+    target = await gateway.resolve_chat(args["to_chat"])
+    source = await gateway.resolve_chat(args["from_chat"])
+    messages = await named_messages(gateway, source.id, args["message_ids"])
+    return PromptFields(
+        action="forward",
+        tool=MESSAGES_FORWARD,
+        chat=target,
+        source_chat=source,
+        messages=messages,
+    )
+
+
+async def _run_forward(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    fields = approved(approval)
+    target, source = approved_chat(approval), fields.source_chat
+    if source is None:
+        raise ValueError("the approval names no source chat")
+    ids = [message.id for message in fields.messages]
+    new_ids = await gateway.forward(source.id, ids, target.id)
+    return {"from_chat": source.id, "to_chat": target.id, "message_ids": new_ids}
+
+
+# tg_messages_react, tg_messages_pin, tg_messages_unpin -----------------------------------------
+
+
+def _validate_react(raw: object) -> dict[str, Any]:
+    args = Args(MESSAGES_REACT, raw, ("chat", "message_id", "emoji"))
+    return {
+        "chat": args.chat(),
+        "message_id": args.required_int("message_id"),
+        "emoji": args.required_text("emoji", max_len=EMOJI_LIMIT),
+    }
+
+
+def _one_message_validator(tool: str) -> Any:
+    def validate(raw: object) -> dict[str, Any]:
+        args = Args(tool, raw, ("chat", "message_id"))
+        return {"chat": args.chat(), "message_id": args.required_int("message_id")}
+
+    return validate
+
+
+def _one_message_describer(tool: str, action: str) -> Any:
+    async def describe(gateway: TelegramGateway, args: dict[str, Any]) -> PromptFields:
+        chat = await gateway.resolve_chat(args["chat"])
+        messages = await named_messages(gateway, chat.id, [args["message_id"]])
+        return PromptFields(
+            action=action,
+            tool=tool,
+            chat=chat,
+            messages=messages,
+            details=HeadlineDetails(message_id=args["message_id"], emoji=args.get("emoji")),
+        )
+
+    return describe
+
+
+async def _run_react(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    chat, number = approved_chat(approval), approved_message_id(approval)
+    emoji = approved(approval).details.emoji
+    if emoji is None:
+        raise ValueError("the approval names no emoji")
+    await gateway.react(chat.id, number, emoji)
+    return {"chat_id": chat.id, "message_id": number, "emoji": emoji}
+
+
+async def _run_pin(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    chat, number = approved_chat(approval), approved_message_id(approval)
+    await gateway.pin(chat.id, number)
+    return {"chat_id": chat.id, "message_id": number, "pinned": True}
+
+
+async def _run_unpin(
+    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+) -> Any:
+    chat, number = approved_chat(approval), approved_message_id(approval)
+    await gateway.unpin(chat.id, number)
+    return {"chat_id": chat.id, "message_id": number, "pinned": False}
+
+
+def write_actions(context: CatalogContext) -> list[ConsentAction]:
+    return [
+        ConsentAction(DECLS[MESSAGES_EDIT], _validate_edit, _describe_edit, _run_edit),
+        ConsentAction(DECLS[MESSAGES_DELETE], _validate_delete, _describe_delete, _run_delete),
+        ConsentAction(
+            DECLS[MESSAGES_FORWARD], _validate_forward, _describe_forward, _run_forward
+        ),
+        ConsentAction(
+            DECLS[MESSAGES_REACT],
+            _validate_react,
+            _one_message_describer(MESSAGES_REACT, "react"),
+            _run_react,
+        ),
+        ConsentAction(
+            DECLS[MESSAGES_PIN],
+            _one_message_validator(MESSAGES_PIN),
+            _one_message_describer(MESSAGES_PIN, "pin"),
+            _run_pin,
+        ),
+        ConsentAction(
+            DECLS[MESSAGES_UNPIN],
+            _one_message_validator(MESSAGES_UNPIN),
+            _one_message_describer(MESSAGES_UNPIN, "pin"),
+            _run_unpin,
+        ),
+    ]

@@ -78,10 +78,13 @@ from telegram_mcp.gateway.models import (
     GatewayError,
     GatewayTimeout,
     NotAuthorized,
+    NotAUser,
     OutcomeUnknown,
     TelegramError,
+    TooLarge,
     TopicNotFound,
     UnreadState,
+    UserNotFound,
     account_label,
 )
 from telegram_mcp.gateway.protocol import GatewayFactory, TelegramGateway
@@ -284,7 +287,7 @@ class Broker:
         self.secret_rotation = secret_rotation
         self.status_budget = status_budget
         self.logout_budget = logout_budget
-        self.registry = registry if registry is not None else default_registry()
+        self.registry = registry if registry is not None else default_registry(paths, clock=clock)
         self.gate = ConsentGate(self.registry.decls(), clock=clock)
         self.redactor = Redactor()
         self.diagnostics = Diagnostics(paths.diagnostics, self.redactor)
@@ -661,6 +664,8 @@ class Broker:
             return ToolFailure.fixed("not_found", "not_found_topic")
         if isinstance(error, FloodWait):
             return ToolFailure.flood(error.seconds)
+        if isinstance(error, UserNotFound | NotAUser | TooLarge):
+            return _catalog_failure(error)
         if isinstance(error, NotAuthorized):
             self._forget_session()
             return ToolFailure.fixed("no_session")
@@ -1087,6 +1092,14 @@ class Broker:
     def _common_failure(self, error: Exception) -> ToolFailure | None:
         if isinstance(error, FloodWait):
             return _flood_failure(error.seconds)
+        if isinstance(error, PromptError):  # a tool's own refusal, with its code (BR25.5)
+            return ToolFailure(error.code, error.message)
+        if isinstance(error, InvalidArguments):
+            return ToolFailure("invalid_arguments", str(error))
+        if isinstance(error, TopicNotFound):
+            return ToolFailure.fixed("not_found", "not_found_topic")
+        if isinstance(error, UserNotFound | NotAUser | TooLarge):
+            return _catalog_failure(error)
         if isinstance(error, NotAuthorized):
             self._forget_session()
             return ToolFailure.fixed("no_session")
@@ -1425,6 +1438,22 @@ class Broker:
 
 
 # Helpers --------------------------------------------------------------------------------------
+
+
+def _catalog_failure(error: UserNotFound | NotAUser | TooLarge) -> ToolFailure:
+    """The gateway errors of U4's lookups and transfers, with a message naming what failed."""
+    if isinstance(error, TooLarge):
+        return ToolFailure(
+            "invalid_arguments",
+            f"The file is {error.size_bytes} bytes; files over 20 MB are not moved by this "
+            "tool. Download or send it in Telegram yourself.",
+        )
+    if isinstance(error, NotAUser):
+        return ToolFailure("not_found", "That username is a chat; use tg_chats_info.")
+    if error.username is not None:
+        return ToolFailure("not_found", f"No user has the username @{error.username}.")
+    named = ", ".join(str(number) for number in error.ids)
+    return ToolFailure("not_found", f"This account cannot see these users: {named}.")
 
 
 def _flood_failure(seconds: int, *, sent_nothing: bool = False) -> ToolFailure:

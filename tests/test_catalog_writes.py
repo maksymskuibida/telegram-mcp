@@ -265,7 +265,8 @@ async def test_a_forward_runs_against_the_approved_chats_by_id(
     world.calls.clear()
     done = await call(claude, "tg_messages_forward", args)
     assert done["ok"] is True
-    assert [name for name, _ in world.calls] == ["forward"]
+    # No new lookup at run time: only the broker's session check and the forward itself.
+    assert [name for name, _ in world.calls if name != "is_authorized"] == ["forward"]
 
 
 DESCRIBER_READS: list[tuple[str, dict[str, Any], str]] = [
