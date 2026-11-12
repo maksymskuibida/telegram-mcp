@@ -25,7 +25,7 @@ from telegram_mcp.broker.client import (
     spawn_broker,
 )
 from telegram_mcp.broker.lock import BrokerLock, LockState
-from telegram_mcp.broker.server import Broker
+from telegram_mcp.broker.server import Broker, BrokerStartError
 from telegram_mcp.gateway.fake import FakeGateway
 from telegram_mcp.paths import FixedPaths
 
@@ -306,4 +306,123 @@ async def test_ten_callers_at_once_yield_one_broker(paths: FixedPaths) -> None:
         assert pids != {os.getpid()}
     finally:
         for client in clients:
+            await client.close()
+
+
+# Across an idle stop, a start race and a secret rotation -----------------------------------
+
+
+def in_process_spawner(
+    paths: FixedPaths, fake_gateway: FakeGateway
+) -> tuple[Callable[[], None], list[Broker], list[asyncio.Task[None]]]:
+    """A spawn that starts an in-process broker; losing brokers fail their start."""
+    started: list[Broker] = []
+    tasks: list[asyncio.Task[None]] = []
+
+    def spawn() -> None:
+        broker = make_broker(paths, fake_gateway)
+        started.append(broker)
+        tasks.append(asyncio.get_running_loop().create_task(broker.start()))
+
+    return spawn, started, tasks
+
+
+async def test_a_call_made_as_an_idle_stop_begins_reaches_a_new_broker(
+    paths: FixedPaths, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_fake_session()
+    stopping = make_broker(paths, fake_gateway)
+    await stopping.start()
+    leave_telegram = stopping.link.close
+
+    async def slow_disconnect(limit: float = 2.0) -> None:
+        await asyncio.sleep(0.3)  # the lock stays held while Telegram is being left
+        await leave_telegram(limit)
+
+    monkeypatch.setattr(stopping.link, "close", slow_disconnect)
+    spawn, started, _ = in_process_spawner(paths, fake_gateway)
+    client = BrokerClient(paths, "mcp-server", client_name="claude-code", spawn=spawn)
+    stop = asyncio.create_task(stopping.stop("idle stop after 10 minutes with no request"))
+    await asyncio.sleep(0.05)
+    try:
+        assert not paths.socket.exists()
+        assert (await client.tool_call("tg_chats_list", {}))["ok"] is True
+        assert len(started) == 1
+        await stop
+    finally:
+        await client.close()
+        for broker in started:
+            await broker.stop()
+
+
+async def test_two_callers_starting_at_once_leave_one_broker_serving_both(
+    paths: FixedPaths, fake_gateway: FakeGateway
+) -> None:
+    save_fake_session()
+    spawn, started, tasks = in_process_spawner(paths, fake_gateway)
+    first = BrokerClient(paths, "mcp-server", client_name="claude-code", spawn=spawn)
+    second = BrokerClient(paths, "mcp-server", client_name="claude-code", spawn=spawn)
+    try:
+        results = await asyncio.gather(
+            first.tool_call("tg_chats_list", {}), second.tool_call("tg_chats_list", {})
+        )
+        assert all(result["ok"] for result in results)
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        assert sum(1 for outcome in outcomes if outcome is None) == 1
+        assert all(
+            isinstance(outcome, BrokerStartError) for outcome in outcomes if outcome is not None
+        )
+        assert fake_gateway.call_names().count("connect") == 1
+    finally:
+        await first.close()
+        await second.close()
+        for broker in started:
+            await broker.stop()
+
+
+def rotate_before_hellos(broker: Broker, monkeypatch: pytest.MonkeyPatch, times: int) -> None:
+    """Make the broker replace its secret just before each of the next ``times`` hellos, as
+    when a caller read the file a moment before an hourly rotation."""
+    original = broker._hello
+    left = [times]
+
+    def hello(connection: Any, request: Any) -> tuple[bytes, bool]:
+        if left[0] > 0:
+            left[0] -= 1
+            broker.secret_rotation = 0
+            broker.rotate_secret_if_due()
+        return original(connection, request)
+
+    monkeypatch.setattr(broker, "_hello", hello)
+
+
+async def test_a_hello_refused_for_its_secret_is_sent_once_more_with_the_file_read_again(
+    paths: FixedPaths, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_fake_session()
+    async with running_broker(paths, fake_gateway) as broker:
+        rotate_before_hellos(broker, monkeypatch, times=1)
+        client = BrokerClient(paths, "mcp-server", client_name="claude-code", spawn=never_spawn)
+        try:
+            assert (await client.tool_call("tg_chats_list", {}))["ok"] is True
+            assert fake_gateway.call_names().count("list_chats") == 1
+        finally:
+            await client.close()
+
+
+async def test_a_second_secret_refusal_fails_the_call_without_sending_it(
+    paths: FixedPaths, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_fake_session()
+    async with running_broker(paths, fake_gateway) as broker:
+        rotate_before_hellos(broker, monkeypatch, times=2)
+        client = BrokerClient(paths, "mcp-server", client_name="claude-code", spawn=never_spawn)
+        try:
+            result = await client.tool_call(SEND, {"chat": ALICE.id, "text": "never sent"})
+            assert result["error"] == {
+                "code": "telegram_error",
+                "message": "The background process refused the connection; try again.",
+            }
+            assert "send_text" not in fake_gateway.call_names()
+        finally:
             await client.close()

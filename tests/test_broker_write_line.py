@@ -18,9 +18,16 @@ import pytest
 from support.brokers import FakeClock, save_fake_session, wait_until
 from support.rpc import RawClient
 from support.writes import check, confirm, hook, list_chats, send
+from telegram_mcp.broker.scheduler import (
+    DropReason,
+    LineFull,
+    WriteDropped,
+    WriteItem,
+    WriteLine,
+)
 from telegram_mcp.broker.server import Broker
 from telegram_mcp.gateway.fake import FakeGateway
-from telegram_mcp.gateway.models import FloodWait, GatewayTimeout
+from telegram_mcp.gateway.models import FloodWait, GatewayTimeout, OutcomeUnknown
 from telegram_mcp.paths import FixedPaths
 
 
@@ -143,7 +150,7 @@ async def test_a_write_dropped_after_40_seconds_in_the_line_has_used_its_approva
 ) -> None:
     broker = await start_broker()
     await confirm(paths, "ahead")
-    await confirm(paths, "behind")
+    behind_id = await confirm(paths, "behind")
     fake_gateway.script("send_text", hang=True)
     first, second = await RawClient.connect(paths), await RawClient.connect(paths)
     running = asyncio.create_task(send(first, "ahead", 30))
@@ -157,6 +164,12 @@ async def test_a_write_dropped_after_40_seconds_in_the_line_has_used_its_approva
     assert "not sent" in dropped["error"]["message"].lower()
     assert (await send(second, "behind"))["error"]["code"] == "needs_confirmation"
     assert send_attempts(fake_gateway, "behind") == 0
+    diagnostics = paths.diagnostics.read_text()
+    assert (
+        f"send not started (not started in time): tg_messages_send, approval {behind_id}"
+        in diagnostics
+    )
+    assert "behind" not in diagnostics.replace("approval", "")  # never the message text
     running.cancel()
 
 
@@ -298,6 +311,81 @@ async def test_the_40_seconds_count_from_arrival_and_include_the_connect(
     assert (await late)["error"]["code"] == "telegram_timeout"
     assert send_attempts(fake_gateway, "late") == 0
     running.cancel()
+
+
+# The line on its own -------------------------------------------------------------------------
+
+
+def line_item(clock: FakeClock, run: Callable[[], Any], is_open: bool = True) -> WriteItem:
+    return WriteItem(
+        tool="tg_messages_send",
+        approval_id="a" * 10,
+        arrived_at=clock(),
+        is_open=lambda: is_open,
+        run=run,
+    )
+
+
+async def test_the_line_refuses_past_its_capacity_and_drops_on_its_own_timer(
+    clock: FakeClock,
+) -> None:
+    dropped: list[DropReason] = []
+    line = WriteLine(
+        clock=clock, capacity=1, start_limit=0.2, on_drop=lambda item, why: dropped.append(why)
+    )
+    line.start()
+    release = asyncio.Event()
+
+    async def blocked() -> str:
+        await release.wait()
+        return "sent"
+
+    running = asyncio.create_task(line.submit(line_item(clock, blocked)))
+    await wait_until(lambda: line.running is not None)
+    waiting = asyncio.create_task(line.submit(line_item(clock, blocked)))
+    await wait_until(lambda: line.waiting == 1)
+    assert line.is_full
+    with pytest.raises(LineFull):
+        await line.submit(line_item(clock, blocked))
+    with pytest.raises(WriteDropped) as late:
+        await waiting
+    assert late.value.reason is DropReason.DEADLINE
+    assert dropped == [DropReason.DEADLINE]
+    release.set()
+    assert await running == "sent"
+    await line.close()
+
+
+async def test_closing_the_line_drops_waiting_writes_and_ends_the_running_one_unknown(
+    clock: FakeClock,
+) -> None:
+    line = WriteLine(clock=clock)
+    line.start()
+
+    async def forever() -> None:
+        await asyncio.Event().wait()
+
+    async def failing() -> None:
+        raise RuntimeError("refused")
+
+    running = asyncio.create_task(line.submit(line_item(clock, forever)))
+    await wait_until(lambda: line.running is not None)
+    waiting = asyncio.create_task(line.submit(line_item(clock, forever)))
+    await wait_until(lambda: line.waiting == 1)
+    await line.close()
+    with pytest.raises(WriteDropped) as stopped:
+        await waiting
+    assert stopped.value.reason is DropReason.STOPPING
+    with pytest.raises(OutcomeUnknown):
+        await running
+    line.start()
+    with pytest.raises(RuntimeError, match="refused"):
+        await line.submit(line_item(clock, failing))
+    with pytest.raises(WriteDropped) as left:
+        await line.submit(line_item(clock, failing, is_open=False))
+    assert left.value.reason is DropReason.CALLER_LEFT
+    assert not line.busy
+    await line.close()
 
 
 async def test_writes_run_one_at_a_time_in_arrival_order(

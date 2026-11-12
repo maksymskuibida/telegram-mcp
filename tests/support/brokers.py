@@ -8,7 +8,7 @@ import json
 import os
 import signal
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -69,6 +69,26 @@ async def running_broker(
         yield broker
     finally:
         await broker.stop()
+
+
+@contextlib.asynccontextmanager
+async def broker_starter(
+    paths: FixedPaths, gateway: FakeGateway, clock: FakeClock
+) -> AsyncIterator[Callable[..., Awaitable[Broker]]]:
+    """Start brokers on the fake gateway and ``clock``; every one is stopped at the end."""
+    started: list[Broker] = []
+
+    async def start(**options: Any) -> Broker:
+        broker = make_broker(paths, gateway, clock=clock, **options)
+        await broker.start()
+        started.append(broker)
+        return broker
+
+    try:
+        yield start
+    finally:
+        for broker in started:
+            await broker.stop()
 
 
 def write_fake_gateway_file(home: Path, **extra: Any) -> Path:
