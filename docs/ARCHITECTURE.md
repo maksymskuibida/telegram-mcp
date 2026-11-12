@@ -214,10 +214,15 @@ It **refuses**:
 - **Shell commands that reach it.** The guard reads the command the way zsh and bash do: words,
   quotes, escapes, `$'…'`, redirects, braces, `~` and variables (from the line and the
   environment), with `cd` followed within the line. It refuses a command holding the data
-  folder's text or `broker.sock` / `broker.secret` in any expanded form, a word that resolves
-  into the data folder, or a wildcard that names its way in. Inline scripts (`python -c`,
+  folder's text or `broker.sock` / `broker.secret` in any expanded form, percent-decoded forms
+  included (`file:///…/Application%20Support/telegram-mcp/…`), a word or `file:` URL that
+  resolves into the data folder, or a wildcard that can match it; in a shell word a `**` may
+  stand for any number of folders, the data folder among them. Inline scripts (`python -c`,
   `node -e`, `osascript -e`, `bash -c`, `eval`, `env -S`), substitutions, here-documents and text
   piped into a shell or interpreter get the same checks.
+- **Links into it.** `ln`, symbolic or hard, whose source is the data folder, lies inside it, or
+  is a folder holding it (such as `~/Library/Application Support`, `~` or `/`), so a link made
+  now cannot be read in the same line or a later call.
 - **Words it cannot place.** A word holding a value the guard cannot know (an unset variable,
   the output of `$(…)`) is refused where it is used as a file, a program, a redirect or code. A
   relative word after a `cd` into such a value passes unless it holds `..` or names a file of
@@ -228,26 +233,34 @@ It **refuses**:
   keyring or Keychain code.
 - **The tool's own commands.** `telegram-mcp` followed by anything but `status`, `--help`, `-h`
   or `--version`, as the program or after a wrapper (`env`, `sudo`, `xargs`, `uvx`, `uv run`,
-  `pipx run`, `nohup`, `time`, `nice`, `timeout`, `caffeinate`, `command`, `exec`);
-  `python -m telegram_mcp…`; code importing `telegram_mcp`; the plugin's `hooks/run`. The
-  person runs these in their own terminal.
+  `pipx run`, `nohup`, `time`, `nice`, `timeout`, `caffeinate`, `command`, `exec`); after
+  `xargs`, the tool with no allowed subcommand written out, since `xargs` adds words from its
+  input; `python -m telegram_mcp…`; code importing `telegram_mcp`; inline code naming the tool
+  and a refused subcommand, written out (`telegram-mcp log`) or as quoted words of one list or
+  call (`subprocess.run(['telegram-mcp', 'login'])`); the plugin's `hooks/run`. The person runs
+  these in their own terminal.
 - **Subagent prompts** naming the data folder or one of the refused commands.
 - **What it cannot read**: a command using syntax it does not model, or that zsh and bash read
   differently (zsh parameter flags, glob qualifiers, `=cmd`, here-strings, `!` history, `case`,
-  arrays, more than 256 brace results), a call that is not valid JSON or misses a field, and any
-  error while deciding.
+  arrays, more than 256 brace results), a text in the call longer than 64 KiB, a command whose
+  expansion would take more work than the guard allows, a call that is not valid JSON or misses
+  a field, and any error while deciding.
 
 A refusal is `permissionDecision: deny` with a reason that says what was refused and what to do
 instead, quoting at most 200 characters of the call. A **pass is the empty object `{}`**, never
 an allow, so Claude Code's usual permission prompts still apply. When the hook cannot answer at
 all, `hooks/run` exits 2 and Claude Code blocks the call. The guard reads no file, writes
-nothing, and loads only the standard library and `paths.py`; a decision takes well under a
-millisecond of CPU.
+nothing, and loads only the standard library and `paths.py`. An ordinary decision takes well
+under a millisecond of CPU, and its work is bounded, so even a 64 KiB command is decided in a
+fraction of a second.
 
 It is best effort. These routes are **left open on purpose**:
 
 - Searches and copies started above the data folder (`grep -r x ~`, `find ~ -name '*.log'`,
-  `cp -R ~/Library/Application\ Support …`), including a `**` that crosses it.
+  `cp -R ~/Library/Application\ Support …`), and a `Glob` or `Grep` pattern whose `**` merely
+  crosses it.
+- The tool's command built from parts while code runs (`'te' + 'legram-mcp'`, a name read from
+  a file or a variable set inside the script): only quoted words written out whole are seen.
 - The installed plugin files and Claude Code's own settings files, which could switch the hooks
   off.
 - Scripts written to a file first and run later: file contents are not checked.

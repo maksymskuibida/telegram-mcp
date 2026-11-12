@@ -100,6 +100,9 @@ OWN_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 PACKAGE_RE = re.compile(r"\b" + PACKAGE_MODULE + r"\b")
+QUOTED_TOOL_RE = re.compile(
+    r"""['"](?:[^'"\s]*/)?""" + COMMAND_NAME + r"""(?:[@=][^'"\s]*)?['"]""", re.IGNORECASE
+)
 KEYCHAIN_WORDS = ("keyring", "keychain", "secitem", "security")
 SLASHES_RE = re.compile(r"/+")
 PYTHON_RE = re.compile(r"(?:python|pypy)(?:\d+(?:\.\d+)*)?")
@@ -382,10 +385,45 @@ def check_data_text(text: str, matched: str | None = None) -> None:
         raise Refusal(Route.DATA_TEXT, text if matched is None else matched)
 
 
+def _runs_from_quoted_words(text: str) -> bool:
+    """True when a quoted ``telegram-mcp`` is followed, in the same list or call, by quoted
+    options and then a quoted subcommand other than status, help or version, as in
+    ``subprocess.run(['telegram-mcp', 'login'])``. Words built from parts at run time
+    (``'te' + 'legram-mcp'``) are not seen."""
+    for match in QUOTED_TOOL_RE.finditer(text):
+        for word in _quoted_words_after(text, match.end()):
+            if word.startswith("-") and word not in ALLOWED_SUBCOMMANDS:
+                continue
+            if word.casefold() in REFUSED_SUBCOMMAND_WORDS:
+                return True
+            break
+    return False
+
+
+def _quoted_words_after(text: str, start: int) -> list[str]:
+    """The quoted words that follow ``start``, separated only by spaces, commas and opening
+    brackets, as in a list or a call's arguments."""
+    words: list[str] = []
+    index = start
+    while index < len(text):
+        char = text[index]
+        if char.isspace() or char in ",[(":
+            index += 1
+        elif char in "'\"":
+            end = text.find(char, index + 1)
+            if end < 0:
+                break
+            words.append(text[index + 1 : end].strip())
+            index = end + 1
+        else:
+            break
+    return words
+
+
 def check_script_text(text: str) -> None:
     """Inline scripts, here-documents and text fed to an interpreter (BR2.7)."""
     check_data_text(text)
-    if PACKAGE_RE.search(text) or OWN_TEXT_RE.search(text):
+    if PACKAGE_RE.search(text) or OWN_TEXT_RE.search(text) or _runs_from_quoted_words(text):
         raise Refusal(Route.OWN_COMMAND, text)
     folded = text.casefold()
     if COMMAND_NAME in folded and any(word in folded for word in KEYCHAIN_WORDS):
