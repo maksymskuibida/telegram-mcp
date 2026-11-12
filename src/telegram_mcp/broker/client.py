@@ -32,6 +32,7 @@ POLL_SECONDS = 0.05
 LOGIN_IN_PROGRESS = "A login is running in a terminal; try again when it has finished."
 NOT_STARTED = "The background connection did not start; try again."
 LOST = "The connection to the background process was lost; try again."
+REFUSED = "The background process refused the connection; try again."
 OUTCOME_UNKNOWN = (
     "The message may or may not have been sent; look at the chat before sending it again."
 )
@@ -73,6 +74,10 @@ class BrokerRefused(Exception):
 
 class _NotReachable(Exception):
     pass
+
+
+class _SecretRefused(_NotReachable):
+    """The broker refused the secret this client read."""
 
 
 def spawn_broker() -> None:
@@ -198,13 +203,25 @@ class BrokerClient:
             return self._reader, self._writer
         self._drop()
         try:
-            return await self._open()
+            return await self._open_with_fresh_secret()
+        except _SecretRefused:
+            raise BrokerUnavailable("telegram_error", REFUSED) from None
         except _NotReachable:
             await self._find_or_start()
         try:
-            return await self._open()
+            return await self._open_with_fresh_secret()
+        except _SecretRefused:
+            raise BrokerUnavailable("telegram_error", REFUSED) from None
         except _NotReachable:
             raise BrokerUnavailable("telegram_error", NOT_STARTED) from None
+
+    async def _open_with_fresh_secret(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """The broker replaces its secret every hour: a hello refused ``bad_secret`` is sent
+        once more with the secret read again. Only hello was sent, so nothing is resent."""
+        try:
+            return await self._open()
+        except _SecretRefused:
+            return await self._open()
 
     async def _open(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         try:
@@ -234,6 +251,8 @@ class BrokerClient:
                     "version_mismatch",
                     "The background process is a different version; try again in a moment.",
                 ) from None
+            if refused.code == jsonrpc.BAD_SECRET:
+                raise _SecretRefused() from refused
             raise _NotReachable() from refused
         except (RequestLost, ConnectionError, OSError) as error:
             self._drop()
@@ -243,17 +262,23 @@ class BrokerClient:
         return reader, writer
 
     async def _find_or_start(self) -> None:
-        """BR2.2: login means wait for it; running means wait for the socket; free means start."""
+        """Login means wait for it; running means wait for the socket; free means start. A
+        broker that is stopping holds the lock until it has left Telegram, so a caller that
+        sees the lock turn free while it waits starts a broker itself (once)."""
         state = probe_lock(self._paths.lock)
         if state is LockProbe.LOGIN:
             raise BrokerUnavailable("login_in_progress", LOGIN_IN_PROGRESS)
-        if state is LockProbe.FREE:
+        spawned = state is LockProbe.FREE
+        if spawned:
             self._spawn()
         deadline = time.monotonic() + self.timeouts.start
         while time.monotonic() < deadline:
             probe = probe_lock(self._paths.lock)
             if probe is LockProbe.LOGIN:
                 raise BrokerUnavailable("login_in_progress", LOGIN_IN_PROGRESS)
+            if probe is LockProbe.FREE and not spawned:
+                spawned = True
+                self._spawn()
             # A socket and secret left by a broker that died are stale: only a held lock
             # says a live broker owns them.
             if (

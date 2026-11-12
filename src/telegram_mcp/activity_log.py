@@ -5,10 +5,11 @@ replaced with ``[redacted]``."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import traceback
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +18,8 @@ from typing import Literal
 REDACTED = "[redacted]"
 FILE_MODE = 0o600
 MIN_SECRET_LENGTH = 8
+MAX_FILE_BYTES = 10_485_760
+KEPT_FILES = 5
 
 EventKind = Literal["call", "prompt", "decision", "result"]
 DecisionKind = Literal["allowed", "declined", "timed_out"]
@@ -61,13 +64,33 @@ class Redactor:
 
 
 class ActivityLog:
-    def __init__(self, path: Path, redactor: Redactor) -> None:
+    """``activity.log`` and up to four older files, ``activity.log.1`` (newest) to
+    ``activity.log.4`` (oldest). Before an entry would take ``activity.log`` past
+    ``max_bytes``, the files move one place along and the entry starts a new file; an entry is
+    never split between two files."""
+
+    def __init__(
+        self,
+        path: Path,
+        redactor: Redactor,
+        *,
+        max_bytes: int = MAX_FILE_BYTES,
+        on_rotation_failure: Callable[[OSError], None] | None = None,
+    ) -> None:
         self._path = path
         self._redactor = redactor
+        self._max_bytes = max_bytes
+        self._on_rotation_failure = on_rotation_failure
+
+    def older_files(self) -> list[Path]:
+        """The older files, newest first, as their names say (some may not exist)."""
+        return [self._path.with_name(f"{self._path.name}.{n}") for n in range(1, KEPT_FILES)]
 
     def append(self, entry: LogEntry) -> None:
-        """Append one JSON line in a single write. Raises ``OSError`` when it cannot."""
+        """Append one JSON line in a single write, rotating first when it would not fit.
+        Raises ``OSError`` only when the entry itself cannot be appended."""
         line = self.render(entry).encode("utf-8") + b"\n"
+        self._rotate_if_needed(len(line))
         descriptor = os.open(self._path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, FILE_MODE)
         try:
             os.fchmod(descriptor, FILE_MODE)
@@ -76,6 +99,37 @@ class ActivityLog:
             os.close(descriptor)
         if written != len(line):
             raise OSError(f"only {written} of {len(line)} bytes of a log entry were written")
+
+    def _rotate_if_needed(self, entry_bytes: int) -> None:
+        try:
+            size = os.lstat(self._path).st_size
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            self._rotation_failed(error)
+            return
+        if size == 0 or size + entry_bytes <= self._max_bytes:
+            return
+        try:
+            self._shift_files()
+        except OSError as error:
+            # The entry still goes into activity.log; the next entry tries again.
+            self._rotation_failed(error)
+
+    def _shift_files(self) -> None:
+        """Delete the oldest file, move each older file one place along, then move
+        activity.log to activity.log.1. Renames stay in the folder and follow no link."""
+        older = self.older_files()
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(older[-1])
+        for source, target in zip(reversed(older[:-1]), reversed(older[1:]), strict=True):
+            with contextlib.suppress(FileNotFoundError):
+                os.replace(source, target)
+        os.replace(self._path, older[0])
+
+    def _rotation_failed(self, error: OSError) -> None:
+        if self._on_rotation_failure is not None:
+            self._on_rotation_failure(error)
 
     def render(self, entry: LogEntry) -> str:
         content = self._redactor.redact(entry.content) if entry.content is not None else None

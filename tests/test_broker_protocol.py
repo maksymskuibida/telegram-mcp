@@ -159,7 +159,8 @@ async def test_status_and_stop(paths: FixedPaths, fake_gateway: FakeGateway) -> 
     assert time.monotonic() - started < 2  # NFR11.3: socket ready well inside the 5 s poll
     raw = await RawClient.connect(paths, client="cli")
     status = await raw.result("broker.status")
-    assert status == {"logged_in": True, "account": None, "clients": 1, "idle_seconds": 0}
+    # clients counts Claude Code sessions; the status command itself is not one.
+    assert status == {"logged_in": True, "account": None, "clients": 0, "idle_seconds": 0}
     assert await raw.result("broker.stop") == {"ok": True}
     await asyncio.wait_for(broker.wait_stopped(), 2)
     assert not paths.socket.exists()

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
 import signal
-from collections.abc import AsyncIterator, Callable, Iterator
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,20 @@ class FakeClock:
     def advance(self, seconds: float) -> None:
         self.now += timedelta(seconds=seconds)
 
+    async def sleep(self, seconds: float) -> None:
+        """A sleep that steps this clock instead of waiting, for the broker and the fake."""
+        self.advance(seconds)
+        await asyncio.sleep(0)
+
+
+async def wait_until(condition: Callable[[], bool], seconds: float = 2.0) -> None:
+    """Poll ``condition`` until it holds; fail the test after ``seconds``."""
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() > deadline:
+            pytest.fail("the condition did not hold in time")
+        await asyncio.sleep(0.01)
+
 
 def save_fake_session() -> StoredSession:
     values = fake_secrets()
@@ -53,6 +69,26 @@ async def running_broker(
         yield broker
     finally:
         await broker.stop()
+
+
+@contextlib.asynccontextmanager
+async def broker_starter(
+    paths: FixedPaths, gateway: FakeGateway, clock: FakeClock
+) -> AsyncIterator[Callable[..., Awaitable[Broker]]]:
+    """Start brokers on the fake gateway and ``clock``; every one is stopped at the end."""
+    started: list[Broker] = []
+
+    async def start(**options: Any) -> Broker:
+        broker = make_broker(paths, gateway, clock=clock, **options)
+        await broker.start()
+        started.append(broker)
+        return broker
+
+    try:
+        yield start
+    finally:
+        for broker in started:
+            await broker.stop()
 
 
 def write_fake_gateway_file(home: Path, **extra: Any) -> Path:

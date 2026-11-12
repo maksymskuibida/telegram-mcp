@@ -607,7 +607,8 @@ async def test_an_unexpected_error_inside_the_broker_refuses(
     ("script", "code", "retry_after"),
     [
         (GatewayTimeout(), "telegram_timeout", None),
-        (FloodWait(30), "flood_wait", 30),
+        # A read waits out a flood wait of 30 s or less; a longer one is answered at once.
+        (FloodWait(31), "flood_wait", 31),
         (NotAuthorized(), "no_session", None),
         (RuntimeError("bug"), "telegram_error", None),
     ],
