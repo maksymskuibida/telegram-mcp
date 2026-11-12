@@ -21,6 +21,10 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 
 MAX_RESULTS = 256
+# All the expansion one decision may do, nested lines and loop values included. A line within
+# the 64 KiB input limit needs far less; past this, the line is refused rather than read slowly.
+MAX_WORK = 600_000
+MAX_RANGE_TEXT = 32
 GLOB_CHARS = "*?["
 NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 ASSIGNMENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=")
@@ -188,14 +192,26 @@ class Word:
 
 
 def _word(pieces: Iterable[Piece]) -> Word:
+    """Joins neighbouring known pieces of the same kind, in one pass."""
     merged: list[Piece] = []
+    texts: list[str] = []
+    quoted = True
+
+    def close() -> None:
+        if texts:
+            merged.append(Piece("".join(texts), quoted))
+            texts.clear()
+
     for piece in pieces:
-        last = merged[-1] if merged else None
-        if last and not piece.unknown and not last.unknown and last.quoted == piece.quoted:
-            merged[-1] = Piece(last.text + piece.text, piece.quoted)
-            continue
-        if piece.unknown or piece.text:
+        if piece.unknown:
+            close()
             merged.append(piece)
+        elif piece.text:
+            if texts and piece.quoted != quoted:
+                close()
+            quoted = piece.quoted
+            texts.append(piece.text)
+    close()
     return Word(tuple(merged))
 
 
@@ -232,6 +248,19 @@ NOT_SET = _Unset(anywhere=True)
 EXPLICITLY_UNSET = _Unset(anywhere=False)
 
 
+class Budget:
+    """The expansion work left for one decision, shared by every copy of the state, so the
+    guard's time stays bounded whatever the line holds."""
+
+    def __init__(self, limit: int = MAX_WORK) -> None:
+        self.left = limit
+
+    def spend(self, amount: int) -> None:
+        self.left -= amount
+        if self.left < 0:
+            raise Unparsable("the command is too large to read")
+
+
 @dataclass
 class ShellState:
     environ: Mapping[str, str]
@@ -239,6 +268,7 @@ class ShellState:
     base: str | None
     variables: dict[str, Value | None] = field(default_factory=dict)
     tainted: bool = False
+    budget: Budget = field(default_factory=lambda: Budget())
 
     @classmethod
     def start(cls, environ: Mapping[str, str], home: str, cwd: str) -> ShellState:
@@ -279,10 +309,14 @@ class Command:
 
 def expand_line(text: str, state: ShellState, depth: int = 0) -> list[Command]:
     """Read ``text`` and expand it in order. ``state`` is changed by the line's assignments
-    and ``cd``s. Raises Unparsable."""
-    nodes = _Parser(text).parse_script(closing=False)
-    walker = _Walker(state, depth)
-    walker.walk(nodes)
+    and ``cd``s. Raises Unparsable, also for nesting deeper than Python's stack allows."""
+    state.budget.spend(len(text))
+    try:
+        nodes = _Parser(text).parse_script(closing=False)
+        walker = _Walker(state, depth)
+        walker.walk(nodes)
+    except RecursionError as error:
+        raise Unparsable("the command nests too deeply to read") from error
     return walker.out
 
 
@@ -927,11 +961,12 @@ def _active(atom: Atom, char: str) -> bool:
     return isinstance(atom, _Char) and atom.active and atom.char == char
 
 
-def brace_expand(atoms: list[Atom]) -> list[list[Atom]]:
+def brace_expand(atoms: list[Atom], budget: Budget) -> list[list[Atom]]:
     pending = [atoms]
     done: list[list[Atom]] = []
     while pending:
         current = pending.pop(0)
+        budget.spend(len(current))
         expanded = _expand_first_brace(current)
         if expanded is None:
             done.append(current)
@@ -945,39 +980,39 @@ def brace_expand(atoms: list[Atom]) -> list[list[Atom]]:
 
 
 def _expand_first_brace(atoms: list[Atom]) -> list[list[Atom]] | None:
-    for start, atom in enumerate(atoms):
-        if not _active(atom, "{"):
-            continue
-        end, commas = _closing_brace(atoms, start)
-        if end is None:
-            if len(atoms) == 1:
-                return None
-            raise Unparsable("a { does not close")
-        prefix, suffix = atoms[:start], atoms[end + 1 :]
+    pairs, unclosed = _brace_pairs(atoms)
+    if unclosed and len(atoms) > 1:
+        raise Unparsable("a { does not close")
+    for start in sorted(pairs):
+        end, commas = pairs[start]
         if commas:
+            if len(commas) + 1 > MAX_RESULTS:
+                raise Unparsable("brace expansion gives more than 256 words")
+            prefix, suffix = atoms[:start], atoms[end + 1 :]
             edges = [start, *commas, end]
             return [
                 prefix + atoms[edges[i] + 1 : edges[i + 1]] + suffix for i in range(len(edges) - 1)
             ]
-        items = _range_items(atoms[start + 1 : end])
+        items = _range_items(atoms[start + 1 : end]) if end - start <= MAX_RANGE_TEXT else None
         if items is not None:
+            prefix, suffix = atoms[:start], atoms[end + 1 :]
             return [prefix + [_Char(c, True) for c in item] + suffix for item in items]
     return None
 
 
-def _closing_brace(atoms: list[Atom], start: int) -> tuple[int | None, list[int]]:
-    depth = 0
-    commas: list[int] = []
-    for index in range(start, len(atoms)):
-        if _active(atoms[index], "{"):
-            depth += 1
-        elif _active(atoms[index], "}"):
-            depth -= 1
-            if depth == 0:
-                return index, commas
-        elif _active(atoms[index], ",") and depth == 1:
-            commas.append(index)
-    return None, []
+def _brace_pairs(atoms: list[Atom]) -> tuple[dict[int, tuple[int, list[int]]], list[int]]:
+    """Each ``{`` with its matching ``}`` and its top-level commas, in one pass."""
+    stack: list[tuple[int, list[int]]] = []
+    pairs: dict[int, tuple[int, list[int]]] = {}
+    for index, atom in enumerate(atoms):
+        if _active(atom, "{"):
+            stack.append((index, []))
+        elif _active(atom, "}") and stack:
+            start, commas = stack.pop()
+            pairs[start] = (index, commas)
+        elif _active(atom, ",") and stack:
+            stack[-1][1].append(index)
+    return pairs, [start for start, _commas in stack]
 
 
 def _range_items(inner: list[Atom]) -> list[str] | None:
@@ -1191,7 +1226,7 @@ class _Walker:
         if mode == "heredoc":
             alternatives = self.expand_atoms(atoms, quoted_context=True)
             return [_word(alternatives[0]) if len(alternatives) == 1 else Word((UNKNOWN_PIECE,))]
-        results = [atoms] if mode == "cond" else brace_expand(atoms)
+        results = [atoms] if mode == "cond" else brace_expand(atoms, self.state.budget)
         words: list[Word] = []
         for result in results:
             if mode == "word":
@@ -1252,6 +1287,7 @@ class _Walker:
         return Lit("".join(p.text for p in value[0]), True)
 
     def expand_atoms(self, atoms: list[Atom], quoted_context: bool) -> list[list[Piece]]:
+        self.state.budget.spend(len(atoms))
         alternatives: list[list[Piece]] = [[]]
         for atom in atoms:
             if isinstance(atom, _Char):
@@ -1266,6 +1302,7 @@ class _Walker:
                 alternatives = [a + list(option) for a in alternatives for option in options]
                 if len(alternatives) > MAX_RESULTS:
                     raise Unparsable("more than 256 combinations of values")
+                self.state.budget.spend(len(alternatives) * len(atoms))
             elif isinstance(atom, Sub):
                 _Walker(self.state.copy(), self.depth + 1, self.out).walk(atom.body)
                 for alternative in alternatives:

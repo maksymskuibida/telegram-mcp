@@ -30,6 +30,7 @@ def decide(call: object, paths: FixedPaths, environ: Mapping[str, str]) -> Guard
         if tool not in rules.WATCHED_TOOLS:
             return PASS
         what = rules.summary(guard_call)
+        rules.check_size(guard_call)
         context = rules.Context.build(paths, environ, guard_call)
         getattr(rules, rules.RULES[tool])(guard_call, context)
         return PASS

@@ -85,6 +85,7 @@ OPTIONAL = {
     "Agent": ("description",),
 }
 MAX_NESTING = 8
+MAX_TEXT = 64 * 1024
 
 OWN_TEXT_RE = re.compile(
     COMMAND_NAME
@@ -314,6 +315,14 @@ def read_call(raw: object) -> GuardCall:
         if name in tool_input and not isinstance(tool_input[name], str):
             raise Refusal(Route.UNREADABLE_CALL, "")
     return GuardCall(tool, tool_input, cwd)
+
+
+def check_size(call: GuardCall) -> None:
+    """Every text the guard reads is at most 64 KiB, which keeps its time bounded."""
+    fields = (REQUIRED[call.tool_name], *OPTIONAL.get(call.tool_name, ()))
+    texts = [call.tool_input.get(name) or "" for name in fields] + [call.cwd or ""]
+    if any(len(text) > MAX_TEXT for text in texts):
+        raise Refusal(Route.UNPARSABLE, "a text in the call is longer than 64 KiB")
 
 
 def summary(call: GuardCall) -> str:
