@@ -516,6 +516,7 @@ class Effective:
     wrapped: bool = False
     values: set[int] = field(default_factory=set)
     nested: list[Word] = field(default_factory=list)
+    wrappers: list[str] = field(default_factory=list)
 
 
 def effective(words: list[Word]) -> Effective:
@@ -525,6 +526,7 @@ def effective(words: list[Word]) -> Effective:
         if name is None:
             break
         found.wrapped = True
+        found.wrappers.append(name)
         found.index = _skip_options(words, found.index + width, name, found)
     return found
 
@@ -638,11 +640,24 @@ def _is_hooks_run(word: Word) -> bool:
     return word.known and (text == "hooks/run" or text.endswith("/hooks/run"))
 
 
+def _allowed_written(rest: list[Word]) -> bool:
+    """True when an allowed subcommand (status, help, version) is written after the tool."""
+    return any(word.known and word.render() in ALLOWED_SUBCOMMANDS for word in rest)
+
+
 def check_own_command(words: list[Word], found: Effective) -> None:
     index = found.index
     if index < len(words):
         program = words[index]
         if is_tool_command(program) and _refused_after(words[index + 1 :]):
+            raise Refusal(Route.OWN_COMMAND, " ".join(w.render() for w in words[index:]))
+        # xargs appends words from standard input: only a subcommand written out and allowed
+        # keeps the tool from running whatever arrives there.
+        if (
+            is_tool_command(program)
+            and "xargs" in found.wrappers
+            and not _allowed_written(words[index + 1 :])
+        ):
             raise Refusal(Route.OWN_COMMAND, " ".join(w.render() for w in words[index:]))
         if _is_hooks_run(program):
             raise Refusal(Route.OWN_COMMAND, program.render())
