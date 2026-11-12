@@ -697,3 +697,23 @@ def test_a_worst_case_line_is_decided_in_under_a_second(gh: GuardHome, name: str
             break
     assert took < 1.0, f"{name}: {took:.2f} s"
     assert decision.route != Route.GUARD_ERROR
+
+
+# The Monitor tool runs a shell command: it is decided exactly as Bash
+
+
+@pytest.mark.parametrize(("command", "_route"), SPEC_EXAMPLES)
+def test_a_monitor_command_is_decided_as_bash(gh: GuardHome, command: str, _route: object) -> None:
+    command = gh.fill(command)
+    as_bash = gh.decide(gh.call("Bash", command=command))
+    as_monitor = gh.decide(gh.call("Monitor", command=command, description="watch"))
+    assert (as_monitor.verdict, as_monitor.route) == (as_bash.verdict, as_bash.route)
+
+
+def test_a_monitor_refusal_and_its_missing_command(gh: GuardHome) -> None:
+    refused = gh.decide(gh.call("Monitor", command="tail -f ~/link/activity.log"))
+    assert refused.route == Route.DATA_PATH
+    missing = gh.decide(gh.call("Monitor", description="watch"))
+    assert missing.route == Route.UNREADABLE_CALL
+    too_long = gh.decide(gh.call("Monitor", command="a" * (MAX_TEXT + 1)))
+    assert too_long.route == Route.UNPARSABLE

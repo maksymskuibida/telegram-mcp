@@ -81,6 +81,7 @@ def test_the_two_approval_hooks_run_through_the_launcher_with_their_timeouts() -
 
 GUARDED_TOOLS = [
     "Bash",
+    "Monitor",
     "Read",
     "Write",
     "Edit",

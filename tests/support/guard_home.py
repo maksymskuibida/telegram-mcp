@@ -22,6 +22,7 @@ DATA_FILES = (
 )
 WATCHED_TOOLS = (
     "Bash",
+    "Monitor",
     "Read",
     "Write",
     "Edit",
