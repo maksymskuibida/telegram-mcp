@@ -28,6 +28,8 @@ from telegram_mcp.gateway.models import (
     QrToken,
     SentCodeInfo,
     TelegramError,
+    TopicNotFound,
+    UnreadState,
 )
 from telegram_mcp.gateway.telethon_gateway import TelethonGateway, sent_code_info
 
@@ -50,6 +52,8 @@ class StubClient:
         self.code_requests: list[str] = []
         self.requests: list[Any] = []
         self.sign_ins: list[dict[str, Any]] = []
+        self.responses: dict[type, Any] = {}
+        self.input_entities: dict[int, Any] = {}
         self.session = SimpleNamespace(save=lambda: "saved-session")
 
     async def _maybe_fail(self, name: str) -> None:
@@ -85,6 +89,8 @@ class StubClient:
     async def __call__(self, request: Any) -> Any:
         await self._maybe_fail("call")
         self.requests.append(request)
+        if type(request) in self.responses:
+            return self.responses[type(request)]
         return types.auth.SentCode(
             type=types.auth.SentCodeTypeSms(length=5), phone_code_hash="hash-2"
         )
@@ -109,7 +115,8 @@ class StubClient:
         raise ValueError("Could not find the input entity")
 
     async def get_input_entity(self, peer: int) -> Any:
-        return types.InputPeerEmpty()
+        await self._maybe_fail("get_input_entity")
+        return self.input_entities.get(peer, types.InputPeerEmpty())
 
     async def send_message(self, chat: int, text: str, **options: Any) -> Any:
         await self._maybe_fail("send_message")
@@ -521,3 +528,153 @@ async def test_log_out_refusals_keep_their_kind(raised: Any, expected: type[Gate
     client.fail["log_out"] = raised
     with pytest.raises(expected):
         await gateway.log_out()
+
+
+# U2: unread_state and mark_read (BR13.9, BR14.1, BR14.2) ---------------------------------------
+
+CHANNEL = types.InputPeerChannel(channel_id=55, access_hash=99)
+USER = types.InputPeerUser(user_id=7, access_hash=1)
+
+
+def dialog_with(unread: int, top: int) -> Any:
+    return types.Dialog(
+        peer=types.PeerUser(user_id=7),
+        top_message=top,
+        read_inbox_max_id=0,
+        read_outbox_max_id=0,
+        unread_count=unread,
+        unread_mentions_count=2,
+        unread_reactions_count=1,
+        unread_poll_votes_count=0,
+        notify_settings=types.PeerNotifySettings(),
+    )
+
+
+def topic_with(topic_id: int, unread: int, top: int, title: str = "Ideas") -> Any:
+    return types.ForumTopic(
+        id=topic_id,
+        date=datetime(2026, 1, 1, tzinfo=UTC),
+        peer=types.PeerChannel(channel_id=55),
+        title=title,
+        icon_color=0,
+        top_message=top,
+        read_inbox_max_id=0,
+        read_outbox_max_id=0,
+        unread_count=unread,
+        unread_mentions_count=0,
+        unread_reactions_count=0,
+        unread_poll_votes_count=0,
+        from_id=types.PeerUser(user_id=7),
+        notify_settings=types.PeerNotifySettings(),
+    )
+
+
+def topics_result(*topics: Any) -> Any:
+    return types.messages.ForumTopics(
+        count=len(topics), topics=list(topics), messages=[], chats=[], users=[], pts=0
+    )
+
+
+def dialogs_result(*dialogs: Any) -> Any:
+    state = types.updates.State(
+        pts=0, qts=0, date=datetime(2026, 1, 1, tzinfo=UTC), seq=0, unread_count=0
+    )
+    return types.messages.PeerDialogs(
+        dialogs=list(dialogs), messages=[], chats=[], users=[], state=state
+    )
+
+
+async def test_unread_state_of_a_chat_uses_get_peer_dialogs() -> None:
+    gateway, client = make_gateway()
+    client.input_entities[7] = USER
+    client.responses[functions.messages.GetPeerDialogsRequest] = dialogs_result(dialog_with(4, 88))
+    assert await gateway.unread_state(7, None) == UnreadState(unread=4, newest_id=88)
+    (request,) = client.requests
+    assert isinstance(request, functions.messages.GetPeerDialogsRequest)
+    assert request.peers == [types.InputDialogPeer(peer=USER)]
+
+
+async def test_unread_state_of_a_topic_uses_get_forum_topics_by_id() -> None:
+    gateway, client = make_gateway()
+    client.input_entities[-10055] = CHANNEL
+    client.responses[functions.messages.GetForumTopicsByIDRequest] = topics_result(
+        topic_with(9, 2, 120)
+    )
+    state = await gateway.unread_state(-10055, 9)
+    assert state == UnreadState(unread=2, newest_id=120, topic_title="Ideas")
+    (request,) = client.requests
+    assert (request.peer, request.topics) == (CHANNEL, [9])
+
+
+async def test_an_empty_answer_is_a_missing_chat_or_topic() -> None:
+    gateway, client = make_gateway()
+    client.responses[functions.messages.GetPeerDialogsRequest] = dialogs_result()
+    client.responses[functions.messages.GetForumTopicsByIDRequest] = topics_result(
+        types.ForumTopicDeleted(id=9)
+    )
+    with pytest.raises(ChatNotFound):
+        await gateway.unread_state(7, None)
+    with pytest.raises(TopicNotFound):
+        await gateway.unread_state(7, 9)
+    client.fail["get_input_entity"] = ValueError("unknown")
+    with pytest.raises(ChatNotFound):
+        await gateway.unread_state(7, None)
+
+
+@pytest.mark.parametrize(
+    ("peer", "topic_id", "expected"),
+    [
+        (USER, None, functions.messages.ReadHistoryRequest(peer=USER, max_id=50)),
+        (
+            CHANNEL,
+            None,
+            functions.channels.ReadHistoryRequest(
+                channel=types.InputChannel(channel_id=55, access_hash=99), max_id=50
+            ),
+        ),
+        (
+            CHANNEL,
+            9,
+            functions.messages.ReadDiscussionRequest(peer=CHANNEL, msg_id=9, read_max_id=50),
+        ),
+    ],
+)
+async def test_mark_read_reads_history_up_to_max_id_only(
+    peer: Any, topic_id: int | None, expected: Any
+) -> None:
+    gateway, client = make_gateway()
+    client.input_entities[1] = peer
+    client.responses[type(expected)] = True
+    await gateway.mark_read(1, 50, topic_id)
+    assert [r.to_dict() for r in client.requests] == [expected.to_dict()]
+    names = {type(r).__name__ for r in client.requests}
+    assert not names & {"ReadMentionsRequest", "ReadReactionsRequest"}
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("hang", OutcomeUnknown),
+        (errors.FloodWaitError(request=None, capture=12), FloodWait),
+        (errors.RPCError(request=None, message="CHANNEL_PRIVATE"), TelegramError),
+    ],
+)
+async def test_mark_read_failures_are_mapped(failure: Any, expected: type[GatewayError]) -> None:
+    gateway, client = make_gateway(timeout=0.05)
+    client.fail["call"] = failure
+    with pytest.raises(expected):
+        await gateway.mark_read(1, 50, None)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("hang", GatewayTimeout),
+        (errors.FloodWaitError(request=None, capture=40), FloodWait),
+    ],
+)
+async def test_unread_state_failures_are_mapped(failure: Any, expected: type[GatewayError]) -> None:
+    gateway, client = make_gateway(timeout=0.05)
+    client.fail["call"] = failure
+    with pytest.raises(expected):
+        await gateway.unread_state(1, None)

@@ -25,6 +25,8 @@ from telegram_mcp.gateway.models import (
     QrExpired,
     SentCodeInfo,
     TelegramError,
+    TopicNotFound,
+    UnreadState,
 )
 
 
@@ -251,3 +253,78 @@ async def test_log_out_returns_its_scripted_result(confirmed: bool) -> None:
     assert await fake.log_out() is confirmed
     assert fake.authorized is not confirmed
     assert fake.call_names() == ["log_out"]
+
+
+# U2: seeded messages, unread state and marking (BR13.1, BR14.1, BR14.2) -----------------------
+
+
+def seeded(fake: FakeGateway) -> list[int]:
+    fake.topics[FORUM.id] = {9: "Ideas", 10: "Off topic"}
+    ids = [fake.add_message(ALICE.id, f"m{n}").id for n in range(3)]
+    ids.append(fake.add_message(FORUM.id, "in ideas", topic_id=9).id)
+    ids.append(fake.add_message(FORUM.id, "off topic", topic_id=10).id)
+    return ids
+
+
+async def test_unread_state_counts_a_chat_and_a_topic(fake_gateway: FakeGateway) -> None:
+    ids = seeded(fake_gateway)
+    assert await fake_gateway.unread_state(ALICE.id, None) == UnreadState(3, ids[2])
+    assert await fake_gateway.unread_state(FORUM.id, 9) == UnreadState(1, ids[3], "Ideas")
+    assert await fake_gateway.unread_state(FORUM.id, None) == UnreadState(2, ids[4])
+    assert await fake_gateway.unread_state(TEAM.id, None) == UnreadState(0, 0)
+
+
+async def test_mark_read_marks_up_to_max_id_and_nothing_beyond(fake_gateway: FakeGateway) -> None:
+    ids = seeded(fake_gateway)
+    await fake_gateway.mark_read(ALICE.id, ids[1], None)
+    assert await fake_gateway.unread_state(ALICE.id, None) == UnreadState(1, ids[2])
+    await fake_gateway.mark_read(FORUM.id, ids[3], 9)
+    assert (await fake_gateway.unread_state(FORUM.id, 9)).unread == 0
+    assert (await fake_gateway.unread_state(FORUM.id, 10)).unread == 1
+    assert fake_gateway.read_acknowledgements() == [
+        {"chat_id": ALICE.id, "max_id": ids[1], "topic_id": None},
+        {"chat_id": FORUM.id, "max_id": ids[3], "topic_id": 9},
+    ]
+
+
+async def test_reads_and_fetches_never_acknowledge_reading(fake_gateway: FakeGateway) -> None:
+    ids = seeded(fake_gateway)
+    assert [m.id for m in await fake_gateway.get_messages(ALICE.id, [ids[0], 999])] == [ids[0]]
+    assert [m.text for m in await fake_gateway.read_messages(ALICE.id, 2, None)] == ["m1", "m2"]
+    older = await fake_gateway.read_messages(ALICE.id, 5, None, before_id=ids[1])
+    assert [m.id for m in older] == [ids[0]]
+    assert [m.id for m in await fake_gateway.read_messages(FORUM.id, 5, 9)] == [ids[3]]
+    await fake_gateway.unread_state(ALICE.id, None)
+    await fake_gateway.list_chats(None, 50, None)
+    await fake_gateway.record_write("tg_chats_leave", approval_id="x")
+    assert fake_gateway.read_acknowledgements() == []
+    assert (await fake_gateway.unread_state(ALICE.id, None)).unread == 3
+
+
+async def test_an_unknown_chat_or_topic_is_reported(fake_gateway: FakeGateway) -> None:
+    seeded(fake_gateway)
+    with pytest.raises(ChatNotFound):
+        await fake_gateway.unread_state(99999, None)
+    with pytest.raises(TopicNotFound):
+        await fake_gateway.unread_state(FORUM.id, 404)
+    with pytest.raises(TopicNotFound):
+        await fake_gateway.mark_read(FORUM.id, 1, 404)
+
+
+async def test_the_new_calls_can_be_scripted(fake_gateway: FakeGateway) -> None:
+    seeded(fake_gateway)
+    fake_gateway.script("unread_state", result=UnreadState(-1, 0))
+    assert (await fake_gateway.unread_state(ALICE.id, None)).unread == -1
+    fake_gateway.script("mark_read", error=FloodWait(3))
+    with pytest.raises(FloodWait):
+        await fake_gateway.mark_read(ALICE.id, 1, None)
+    fake_gateway.authorized = False
+    with pytest.raises(NotAuthorized):
+        await fake_gateway.unread_state(ALICE.id, None)
+
+
+async def test_mark_all_read_seeds_without_recording(fake_gateway: FakeGateway) -> None:
+    seeded(fake_gateway)
+    fake_gateway.mark_all_read()
+    assert (await fake_gateway.unread_state(FORUM.id, 9)).unread == 0
+    assert fake_gateway.read_acknowledgements() == []
