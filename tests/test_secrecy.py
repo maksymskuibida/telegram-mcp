@@ -59,7 +59,11 @@ async def test_no_secret_reaches_any_file_log_or_result(paths: FixedPaths) -> No
 
     assert (
         await login(
-            paths, terminal, gateway_factory=lambda s, i, h: login_gateway, stop_broker=no_broker
+            paths,
+            terminal,
+            gateway_factory=lambda s, i, h: login_gateway,
+            stop_broker=no_broker,
+            method="phone",
         )
         == 0
     )

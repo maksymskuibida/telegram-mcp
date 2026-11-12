@@ -1,8 +1,9 @@
-"""`telegram-mcp login`: phone login into the Keychain (C7; rules BR1.1 to BR1.4, BR1.8).
+"""`telegram-mcp login [--qr]`: phone or QR-code login into the Keychain (C7).
 
 Everything is asked in the terminal only; the api_hash and the two-step password are read
-without echo. Nothing is saved until sign-in succeeds, and the broker lock is held in state
-``login`` for the whole command, released on every way out, Ctrl-C included."""
+without echo. A QR login link is shown on the terminal only. Nothing is saved until sign-in
+succeeds, and the broker lock is held in state ``login`` for the whole command, released on
+every way out, Ctrl-C included."""
 
 from __future__ import annotations
 
@@ -14,7 +15,10 @@ import time
 import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
+from typing import Literal
 
+from telegram_mcp.activity_log import utc_now
 from telegram_mcp.broker.client import BrokerClient
 from telegram_mcp.broker.lock import BrokerLock, LockProbe, LockState, probe_lock
 from telegram_mcp.broker.server import default_gateway_factory
@@ -28,14 +32,24 @@ from telegram_mcp.gateway.models import (
     GatewayTimeout,
     Me,
     PasswordNeeded,
+    QrExpired,
+    QrToken,
     SentCodeInfo,
     TelegramError,
     account_label,
 )
 from telegram_mcp.gateway.protocol import GatewayFactory, TelegramGateway
 from telegram_mcp.paths import FixedPaths
+from telegram_mcp.qr import draw
 from telegram_mcp.vault import SessionVault, StoredSession, VaultError, VaultOutcome
 
+LoginMethod = Literal["phone", "qr"]
+Clock = Callable[[], datetime]
+QR_WINDOW = timedelta(seconds=180)
+QR_MIN_LEFT = timedelta(seconds=5)
+QR_GAVE_UP = "No QR code was scanned within 3 minutes; nothing was saved."
+QR_NEW_CODE = "A new code (the previous one expired):"
+METHOD_QUESTION = "Log in with (1) phone number or (2) QR code? "
 MAX_TRIES = 3
 STOP_WAIT_SECONDS = 5.0
 ACCOUNT_LOOKUP_SECONDS = 15.0
@@ -97,7 +111,10 @@ async def login(
     gateway_factory: GatewayFactory,
     stop_broker: Callable[[], Awaitable[None]],
     vault: SessionVault | None = None,
+    method: LoginMethod | None = None,
+    clock: Clock = utc_now,
 ) -> int:
+    """``method`` "qr" is ``--qr``; None asks phone or QR after any "Replace it?" question."""
     vault = vault or SessionVault(paths.keychain_service)
     stored = vault.load()
     if stored.outcome is VaultOutcome.KEYCHAIN_LOCKED:
@@ -113,7 +130,9 @@ async def login(
         ):
             terminal.say("Nothing changed.")
             return EXIT_OK
-        return await _sign_in(terminal, gateway_factory, vault, stored.session)
+        chosen = method or _choose_method(terminal)
+        sign_in = _SignIn(terminal, gateway_factory, chosen, clock)
+        return await sign_in.run(vault, stored.session)
     except LoginStopped as stopped:
         terminal.say(str(stopped))
         return stopped.code
@@ -165,46 +184,120 @@ async def _confirm_replace(
     return answer in ("y", "yes")
 
 
-async def _sign_in(
-    terminal: Terminal,
-    gateway_factory: GatewayFactory,
-    vault: SessionVault,
-    old: StoredSession | None,
-) -> int:
-    api_id = _ask_until(
-        terminal.ask,
-        "api_id (from my.telegram.org): ",
-        _parse_api_id,
-        terminal,
-        "api_id must be a positive whole number.",
-    )
-    api_hash = _ask_until(
-        terminal.ask_secret,
-        "api_hash (hidden): ",
-        _parse_api_hash,
-        terminal,
-        "api_hash must be 32 hexadecimal characters.",
-    )
-    phone = _ask_until(
+def _choose_method(terminal: Terminal) -> LoginMethod:
+    """Ask phone (1) or QR (2) until the answer is one of them."""
+    while True:
+        answer = terminal.ask(METHOD_QUESTION).strip()
+        if answer == "1":
+            return "phone"
+        if answer == "2":
+            return "qr"
+        terminal.say("Type 1 or 2.")
+
+
+@dataclass
+class _SignIn:
+    terminal: Terminal
+    gateway_factory: GatewayFactory
+    method: LoginMethod
+    clock: Clock
+
+    async def run(self, vault: SessionVault, old: StoredSession | None) -> int:
+        """Ask the app credentials, sign in by the chosen method, then save (or replace)."""
+        api_id, api_hash = self._credentials()
+        phone = _ask_phone(self.terminal) if self.method == "phone" else None
+        gateway = self.gateway_factory("", api_id, api_hash)
+        try:
+            await gateway.connect()
+            if phone is not None:
+                me = await _phone_sign_in(self.terminal, gateway, phone)
+            else:
+                me = await _QrWait(self.terminal, gateway, self.clock).run()
+            stored = StoredSession(gateway.export_session(), api_id, api_hash)
+        except GatewayError as error:
+            raise LoginStopped(_refused(error), EXIT_FAILED) from error
+        finally:
+            await _disconnect(gateway)
+        _store(vault, stored, old)
+        self.terminal.say(f"Logged in as {describe(me)}.")
+        return EXIT_OK
+
+    def _credentials(self) -> tuple[int, str]:
+        api_id = _ask_until(
+            self.terminal.ask,
+            "api_id (from my.telegram.org): ",
+            _parse_api_id,
+            self.terminal,
+            "api_id must be a positive whole number.",
+        )
+        api_hash = _ask_until(
+            self.terminal.ask_secret,
+            "api_hash (hidden): ",
+            _parse_api_hash,
+            self.terminal,
+            "api_hash must be 32 hexadecimal characters.",
+        )
+        return api_id, api_hash
+
+
+def _ask_phone(terminal: Terminal) -> str:
+    return _ask_until(
         terminal.ask,
         "Phone number, with country code: ",
         _parse_phone,
         terminal,
         "Give the phone number with its country code, like +15551234567.",
     )
-    gateway = gateway_factory("", api_id, api_hash)
-    try:
-        await gateway.connect()
-        sent = await gateway.sign_in_phone(phone)
-        terminal.say(where_the_code_went(sent))
-        me = await _enter_code(terminal, gateway, phone, sent)
-        stored = StoredSession(gateway.export_session(), api_id, api_hash)
-    except GatewayError as error:
-        raise LoginStopped(
-            f"Telegram refused the login ({type(error).__name__}); nothing was saved.", EXIT_FAILED
-        ) from error
-    finally:
-        await _disconnect(gateway)
+
+
+async def _phone_sign_in(terminal: Terminal, gateway: TelegramGateway, phone: str) -> Me:
+    sent = await gateway.sign_in_phone(phone)
+    terminal.say(where_the_code_went(sent))
+    return await _enter_code(terminal, gateway, phone, sent)
+
+
+@dataclass
+class _QrWait:
+    """Show a token and wait for a scan; replace an expired token until 3 minutes after the
+    first one was shown. Each wait ends at the earlier of the token's expiry and that
+    deadline, and no new token is asked for with under 5 s left."""
+
+    terminal: Terminal
+    gateway: TelegramGateway
+    clock: Clock
+
+    async def run(self) -> Me:
+        token = await self.gateway.sign_in_qr()
+        deadline = self.clock() + QR_WINDOW
+        self._show(token)
+        while True:
+            wait = (min(token.expires_at, deadline) - self.clock()).total_seconds()
+            try:
+                return await self.gateway.wait_qr(max(0.0, wait))
+            except PasswordNeeded:
+                return await _enter_password(self.terminal, self.gateway)
+            except QrExpired:
+                if deadline - self.clock() < QR_MIN_LEFT:
+                    raise LoginStopped(QR_GAVE_UP, EXIT_FAILED) from None
+            token = await self.gateway.sign_in_qr()
+            self.terminal.say(QR_NEW_CODE)
+            self._show(token)
+
+    def _show(self, token: QrToken) -> None:
+        for line in draw(token.url):
+            self.terminal.say(line)
+
+
+def _refused(error: GatewayError) -> str:
+    """Why Telegram refused, by error type only (never its text); a flood wait names its
+    seconds."""
+    kind = type(error).__name__
+    if isinstance(error, FloodWait):
+        kind = f"{kind}, wait {error.seconds} s"
+    return f"Telegram refused the login ({kind}); nothing was saved."
+
+
+def _store(vault: SessionVault, stored: StoredSession, old: StoredSession | None) -> None:
     try:
         if old is None:
             vault.save(stored)
@@ -212,8 +305,6 @@ async def _sign_in(
             vault.replace(stored, old)
     except VaultError as error:
         raise LoginStopped(f"{error}.", EXIT_REFUSED) from error
-    terminal.say(f"Logged in as {describe(me)}.")
-    return EXIT_OK
 
 
 def where_the_code_went(sent: SentCodeInfo) -> str:
@@ -328,7 +419,7 @@ async def _disconnect(gateway: TelegramGateway) -> None:
         await gateway.disconnect()
 
 
-def run_login_command(paths: FixedPaths) -> int:
+def run_login_command(paths: FixedPaths, *, qr: bool = False) -> int:
     async def stop_broker() -> None:
         client = BrokerClient(paths, "cli", spawn=lambda: None)
         try:
@@ -343,6 +434,7 @@ def run_login_command(paths: FixedPaths) -> int:
                 Terminal(),
                 gateway_factory=default_gateway_factory(paths),
                 stop_broker=stop_broker,
+                method="qr" if qr else None,
             )
         )
     except KeyboardInterrupt:
