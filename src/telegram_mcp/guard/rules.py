@@ -9,7 +9,6 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
-from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from telegram_mcp.guard import patterns
@@ -27,7 +26,15 @@ from telegram_mcp.guard.model import (
     Route,
 )
 from telegram_mcp.guard.paths import Resolver, Unresolvable, absolute, expand_home
-from telegram_mcp.guard.shell import Command, ShellState, Unparsable, Word, expand_line
+from telegram_mcp.guard.shell import (
+    Command,
+    Piece,
+    ShellState,
+    Unparsable,
+    Word,
+    expand_line,
+    known_word,
+)
 from telegram_mcp.paths import FixedPaths
 
 WATCHED_TOOLS = frozenset(
@@ -512,7 +519,7 @@ def _skip_options(words: list[Word], index: int, name: str, found: Effective) ->
                 index += 2
             else:
                 attached = text.split("=", 1)[1] if text.startswith("--") else text[2:]
-                found.nested.append(Word(((_known_piece(attached)),)))
+                found.nested.append(known_word(attached))
                 index += 1
             continue
         if not text.startswith("-") or text == "-":
@@ -526,12 +533,6 @@ def _skip_options(words: list[Word], index: int, name: str, found: Effective) ->
         found.values.add(index)
         index += 1
     return index
-
-
-def _known_piece(text: str) -> Any:
-    from telegram_mcp.guard.shell import Piece
-
-    return Piece(text, True)
 
 
 def check_command(command: Command, ctx: Context) -> None:
@@ -646,7 +647,7 @@ def _python_module(rest: list[Word]) -> Word | None:
         if "m" in flags and not text.startswith("--"):
             attached = flags.split("m", 1)[1]
             if attached:
-                return Word((_known_piece(attached),))
+                return known_word(attached)
             return rest[index + 1] if index + 1 < len(rest) else None
         index += 1
     return None
@@ -754,7 +755,7 @@ def _cluster_inline(kind: str, args: list[Word], letters: str) -> Inline:
         if position >= 0 and not text.startswith("--"):
             attached = flags[position + 1 :]
             if attached:
-                info.scripts.append(Word((_known_piece(attached),)))
+                info.scripts.append(known_word(attached))
             elif index + 1 < len(args):
                 info.scripts.append(args[index + 1])
                 index += 1
@@ -778,7 +779,7 @@ def _option_inline(kind: str, args: list[Word], options: tuple[str, ...]) -> Inl
             continue
         option = next((o for o in options if o.startswith("--") and text.startswith(o + "=")), None)
         if option is not None:
-            info.scripts.append(Word((_known_piece(text.split("=", 1)[1]),)))
+            info.scripts.append(known_word(text.split("=", 1)[1]))
         elif text == "-":
             info.reads_stdin = True
             return info
@@ -791,10 +792,11 @@ def _option_inline(kind: str, args: list[Word], options: tuple[str, ...]) -> Inl
 
 
 def _join(words: list[Word]) -> Word:
-    pieces: list[Any] = []
+    """The words as the single text a command such as echo prints."""
+    pieces: list[Piece] = []
     for position, word in enumerate(words):
         if position:
-            pieces.append(_known_piece(" "))
+            pieces.extend(known_word(" ").pieces)
         pieces.extend(word.pieces)
     return Word(tuple(pieces))
 
