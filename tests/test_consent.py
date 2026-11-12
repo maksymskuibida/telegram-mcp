@@ -14,7 +14,6 @@ from support.samples import ALICE, TEAM
 from telegram_mcp.consent import (
     APPROVAL_TTL,
     MAX_OPEN_APPROVALS,
-    OPTION_DESCRIPTIONS,
     OPTIONS,
     ActionDecl,
     ActionKind,
@@ -24,15 +23,33 @@ from telegram_mcp.consent import (
     ConsentGate,
     DigestError,
     Refuse,
-    build_send_question,
     canonical_digest,
     sanitize_chat_name,
 )
 from telegram_mcp.gateway.models import ChatRef
+from telegram_mcp.prompts import (
+    HeadlineDetails,
+    PromptFields,
+    TopicRef,
+    build_send_question,
+)
 from telegram_mcp.tools import DECLS, InvalidArguments, validate_args
 
 SEND = "tg_messages_send"
 LIST = "tg_chats_list"
+OPTION_DESCRIPTIONS = ("Send it", "Do not send")
+
+
+def send_fields(chat: ChatRef, args: dict[str, Any]) -> PromptFields:
+    topic_id = args.get("topic_id")
+    return PromptFields(
+        action="send",
+        tool=SEND,
+        chat=chat,
+        content=str(args["text"]),
+        topic=TopicRef(topic_id, "") if topic_id is not None else None,
+        details=HeadlineDetails(message_id=args.get("reply_to")),
+    )
 
 
 class FakeClock:
@@ -64,7 +81,7 @@ def send_args(**overrides: Any) -> dict[str, Any]:
 
 def ask(gate: ConsentGate, chat: ChatRef = ALICE, **overrides: Any) -> Ask:
     args = send_args(chat=chat.id, **overrides)
-    decision = gate.check(SEND, canonical_digest(SEND, args), chat, args)
+    decision = gate.check(SEND, canonical_digest(SEND, args), send_fields(chat, args))
     assert isinstance(decision, Ask)
     return decision
 
@@ -107,7 +124,8 @@ def test_u1_declares_a_read_and_a_send() -> None:
 
 def test_a_read_needs_no_approval(gate: ConsentGate) -> None:
     args = validate_args(LIST, {})
-    decision = gate.check(LIST, canonical_digest(LIST, args), None, args)
+    unused = PromptFields(action="read", tool=LIST)
+    decision = gate.check(LIST, canonical_digest(LIST, args), unused)
     assert isinstance(decision, Allow)
     assert gate.open_count() == 0
 
@@ -268,7 +286,8 @@ def test_an_exact_allow_confirms(gate: ConsentGate) -> None:
     prepared = ask(gate)
     assert answer(gate, prepared) == "confirmed"
     assert prepared.approval.status is ApprovalStatus.CONFIRMED
-    assert isinstance(gate.check(SEND, prepared.approval.args_digest, ALICE, send_args()), Allow)
+    fields = send_fields(ALICE, send_args())
+    assert isinstance(gate.check(SEND, prepared.approval.args_digest, fields), Allow)
 
 
 @pytest.mark.parametrize(
@@ -398,12 +417,18 @@ def test_a_confirmed_approval_expires_unused(gate: ConsentGate, clock: FakeClock
     assert [previous for _, previous in expired] == [ApprovalStatus.CONFIRMED]
 
 
-def test_a_declined_approval_never_runs_and_a_new_check_prepares_a_new_one(
-    gate: ConsentGate,
+def test_a_declined_approval_never_runs_and_a_new_check_after_60_s_prepares_a_new_one(
+    gate: ConsentGate, clock: FakeClock
 ) -> None:
+    # U2 BR12.4 changes U1's rule: within 60 s of the Deny the same call is refused declined.
     prepared = ask(gate)
     answer(gate, prepared, "Deny")
     assert gate.consume(SEND, prepared.approval.args_digest) is None
+    args = send_args()
+    refused = gate.check(SEND, canonical_digest(SEND, args), send_fields(ALICE, args))
+    assert isinstance(refused, Refuse)
+    assert refused.code == "declined"
+    clock.advance(61)
     again = ask(gate)
     assert again.approval.id != prepared.approval.id
     assert again.approval.status is ApprovalStatus.PENDING
@@ -411,7 +436,7 @@ def test_a_declined_approval_never_runs_and_a_new_check_prepares_a_new_one(
 
 def test_an_expired_approval_is_replaced_by_a_new_one(gate: ConsentGate, clock: FakeClock) -> None:
     prepared = ask(gate)
-    clock.advance(121)
+    clock.advance(181)  # 120 s to answer, then 60 s of the remembered timeout (U2 BR12.4)
     again = ask(gate)
     assert again.approval.id != prepared.approval.id
 
@@ -423,18 +448,20 @@ def test_the_store_holds_at_most_100_open_approvals(gate: ConsentGate, clock: Fa
     for number in range(MAX_OPEN_APPROVALS):
         ask(gate, text=f"message {number}")
     args = send_args(text="one too many")
-    refused = gate.check(SEND, canonical_digest(SEND, args), ALICE, args)
+    fields = send_fields(ALICE, args)
+    refused = gate.check(SEND, canonical_digest(SEND, args), fields)
     assert isinstance(refused, Refuse)
     assert refused.code == "telegram_error"
     assert "too many open confirmations" in refused.message
     clock.advance(121)
-    assert isinstance(gate.check(SEND, canonical_digest(SEND, args), ALICE, args), Ask)
+    assert isinstance(gate.check(SEND, canonical_digest(SEND, args), fields), Ask)
     assert gate.open_count() == 1
 
 
 def test_an_unknown_write_kind_is_refused_at_check(gate: ConsentGate) -> None:
     args = {"chat": 1}
-    decision = gate.check("tg_unknown_tool", canonical_digest("tg_unknown_tool", args), ALICE, args)
+    fields = send_fields(ALICE, {"text": "x"})
+    decision = gate.check("tg_unknown_tool", canonical_digest("tg_unknown_tool", args), fields)
     assert isinstance(decision, Refuse)
     assert decision.code == "not_found"
 

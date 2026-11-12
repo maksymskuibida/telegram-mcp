@@ -29,6 +29,7 @@ from telegram_mcp.consent import (
 )
 from telegram_mcp.prompts import (
     KINDS,
+    FileFields,
     HeadlineDetails,
     MessageExcerpt,
     PromptFields,
@@ -83,7 +84,12 @@ EXCERPT = MessageExcerpt(id=11, sender="Alice", date=NOW, text="first")
 
 FIELDS: dict[str, PromptFields] = {
     "send": PromptFields(action="send", tool=SEND, chat=ALICE, content="hello"),
-    "file_send": PromptFields(action="file_send", tool="tg_files_send", chat=ALICE),
+    "file_send": PromptFields(
+        action="file_send",
+        tool="tg_files_send",
+        chat=ALICE,
+        file=FileFields(path="/out/a.txt", name="a.txt", size_bytes=3),
+    ),
     "edit": PromptFields(
         action="edit",
         tool="tg_messages_edit",
@@ -264,7 +270,7 @@ def test_an_unused_allow_is_reported_by_the_sweep_and_the_next_call_asks_again(
     assert again.approval.id != asked.approval.id
 
 
-# BR12.1, BR12.3, NFR3.3: 120 s to answer; unknown picks ---------------------------------------------
+# BR12.1, BR12.3, NFR3.3: 120 s to answer; unknown picks -------------------------------------------
 
 
 def test_a_pick_at_125_s_with_no_sweep_is_unknown(gate: ConsentGate, clock: FakeClock) -> None:
@@ -287,7 +293,7 @@ def test_an_unknown_id_or_an_answered_approval_changes_nothing(gate: ConsentGate
     assert gate.recent_outcome(asked.approval.args_digest) == outcome
 
 
-# BR12.4, NFR3.6: repeat calls after a Deny or a timeout ---------------------------------------------
+# BR12.4, NFR3.6: repeat calls after a Deny or a timeout -------------------------------------------
 
 
 def test_after_a_deny_the_same_call_is_refused_declined_for_60_s(
@@ -417,7 +423,7 @@ def test_ask_again_also_reopens_after_a_timeout(gate: ConsentGate, clock: FakeCl
     assert isinstance(check(gate, ask_again=True), Ask)
 
 
-# BR12.6: at most 100 remembered outcomes ------------------------------------------------------------
+# BR12.6: at most 100 remembered outcomes ----------------------------------------------------------
 
 
 def test_remembered_outcomes_are_capped_at_100_oldest_dropped_first(gate: ConsentGate) -> None:
@@ -505,7 +511,7 @@ def test_a_declined_mark_is_remembered_like_any_write(gate: ConsentGate) -> None
     assert refused == Refuse("declined", DECLINED_MESSAGE)
 
 
-# Withdrawing an approval whose prompt could not be logged (BR15.1) ------------------------------------
+# Withdrawing an approval whose prompt could not be logged (BR15.1) --------------------------------
 
 
 def test_a_withdrawn_approval_is_gone(gate: ConsentGate) -> None:

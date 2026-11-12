@@ -292,9 +292,9 @@ async def test_a_deny_never_sends(
     assert await relay(approval_hook, asked["question"], "Deny") == "declined"
     server = await RawClient.connect(paths)
     assert (await call(server))["error"]["code"] == "needs_confirmation"
+    # U2 BR12.4: within 60 s of the Deny the same call is told why instead of asked again.
     again = await check(approval_hook)
-    assert again["decision"] == "ask"
-    assert again["approval_id"] != asked["approval_id"]
+    assert (again["decision"], again["code"]) == ("refuse", "declined")
     assert fake_gateway.sent == []
 
 

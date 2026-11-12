@@ -55,7 +55,6 @@ from telegram_mcp.broker.scheduler import (
 )
 from telegram_mcp.broker.secret import new_secret, remove_leftovers, write_secret
 from telegram_mcp.consent import (
-    OPTION_DESCRIPTIONS,
     ActionKind,
     Allow,
     ApprovalStatus,
@@ -77,6 +76,7 @@ from telegram_mcp.gateway.models import (
 )
 from telegram_mcp.gateway.protocol import GatewayFactory, TelegramGateway
 from telegram_mcp.paths import FixedPaths
+from telegram_mcp.prompts import HeadlineDetails, PromptFields, TopicRef
 from telegram_mcp.settings import Settings, SettingsError
 from telegram_mcp.tools import (
     DECLS,
@@ -524,7 +524,16 @@ class Broker:
         args, digest = _validated(tool, params.get("args"))
         gateway = await self._open_gateway(stored)
         chat = await self._lookup(gateway, int(args["chat"]), arrived)
-        decision = self.gate.check(tool, digest, chat, args)
+        topic_id = args.get("topic_id")
+        fields = PromptFields(
+            action="send",
+            tool=tool,
+            chat=chat,
+            content=str(args["text"]),
+            topic=TopicRef(topic_id, "") if topic_id is not None else None,
+            details=HeadlineDetails(message_id=args.get("reply_to")),
+        )
+        decision = self.gate.check(tool, digest, fields)
         if isinstance(decision, Allow):
             return {"decision": "allow"}
         if isinstance(decision, Ask):
@@ -534,7 +543,7 @@ class Broker:
                 "approval_id": decision.approval.id,
                 "question": decision.approval.question,
                 "options": list(decision.approval.options),
-                "option_descriptions": list(OPTION_DESCRIPTIONS),
+                "option_descriptions": list(decision.approval.option_descriptions),
                 "multi_select": False,
             }
         return _refusal(decision.code, decision.message)
@@ -699,6 +708,8 @@ class Broker:
     async def _run_send(self, gateway: TelegramGateway, approval: PendingApproval) -> Any:
         """Send exactly what was approved, to the chat stored at check time. The approval is
         already used, so nothing here is ever resent."""
+        if approval.chat_id is None:
+            raise ToolFailure("telegram_error", "The approved send names no chat.")
         if self._logging_out:  # a logout started while this send waited: the session is gone
             raise ToolFailure.fixed("no_session")
         try:
