@@ -641,3 +641,50 @@ def test_a_shell_globstar_reaching_the_data_folder_is_refused(gh: GuardHome, com
 )
 def test_a_shell_globstar_elsewhere_passes(gh: GuardHome, command: str) -> None:
     check_passed(gh, command)
+
+
+# ln: a link to the data folder, into it, or to a folder holding it gives a way in
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd"),
+    [
+        (
+            "ln -s ~/Library/Application\\ Support /tmp/yy; cat /tmp/yy/telegram-mcp/config.toml",
+            None,
+        ),
+        ("ln -s ~/Library/Application\\ Support ~/yy", None),
+        ("ln -s ~/Library ~/lib", None),
+        ("ln -s ~ /tmp/h", None),
+        ("ln -s / /tmp/root", None),
+        ("ln ~/link/config.toml ~/c", None),
+        ("ln -sfn ../Library/Application\\ Support ~/x", "{project}"),
+        ("ln -s Application\\ Support /tmp/z", "{home}/Library"),
+        ("ln -s Library/Application\\ Support ~/as", "{project}"),
+        ("sudo ln -s ~/Library ~/lib2", None),
+        ("ln -s ~/Library/Application\\ Support/telegram-mcp/x ~/project/", None),
+    ],
+)
+def test_a_link_to_the_data_folder_or_a_folder_holding_it_is_refused(
+    gh: GuardHome, command: str, cwd: str | None
+) -> None:
+    decision = gh.bash(gh.fill(command), None if cwd is None else gh.fill(cwd))
+    assert decision.verdict == "refuse", command
+    assert decision.route in (Route.DATA_PATH, Route.DATA_TEXT), decision.reason
+
+
+def test_a_link_from_a_folder_that_cannot_be_placed_is_refused(gh: GuardHome) -> None:
+    check_refused(gh, UNDECIDABLE_BASE + "ln -s foo bar", Route.UNDECIDABLE)
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd"),
+    [
+        ("ln -s ~/project/README.md ~/r", None),
+        ("ln -s ../README.md docs/readme", "{project}"),
+        ("ln -s /usr/local/bin/python3 ~/bin/python", None),
+        ("ln -sf ~/Downloads/telegram-mcp/outbox ~/out", None),
+    ],
+)
+def test_other_links_pass(gh: GuardHome, command: str, cwd: str | None) -> None:
+    check_passed(gh, command, cwd)
