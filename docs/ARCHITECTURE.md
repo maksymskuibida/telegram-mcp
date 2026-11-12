@@ -36,6 +36,9 @@ subagent calls and talks to nothing.
 | Approval hook | `hooks.py`, `hooks/run` | `approval-pre` turns the broker's approval check into Claude Code's permission decision. `approval-post` relays the person's pick from the question box. |
 | Guard hook | `guard/`, `hooks/run` | Runs before Claude's own shell, file, search, fetch and subagent calls and refuses the ones that reach the data folder, the Keychain items or the tool's own commands (below). Talks to nothing. |
 | Broker | `broker/server.py` | The one process with the Telegram connection. Runs every check in a fixed order (below), holds the approvals in memory, writes the activity log. |
+| Telegram link | `broker/link.py` | The broker's one Telegram connection: one shared connect, back-off after failures. |
+| Scheduler | `broker/scheduler.py` | The write line (one send at a time, in order) and the read places. |
+| Broker secret | `broker/secret.py` | Writes the secret file whole and swaps it in one step. |
 | Broker client | `broker/client.py` | How the other processes reach the broker: connects, starts a broker when none runs, retries once only when the request was never written. |
 | Lock | `broker/lock.py` | Makes sure at most one broker (or one login) runs. |
 | ConsentGate | `consent.py` | Decides which actions need confirmation, prepares the exact question, matches the pick, and lets each confirmed approval run once. |
@@ -53,9 +56,10 @@ to 077 first, so each file is born private.
 | File | Mode | Contents |
 |---|---|---|
 | `broker.lock` | 0600 | `{pid, started_at, protocol, state}`; never deleted |
-| `broker.secret` | 0600 | 32 random bytes as hex, new at every broker start |
+| `broker.secret` | 0600 | 32 random bytes as hex, new at every broker start and every hour |
 | `broker.sock` | 0600 | the broker's Unix socket |
 | `activity.log` | 0600 | JSON lines: `ts, client, event, tool, chat_id, approval_id, content, decision, result` |
+| `activity.log.1` to `.4` | 0600 | older log files, `.1` newest, `.4` oldest |
 | `broker.err` | 0600 | broker diagnostics, truncated at each start, secrets redacted |
 | `config.toml` | 0600 | written by the person only: `outbox_dir`, `downloads_dir` |
 
@@ -93,7 +97,7 @@ secret closes the connection.
 | `tool.call {tool, args}` | MCP server | `{ok: true, data}` or `{ok: false, error: {code, message, retry_after?}}` |
 | `approval.check {tool, args}` | approval hook (pre) | `{decision: allow}`, `{decision: ask, approval_id, question, options, option_descriptions, multi_select}` or `{decision: refuse, code, message}` |
 | `approval.answer {question, options, option_descriptions, multi_select, pick}` | approval hook (post) | `{outcome: confirmed \| declined \| unknown}` |
-| `broker.status` | any | `{logged_in, account, clients, idle_seconds}` |
+| `broker.status` | any | `{logged_in, account, clients, idle_seconds}`: `clients` counts the Claude Code sessions connected (hook and command connections are not counted); `idle_seconds` is how long the broker had been idle before this request |
 | `broker.stop` | login | `{ok: true}`, then the broker exits cleanly |
 
 Protocol errors: -32700 parse error, -32600 invalid request, -32601 unknown method,
@@ -101,7 +105,9 @@ Protocol errors: -32700 parse error, -32600 invalid request, -32601 unknown meth
 
 Time limits: `hello` and `approval.answer` 5 s; `approval.check` 12 s, its Telegram calls
 sharing one 10 s budget; `tool.call` 75 s. Every Telegram call has its own 30 s limit, and the
-Telethon client is built so it never retries or sleeps on its own.
+Telethon client is built so it never retries or sleeps on its own: the broker decides who
+waits (see [Sharing one connection](#sharing-one-connection)). Every `tool.call` is answered
+within 70 s of reaching the broker, inside the caller's 75 s.
 
 ## The approval flow
 
@@ -144,15 +150,19 @@ Rules that make this hold:
   `needs_confirmation`.
 - **Every check runs in one order.** Connection authenticated; client allowed to write (Claude
   Code only); vault and session (`no_session`, `keychain_locked`); the tool's kind (a tool with
-  no declaration counts as a write); argument validation and the digest; then either the chat
-  lookup and the question (`approval.check`), or the single use of a confirmed approval and the
-  Telegram call (`tool.call`). The first step that fails decides the answer, and later steps do
-  not run. No Telegram call and no approval change happens without a valid session.
-- **Single use.** An approval is marked used immediately before the Telegram call. A failure
-  before that never uses it; a failure after it is never resent (`outcome_unknown` when it is
-  not known whether Telegram got it).
+  no declaration counts as a write); argument validation and the digest; the Telegram
+  connection; then either the chat lookup and the question (`approval.check`), or room in the
+  write line, the single use of a confirmed approval and the send (`tool.call`). The first step
+  that fails decides the answer, and later steps do not run. No Telegram call and no approval
+  change happens without a valid session.
+- **Single use.** An approval is used at the moment its send enters the write line. A refusal
+  before that (not logged in, Keychain locked, Telegram unreachable, the line full, the call
+  entry not logged) keeps it confirmed until it expires, so the same call works once the cause
+  is gone. After that, whatever happens (dropped unsent, flood wait, timeout, sent), the
+  approval is spent and the send is never made again; a new send needs a new confirmation
+  (`outcome_unknown` when it is not known whether Telegram got it).
 - **Expiry.** An approval expires 120 s after it is prepared, whether answered or not. A sweep
-  runs every 10 s and logs it.
+  runs every 5 s and logs it.
 - **Fail closed.** Any error on the approval path refuses. The pre hook denies on every
   failure, and the launcher `hooks/run` exits 2 (a block) whenever the hook cannot print a
   valid answer.
@@ -188,7 +198,8 @@ content only explains who that is: `running` (a broker), `login`, or `released`.
 - A **caller** (MCP server, hook) never holds the lock. When it cannot connect, it tests the
   flock and releases it at once: held with `login` means `login_in_progress`; held with
   `running` means wait up to 5 s for the socket; free (no file, `released`, or the holder died)
-  means start `telegram-mcp broker` in the background and wait up to 5 s.
+  means start `telegram-mcp broker` in the background and wait up to 5 s. A caller that sees
+  the lock turn free while it waits (a broker finishing its stop) starts a broker itself, once.
 - **Login** calls `broker.stop`, takes the flock with state `login`, and writes `released` when
   it ends, Ctrl-C included. A crashed process drops its flock with it, so the next caller finds
   the lock free.
@@ -272,10 +283,81 @@ It is best effort. These routes are **left open on purpose**:
 When the guard blocks wrongly or cannot start (for example an empty `uv` cache with no
 network), the person removes or reinstalls the plugin in their own terminal, outside Claude.
 
+## Sharing one connection
+
+Two Claude Code sessions (say, the terminal and the desktop app) use the same broker and so
+the same Telegram connection. The broker serves each client connection on its own and keeps
+Telegram calls from starving each other:
+
+- **One connection, one connect.** There is at most one Telegram connection. When it is not
+  open, the first call that needs it starts one connect attempt as its own task; every call
+  that arrives meanwhile waits for that same attempt. A caller that gives up waiting (an
+  approval check at the end of its budget) never cancels the attempt for the others.
+- **Back-off.** After a failed connect (no answer within 30 s, a network error), calls answer
+  at once `telegram_error` "Telegram could not be reached; trying again in N s" with
+  `retry_after`, for 1 s, then 2, 4, 8, 16 and at most 30 s after each further failure in a
+  row. The first call after the wait tries again; a success resets the count. A call that
+  times out marks the connection dropped, and the next call opens it again without restarting
+  the broker. A session Telegram no longer accepts closes the connection; the next call reads
+  the Keychain again.
+- **The write line.** Sends run one at a time, in the order they reached the broker, from one
+  line that holds at most 20 waiting sends; the 21st is refused at once ("too many sends
+  waiting") with its approval kept. A send that has not started 40 s after it reached the
+  broker (connect time included), or whose caller's connection has closed, leaves the line
+  unsent and answers `telegram_timeout` "Not sent". With the 30 s limit on the send itself,
+  every send is answered within 70 s. A send that has started runs to its end even if its
+  caller has gone; its result goes to the log.
+- **Read places.** Reads never use the write line. At most ten run against Telegram at once;
+  the others wait for a place, and that wait counts in their 30 s limit. Approval checks,
+  answers and status never wait for either.
+- **Flood waits.** When Telegram asks a read to wait 30 s or less, the broker waits and runs
+  the read once more, but only when the second try can still be answered within 70 s of the
+  request's arrival; a second flood wait, or a longer one, returns `flood_wait` with
+  `retry_after`. An approval check waits only when the wait fits in what is left of its 10 s
+  budget, otherwise it refuses `flood_wait` and prepares nothing. A send never waits: it
+  answers `flood_wait` at once, "nothing was sent", and needs a new confirmation.
+
+### Idle exit
+
+The broker stops by itself when no request has arrived or been answered for 10 minutes, even
+with sessions still connected, and never while a request runs (approvals expire after 120 s,
+so none is live by then). Open but silent connections, the sweep and the secret rotation are
+not activity. The stop runs in this order: stop accepting connections and delete `broker.sock`
+and `broker.secret`; close every client connection; disconnect from Telegram, waiting at most
+2 s; then write `released` to the lock and drop it. The lock is held until Telegram is left,
+so a new broker is never connected while the old one still is. A call made during the stop
+waits for the lock to turn free and starts a new broker. Every stop follows this order.
+
+### The secret every hour
+
+Besides the new secret at each start, the broker replaces it every 60 minutes: it writes the
+new value to a new file with a random name in the data folder (created exclusively, mode 0600,
+no link followed) and renames it over `broker.secret`, so a reader sees the whole old secret
+or the whole new one. Connections already open stay accepted; a new `hello` must carry the new
+secret. A caller refused `bad_secret` reads the file again and tries `hello` once more. If the
+swap fails, the old secret stays in force and the broker tries again an hour later. Temporary
+secret files left by a stopped broker are deleted at start.
+
+### Log rotation
+
+Before an entry would take `activity.log` past 10,485,760 bytes, `activity.log.4` is deleted,
+`.3` becomes `.4`, `.2` becomes `.3`, `.1` becomes `.2`, `activity.log` becomes
+`activity.log.1`, and the entry starts a new `activity.log` (mode 0600). An entry is never
+split between files, so reading `.4` to `.1` and then `activity.log` gives every entry in
+time order. If a rename fails, the entry still goes into `activity.log` and the next entry
+tries again; only an entry that cannot be appended at all refuses a send.
+
+### What `broker.err` shows
+
+One line each for an idle stop (with the idle minutes), a secret rotation and its failure (never
+the value), the start and end of a connect back-off (failure count and wait), a send dropped
+from the line (tool and approval id, never the text), and a failed log rotation.
+
 ## What is not here yet
 
-This is the first working slice: phone login, `tg_chats_list` and `tg_messages_send`, with the
-guard hook above. Other tools, QR login, logout, status and log commands, idle exit and log
-rotation come later. The guard covers Claude's own tools only: another program running as the
-same macOS user can still read `broker.secret`. This version is for trying out, not for daily
+This is an early version: phone login, `tg_chats_list` and `tg_messages_send`, with the guard
+hook above, a shared Telegram connection, idle exit and log rotation. Other tools, QR login,
+logout, status and log commands come later. The guard covers Claude's own tools only: another
+program running as the same macOS user can still read `broker.secret`. This version is for
+trying out, not for daily
 use.
