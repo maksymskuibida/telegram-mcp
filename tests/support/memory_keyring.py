@@ -8,7 +8,8 @@ from keyring.errors import KeyringLocked, PasswordDeleteError, PasswordSetError
 
 class MemoryKeyring(KeyringBackend):
     """Holds items in a dict. Set ``fail_on_write`` to make the n-th write (1-based) fail,
-    ``locked`` to make every call raise ``KeyringLocked``."""
+    ``locked`` to make every call raise ``KeyringLocked``, ``fail_deletes`` to refuse every
+    delete and ``fail_delete_items`` to refuse deleting the named items only."""
 
     priority = 1
 
@@ -18,6 +19,7 @@ class MemoryKeyring(KeyringBackend):
         self.locked = False
         self.fail_on_write: set[int] = set()
         self.fail_deletes = False
+        self.fail_delete_items: set[str] = set()
         self.writes = 0
 
     def _check_locked(self) -> None:
@@ -37,7 +39,7 @@ class MemoryKeyring(KeyringBackend):
 
     def delete_password(self, service: str, username: str) -> None:
         self._check_locked()
-        if self.fail_deletes:
+        if self.fail_deletes or username in self.fail_delete_items:
             raise PasswordDeleteError("delete refused")
         if (service, username) not in self.items:
             raise PasswordDeleteError("no such item")
