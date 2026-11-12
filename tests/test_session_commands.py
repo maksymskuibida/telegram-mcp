@@ -23,7 +23,7 @@ from telegram_mcp.broker.client import BrokerClient, Timeouts
 from telegram_mcp.broker.lock import BrokerLock, LockState
 from telegram_mcp.broker.server import Broker
 from telegram_mcp.gateway.fake import FakeGateway
-from telegram_mcp.gateway.models import FloodWait, GatewayTimeout, TelegramError
+from telegram_mcp.gateway.models import FloodWait, GatewayError, GatewayTimeout, TelegramError
 from telegram_mcp.login import Terminal
 from telegram_mcp.paths import FixedPaths
 from telegram_mcp.session_commands import logout, status
@@ -301,7 +301,7 @@ async def test_telegram_not_confirming_still_logs_this_mac_out(
     fake_gateway: FakeGateway,
     brokers: list[Broker],
     memory_keyring: MemoryKeyring,
-    error: Exception,
+    error: GatewayError,
     reason: str,
 ) -> None:
     save_fake_session()
@@ -321,7 +321,7 @@ async def test_a_keychain_that_cannot_delete_exits_2_and_names_the_cause(
     fake_gateway: FakeGateway,
     brokers: list[Broker],
     memory_keyring: MemoryKeyring,
-    error: Exception | None,
+    error: GatewayError | None,
     said: str,
 ) -> None:
     save_fake_session()
