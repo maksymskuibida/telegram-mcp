@@ -45,6 +45,9 @@ jobs:
       - name: Tests with coverage (90% floor)
         run: uv run pytest --cov=telegram_mcp --cov-branch --cov-report=term-missing --cov-fail-under=90
 
+      - name: Guard coverage (95% floor)
+        run: uv run coverage report --include='src/telegram_mcp/guard/*' --fail-under=95
+
       - name: constraints.txt and the == pins match uv.lock
         run: uv run python scripts/check_constraints.py
 

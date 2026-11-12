@@ -19,7 +19,13 @@ person, sending must not be treated as safe.
 | 6 | Only the person can answer the question box: in the terminal and the desktop app, in the default, acceptEdits and bypassPermissions modes the box waits for the person, and a `claude -p` run cannot produce an Allow for a `[tg-` question | | | | | **Not verified.** Until it is, this version is for trying out only. |
 | 7 | Cold start of the `approval-pre` hook within its 20 s timeout (first call after install), and that a hook made to sleep past 20 s never lets a send run | | | | | **Not verified in Claude Code.** See check 3 for the launcher's measured start time. |
 | 8 | The versions installed by `uvx` equal the lock | 2026-11-11 | none (the plugin's `uvx` command run from a terminal) | n/a | n/a | **Verified outside Claude Code.** `uvx --constraints constraints.txt --from .` with an empty uv cache: 42 pinned packages, none different from `constraints.txt`, none missing, none extra. |
-
+| 9 | The guard refuses `cat` of `activity.log`, `Read` of `config.toml` and `Grep` in the data folder, and Claude sees the reason, in the terminal and in the desktop Code tab | | | | | **Not verified.** Covered by automated tests on the decision function only. |
+| 10 | A subagent's own `cat` of `activity.log` reaches the guard and is refused the same way | | | | | **Not verified.** The guard decides a subagent's call exactly like Claude's, but whether Claude Code runs plugin hooks for subagent calls is only checked here. |
+| 11 | `telegram-mcp log` is refused in Claude's shell, with the advice to run it in the person's own terminal | | | | | **Not verified.** (The `log` command itself comes in a later version.) |
+| 12 | What Claude Code does when the guard hook passes its 10 s timeout (a guard made to sleep): block the call, or run it | | | | | **Not verified.** If it runs the call, a guard slower than 10 s does not protect that call. |
+| 13 | Warm and cold start of `hooks/run guard` with `{}` on standard input, against the 10 s timeout | | | | | **Not verified.** Check 3 measured another hook: 0.44 to 0.47 s warm, 4.86 s with an empty uv cache. |
+| 14 | Ordinary shell and file calls still show the person's usual permission prompts (the guard passes with `{}`, never an allow), in the default and acceptEdits modes | | | | | **Not verified.** |
+| 15 | The hook's `HOME`, `PWD` and `TMPDIR` equal those of Claude's shell, since the guard expands variables a command does not set from its own environment | | | | | **Not verified.** Until it is, the guard assumes they are equal. |
 ## Manual smoke test (before each release)
 
 On your own account, in a real Claude Code session with the plugin installed:

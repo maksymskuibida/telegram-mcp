@@ -3,9 +3,11 @@ answer (BR9.2, NFR2.4). Each test puts a stub `uvx` on PATH."""
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -90,6 +92,48 @@ def test_no_hook_name_blocks(home: Path) -> None:
     result = run_launcher(f"{folder}:{SYSTEM_PATH}", home, name="")
     assert result.returncode == 2
     assert "no hook name" in result.stderr
+
+
+GUARD_REFUSED_CALL = '{"tool_name": "Bash", "tool_input": {"command": "telegram-mcp log"}}'
+RUN_THE_GUARD = "from telegram_mcp import cli; raise SystemExit(cli.main(['hook', 'guard']))"
+BREAK_THE_GUARD = (
+    "import telegram_mcp.guard as g\n"
+    "def boom(*args, **kwargs): raise RuntimeError('guard broken')\n"
+    "g.run_guard = boom\n" + RUN_THE_GUARD
+)
+
+
+def run_guard_launcher(home: Path, program: str) -> subprocess.CompletedProcess[str]:
+    """``hooks/run guard`` with a stub uvx that runs this checkout's guard in Python."""
+    script = home / "probe.py"
+    script.write_text(program)
+    folder = stub_uvx(home / "bin", f'exec "{sys.executable}" "{script}"')
+    env = {"PATH": f"{folder}:{SYSTEM_PATH}", "HOME": str(home), "CLAUDE_PLUGIN_ROOT": "/p"}
+    return subprocess.run(
+        ["/bin/sh", str(LAUNCHER), "guard"],
+        input=GUARD_REFUSED_CALL,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=30,
+    )
+
+
+def test_the_guard_refusal_is_passed_through(home: Path) -> None:
+    result = run_guard_launcher(home, RUN_THE_GUARD)
+    assert result.returncode == 0, result.stderr
+    answer = json.loads(result.stdout)
+    specific = answer["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "deny"
+    assert specific["permissionDecisionReason"].startswith("telegram-mcp guard: refused")
+
+
+def test_a_guard_that_raises_blocks(home: Path) -> None:
+    result = run_guard_launcher(home, BREAK_THE_GUARD)
+    assert result.returncode == 2
+    assert "the hook command failed" in result.stderr
+    assert result.stdout == ""
 
 
 def test_the_launcher_is_executable_posix_sh() -> None:

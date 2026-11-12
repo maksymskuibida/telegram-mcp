@@ -14,7 +14,7 @@ from telegram_mcp import __version__
 from telegram_mcp.paths import FixedPaths
 from telegram_mcp.platform import require_macos, secure_umask
 
-HOOK_NAMES = ("approval-pre", "approval-post")
+HOOK_NAMES = ("approval-pre", "approval-post", "guard")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,6 +37,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     require_macos()
     args = build_parser().parse_args(argv)
     paths = FixedPaths.from_home()
+    if args.command == "hook" and args.name == "guard":
+        # The guard runs before every shell and file call: it loads only the standard library
+        # and the fixed paths, never the broker client that telegram_mcp.hooks pulls in.
+        from telegram_mcp.guard import run_guard
+
+        return run_guard(paths, sys.stdin, sys.stdout)
     if args.command == "broker":
         from telegram_mcp.broker.server import run_broker
 

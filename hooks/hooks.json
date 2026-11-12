@@ -10,6 +10,16 @@
             "timeout": 20
           }
         ]
+      },
+      {
+        "matcher": "Bash|Monitor|Read|Write|Edit|MultiEdit|NotebookEdit|Glob|Grep|Task|Agent|WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run\" guard",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [

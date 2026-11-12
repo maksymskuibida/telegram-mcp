@@ -44,7 +44,7 @@ def test_the_umask_is_private_after_start(
 
 
 def test_unknown_commands_and_hook_names_are_refused(capsys: pytest.CaptureFixture[str]) -> None:
-    for argv in (["logout"], ["hook", "guard"], []):
+    for argv in (["logout"], ["hook", "nope"], ["hook", "Guard"], []):
         with pytest.raises(SystemExit) as exited:
             cli.main(argv)
         assert exited.value.code == 2
@@ -52,6 +52,21 @@ def test_unknown_commands_and_hook_names_are_refused(capsys: pytest.CaptureFixtu
         cli.main(["--version"])
     assert shown.value.code == 0
     assert "telegram-mcp 0.1.0" in capsys.readouterr().out
+
+
+def test_the_guard_hook_name_is_accepted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    call = {"tool_name": "Bash", "tool_input": {"command": "telegram-mcp log"}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(call)))
+    assert cli.main(["hook", "guard"]) == 0
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["hookSpecificOutput"]["permissionDecision"] == "deny"
+    monkeypatch.setattr(
+        sys, "stdin", io.StringIO('{"tool_name": "Bash", "tool_input": {"command": "ls"}}')
+    )
+    assert cli.main(["hook", "guard"]) == 0
+    assert json.loads(capsys.readouterr().out) == {}
 
 
 def test_the_module_runs_as_a_program(home: Path) -> None:
