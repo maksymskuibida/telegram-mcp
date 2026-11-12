@@ -10,7 +10,39 @@ from pathlib import Path
 import pytest
 
 from support.samples import fake_secrets
-from telegram_mcp.activity_log import REDACTED, ActivityLog, Diagnostics, LogEntry, Redactor
+from telegram_mcp.activity_log import (
+    REDACTED,
+    ActivityLog,
+    Diagnostics,
+    LogEntry,
+    Redactor,
+    redact_invite_links,
+)
+
+# U2 BR15.2, NFR1.2: invite links ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "shown"),
+    [
+        ("https://t.me/+AbCd-12_x", "https://t.me/+…"),
+        ("join at t.me/joinchat/QWErty123 now", "join at t.me/joinchat/… now"),
+        ("two: t.me/+aa and t.me/+bb.", "two: t.me/+… and t.me/+…."),
+        ("a public t.me/somechannel stays", "a public t.me/somechannel stays"),
+        ("no link at all", "no link at all"),
+    ],
+)
+def test_the_secret_part_of_an_invite_link_is_replaced(text: str, shown: str) -> None:
+    assert redact_invite_links(text) == shown
+
+
+def test_a_logged_entry_never_holds_a_working_invite_link(tmp_path: Path) -> None:
+    log = ActivityLog(tmp_path / "activity.log", Redactor())
+    log.append(LogEntry("broker", "prompt", "tg_chats_join", "ok", content="Join t.me/+Secret1?"))
+    line = (tmp_path / "activity.log").read_text()
+    assert "Secret1" not in line
+    assert json.loads(line)["content"] == "Join t.me/+…?"
+
 
 C8_FIELDS = {
     "ts",

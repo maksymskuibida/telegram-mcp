@@ -1,13 +1,14 @@
 """The activity log and the broker's diagnostics file (C8 activity_log, BR8.1, BR8.2).
 
-Entries are built only from LogEntry's fields, and any stored secret found in a field is
-replaced with ``[redacted]``."""
+Entries are built only from LogEntry's fields, any stored secret found in a field is replaced
+with ``[redacted]``, and the secret part of an invite link in an entry's content with ``…``."""
 
 from __future__ import annotations
 
 import contextlib
 import json
 import os
+import re
 import traceback
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -20,6 +21,17 @@ FILE_MODE = 0o600
 MIN_SECRET_LENGTH = 8
 MAX_FILE_BYTES = 10_485_760
 KEPT_FILES = 5
+
+
+# BR15.2: the part of an invite link that grants access, after "t.me/+" or "joinchat/".
+_INVITE_SECRET = re.compile(r"(t\.me/\+|joinchat/)[A-Za-z0-9_-]+")
+
+
+def redact_invite_links(text: str) -> str:
+    """Replace the secret part of every invite link with "…", so the log never holds a
+    link that works (BR15.2)."""
+    return _INVITE_SECRET.sub(r"\1…", text)
+
 
 EventKind = Literal["call", "prompt", "decision", "result"]
 DecisionKind = Literal["allowed", "declined", "timed_out"]
@@ -132,7 +144,9 @@ class ActivityLog:
             self._on_rotation_failure(error)
 
     def render(self, entry: LogEntry) -> str:
-        content = self._redactor.redact(entry.content) if entry.content is not None else None
+        content = None
+        if entry.content is not None:
+            content = redact_invite_links(self._redactor.redact(entry.content))
         fields = {
             "ts": iso_utc(entry.ts or utc_now()),
             "client": self._redactor.redact(entry.client),

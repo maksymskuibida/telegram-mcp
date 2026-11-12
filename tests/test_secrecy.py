@@ -16,7 +16,8 @@ from support.brokers import FakeClock, running_broker, subprocess_brokers
 from support.file_keyring import FileKeyring
 from support.flows import SEND, post_hook_input, pre_hook_input, question_from
 from support.rpc import RawClient
-from support.samples import ALICE, FAMILY, sample_chats
+from support.samples import ALICE, FAMILY, fake_secrets, sample_chats
+from support.standins import SAMPLE_ARGS, seeded_fake, stand_in_registry
 from telegram_mcp.broker.client import BrokerClient
 from telegram_mcp.gateway.fake import FakeGateway
 from telegram_mcp.gateway.models import TelegramError
@@ -220,3 +221,45 @@ async def test_status_and_logout_never_show_a_secret_or_the_phone_number(
     for secret in secrets:
         assert secret not in everything
         assert files_holding(home / "Library", secret) == []
+
+
+# U2 NFR1.1: a run of every stand-in kind writes no secret ---------------------------------------
+
+
+def with_secret(tool: str, args: dict[str, Any], secret: str) -> dict[str, Any]:
+    """The sample call, with the secret placed in every text the question shows."""
+    text_fields = {"text", "title", "first_name"}
+    return {k: (f"{v} {secret}" if k in text_fields else v) for k, v in args.items()}
+
+
+async def test_every_kind_logs_no_secret(paths: FixedPaths, fake_gateway: FakeGateway) -> None:
+    values = fake_secrets()
+    SessionVault().save(StoredSession(values.session, values.api_id, values.api_hash))
+    seeded_fake(fake_gateway)
+    secret_text = f"{values.session} {values.api_hash}"
+    fake_gateway.add_message(ALICE.id, f"a message holding {secret_text}")
+    async with running_broker(paths, fake_gateway, registry=stand_in_registry()):
+        approval_hook = await RawClient.connect(paths, client="approval-hook", client_name=None)
+        server = await RawClient.connect(paths)
+        for tool, sample in sorted(SAMPLE_ARGS.items()):
+            args = with_secret(tool, sample, secret_text)
+            asked = await approval_hook.result("approval.check", {"tool": tool, "args": args})
+            assert asked["decision"] == "ask", (tool, asked)
+            answer = {
+                "question": asked["question"],
+                "options": asked["options"],
+                "option_descriptions": asked["option_descriptions"],
+                "multi_select": False,
+                "pick": "Allow",
+            }
+            await approval_hook.result("approval.answer", answer)
+            done = await server.result("tool.call", {"tool": tool, "args": args})
+            assert done["ok"] is True, (tool, done)
+        await approval_hook.close()
+        await server.close()
+    for path in (paths.log, paths.diagnostics):
+        content = path.read_text(encoding="utf-8")
+        assert values.session not in content, path.name
+        assert values.api_hash not in content, path.name
+    assert "SecretPart123" not in paths.log.read_text(encoding="utf-8")
+    assert "[redacted]" in paths.log.read_text(encoding="utf-8")

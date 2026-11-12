@@ -10,6 +10,9 @@ import pytest
 from support.samples import TEAM, sample_chats
 from telegram_mcp.gateway.models import ChatRef, SentMessage, encode_cursor
 from telegram_mcp.tools import (
+    ASK_AGAIN,
+    ASK_AGAIN_PROPERTY,
+    ASK_AGAIN_SENTENCE,
     CHATS_LIST,
     MESSAGES_SEND,
     TELEGRAM_CONTENT_NOTICE,
@@ -139,3 +142,30 @@ def test_a_reply_and_a_topic_together_are_refused() -> None:
     with pytest.raises(InvalidArguments, match="reply_to or topic_id, not both"):
         validate_args(MESSAGES_SEND, {"chat": 1, "text": "hi", "reply_to": 5, "topic_id": 7})
     assert validate_args(MESSAGES_SEND, {"chat": 1, "text": "hi", "topic_id": 7})["topic_id"] == 7
+
+
+# U2 FR3.3, BR12.5: ask_again ------------------------------------------------------------------
+
+
+def test_the_send_tool_accepts_ask_again_and_says_what_it_is_for() -> None:
+    send = SPECS[MESSAGES_SEND]
+    assert send.input_schema["properties"][ASK_AGAIN] == ASK_AGAIN_PROPERTY
+    assert ASK_AGAIN_PROPERTY["type"] == "boolean"
+    assert ASK_AGAIN_PROPERTY["default"] is False
+    assert ASK_AGAIN not in send.input_schema["required"]
+    assert send.description.endswith(ASK_AGAIN_SENTENCE)
+    assert "only when the person has asked in the chat" in ASK_AGAIN_SENTENCE
+    assert "never approves anything" in ASK_AGAIN_SENTENCE
+
+
+def test_reads_do_not_take_ask_again() -> None:
+    assert ASK_AGAIN not in SPECS[CHATS_LIST].input_schema["properties"]
+    with pytest.raises(InvalidArguments, match=ASK_AGAIN):
+        validate_args(CHATS_LIST, {ASK_AGAIN: True})
+
+
+def test_ask_again_is_removed_by_the_broker_not_part_of_the_send_arguments() -> None:
+    # The broker takes ask_again out before validation and the digest (BR12.5); the send's own
+    # arguments never hold it, so the digest is the same with or without it.
+    with pytest.raises(InvalidArguments, match=ASK_AGAIN):
+        validate_args(MESSAGES_SEND, {"chat": 1, "text": "hi", ASK_AGAIN: True})
