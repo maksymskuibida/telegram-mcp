@@ -26,7 +26,8 @@ from telegram_mcp.consent import ActionKind
 from telegram_mcp.paths import FixedPaths
 from telegram_mcp.tools import DECLS
 
-STREAM_LIMIT = 2**20
+STREAM_LIMIT = 2**24
+"""An answer line may be large (up to 10,000 contacts, NFR11.9); requests stay under 1 MiB."""
 POLL_SECONDS = 0.05
 
 LOGIN_IN_PROGRESS = "A login is running in a terminal; try again when it has finished."

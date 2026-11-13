@@ -19,7 +19,7 @@ class RawClient:
 
     @classmethod
     async def open(cls, paths: FixedPaths) -> RawClient:
-        reader, writer = await asyncio.open_unix_connection(str(paths.socket), limit=2**20)
+        reader, writer = await asyncio.open_unix_connection(str(paths.socket), limit=2**24)
         return cls(reader, writer)
 
     @classmethod

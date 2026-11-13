@@ -24,7 +24,7 @@ with `not_allowed` and never asked about.
 | pin | `tg_messages_pin` | Pin message `<n>` in `<chat>`? | Pin it | Do not pin |
 | pin | `tg_messages_unpin` | Unpin message `<n>` in `<chat>`? | Unpin it | Keep it pinned |
 | topic_create | `tg_topics_create` | Create the topic «`<title>`» in `<chat>`? | Create the topic | Do not create |
-| chat_create | `tg_chats_create` | Create a new `<group or channel>` «`<title>`»? | Create it | Do not create |
+| chat_create | `tg_chats_create` | Create a new `<basic group, supergroup or channel>` «`<title>`»? | Create it | Do not create |
 | join | `tg_chats_join` | Join `<chat>`? (or: Join the chat at `<link>`?) | Join | Do not join |
 | leave | `tg_chats_leave` | Leave `<chat>`? | Leave | Stay |
 | chat_edit | `tg_chats_edit` | Change `<chat>`? | Save the changes | Do not change |
@@ -64,6 +64,62 @@ name cannot pose as another chat or as the question's own text.
 
 A question longer than **20,000 characters** is refused, not cut; Claude is told to split the
 call into smaller ones.
+
+## Choosing first: deleting and new groups
+
+Two actions have a choice only you can make, so the tool asks for it before the usual question:
+
+- `tg_messages_delete` without `for_everyone`: **Delete these messages only for you or for
+  everyone?**, options **Only for you** and **For everyone**.
+- `tg_chats_create` with type `group` and no `group_kind`: **Create a basic group or a
+  supergroup?**, options **Basic group** and **Supergroup**. (Telegram's apps create a basic
+  group, which Telegram upgrades to a supergroup when it grows or needs a supergroup feature.)
+  A channel needs no choice.
+
+The tool answers `needs_choice` and prepares nothing; Claude asks you in the question box and
+calls again with your pick. Your last pick comes first, marked **(last used)**; with no last
+pick, the less far-reaching one comes first (only for you; a basic group). Then the usual
+question follows and names the scope: `Delete 1 message(s) in … for everyone?`,
+`Create a new basic group «…»?`, `Create a new supergroup «…»?`.
+
+Your last pick of each is kept in `choices.json` in the data folder (mode 0600), holding only
+`delete_scope` (`everyone` or `me`) and `group_kind` (`basic` or `supergroup`). It is written
+only after an action you allowed has run; a Deny or an unanswered question changes nothing. A
+missing or damaged file just means there is no last pick.
+
+## What each tool checks before asking
+
+These are refused before any question, so you are never asked about something that cannot run:
+
+| Tool | Refused before the question |
+|---|---|
+| `tg_messages_edit` | A message that is not your own (`not_allowed`); text outside 1 to 4,096 characters, or equal to the current text (`invalid_arguments`). |
+| `tg_messages_delete`, `tg_messages_forward` | No ids, more than 20, or one named twice (`invalid_arguments`); an id not in the chat (`not_found`). |
+| `tg_messages_react` | An emoji longer than 16 characters. |
+| `tg_topics_create` | A chat that is not a forum; a title outside 1 to 128 characters. |
+| `tg_chats_create` | A type other than `group` or `channel`; a title outside 1 to 128 characters; more than 20 members, a member named twice, yourself as a member, a user the account cannot see, or members for a channel. |
+| `tg_chats_join` | Anything other than `@name`, `name`, `t.me/name`, `t.me/+hash` or `t.me/joinchat/hash`; a public chat you are already in; a username that is a person. |
+| `tg_chats_leave`, `tg_chats_edit`, `tg_invites_create` | A person's chat or your Saved Messages (only groups and channels). |
+| `tg_chats_edit`, `tg_profile_edit` | Nothing to change; a title, name, bio or username outside its limits (bio and description at most 255 characters, a username 5 to 32 letters, digits or underscores, or empty to remove it). |
+| `tg_invites_create` | An expiry outside 60 s to one year, a usage limit outside 1 to 99,999. |
+| `tg_admins_set` | A chat that is not a supergroup or channel; a right that is not one of the 11. |
+| `tg_files_send`, `photo_path` | A file outside the outbox folder, one of the tool's own files, a missing file, a folder or pipe, an empty file, or a file over 20 MB. |
+
+Whether your account may make a change (an admin right, a channel you do not own) is
+Telegram's to decide: it refuses after your Allow with `telegram_error`, and nothing is retried.
+
+## What runs after Allow
+
+The call runs exactly what the question showed, once: the chat ids, message ids, texts and file
+stored with your answer, never a new lookup. A title or a message that changed in Telegram
+between the question and the run does not change what is done. A join uses the username or
+link you approved. A file send checks the file again and uploads it only if it is the same file
+(same device, inode, size and modification time) you were asked about; otherwise nothing is
+sent and the tool must ask again.
+
+If Telegram asks to wait before a change is sent, the change is not sent and the tool says how
+long to wait; ask again after that. If the connection drops after a change was sent, the tool
+says the outcome is unknown and never sends it twice; look at the chat first.
 
 ## How long an answer is good for
 

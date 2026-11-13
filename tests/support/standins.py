@@ -10,7 +10,7 @@ import asyncio
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from telegram_mcp.actions import ActionRegistry, ConsentAction, default_registry
+from telegram_mcp.actions import ActionRegistry, ConsentAction, u1_registry
 from telegram_mcp.consent import ActionDecl, ActionKind, PendingApproval
 from telegram_mcp.gateway.fake import FakeGateway, FakeMessage
 from telegram_mcp.prompts import (
@@ -245,7 +245,7 @@ def read_action() -> ConsentAction:
 
     async def run(gateway: Any, approval: PendingApproval | None, args: dict[str, Any]) -> Any:
         found = await gateway.read_messages(
-            args["chat"], args["limit"], args["topic_id"], args["before_id"]
+            args["chat"], args["limit"], before_id=args["before_id"], topic_id=args["topic_id"]
         )
         return {"messages": [{"id": m.id, "text": m.text} for m in found]}
 
@@ -291,7 +291,7 @@ def rowless_action(tool: str = "tg_no_row") -> ConsentAction:
 
 
 def stand_in_registry(*extra: ConsentAction) -> ActionRegistry:
-    registry = default_registry()
+    registry = u1_registry()
     for tool in SCHEMAS:
         registry.register(write_action(tool))
     registry.register(mark_action())

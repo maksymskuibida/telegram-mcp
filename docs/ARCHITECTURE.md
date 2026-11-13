@@ -1,9 +1,10 @@
 # Architecture
 
 telegram-mcp lets Claude Code use the person's own Telegram account. Reading is free. Every
-action that changes anything (in this version: sending a text message) runs only after the
-person has picked **Allow** in Claude Code's question box, and each Allow runs exactly one
-action.
+action that changes anything (sending, editing, deleting, forwarding, reacting, pinning,
+creating, joining, leaving and editing chats, invite links, admin rights, the profile, file
+sends) and every marking as read runs only after the person has picked **Allow** in Claude
+Code's question box, and each Allow runs exactly one action.
 
 Everything runs locally on one Mac, in one Python package.
 
@@ -48,7 +49,9 @@ else.
 | ConsentGate | `consent.py` | Decides which actions need confirmation, prepares the exact question, matches the pick, lets each confirmed approval run once, and remembers a Deny or a timeout for 60 s. |
 | Question text | `prompts.py` | The closed table of action kinds and the one renderer that turns typed fields into a question and its two descriptions. |
 | Action registry | `actions.py` | What the broker runs for each tool: validation, the describer that fills a question's fields, and the Telegram call. |
-| Tool catalog | `tools.py` | Tool declarations, closed argument schemas, validation, result shapes. |
+| Tool catalog | `tools.py`, `catalog/` | Tool declarations and closed argument schemas (`tools.py`); per tool family, the validators, describers and Telegram calls (`catalog/`, below). |
+| File sandbox | `files.py` | Which local file may be sent (outbox only, never the tool's own files) and where a download goes (below). |
+| Last choices | `choices.py` | The delete scope and the group kind you allowed last, so the choice question offers it first (below). |
 | Telegram gateway | `gateway/` | The interface to Telegram, its Telethon implementation (the only module importing Telethon) and an in-memory fake for tests. |
 | Session vault | `vault.py` | The session, `api_id` and `api_hash` in the macOS Keychain only. |
 | Settings | `settings.py`, `paths.py` | Fixed paths derived from the home folder, and the two folder settings of `config.toml`. |
@@ -505,10 +508,72 @@ One line each for an idle stop (with the idle minutes), a secret rotation and it
 the value), the start and end of a connect back-off (failure count and wait), a send dropped
 from the line (tool and approval id, never the text), and a failed log rotation.
 
+## The tool catalogue
+
+The MCP server lists 30 tools, named `tg_<object>_<verb>`. Every tool names a chat by its id;
+`tg_chats_resolve` is the one place a title, an `@username` or a `t.me/<name>` link becomes an
+id, and it never guesses: several chats with the same title come back as candidates
+(`ambiguous_chat`), and a title that only contains the query is listed, never chosen. A title
+lookup reads the main list and the archive, at most 2,000 chats.
+
+| Family | Module | Reads (no question, nothing marked) | Writes (one question each) |
+|---|---|---|---|
+| Chats | `catalog/chats.py` | `tg_folders_list`, `tg_chats_resolve`, `tg_chats_info`, `tg_topics_list` | `tg_topics_create`, `tg_chats_create`, `tg_chats_join`, `tg_chats_leave`, `tg_chats_edit`, `tg_invites_create` |
+| Messages | `catalog/messages.py` | `tg_messages_read`, `tg_messages_pinned`, `tg_messages_search` | `tg_messages_edit`, `tg_messages_delete`, `tg_messages_forward`, `tg_messages_react`, `tg_messages_pin`, `tg_messages_unpin` |
+| People | `catalog/people.py` | `tg_members_list`, `tg_contacts_list`, `tg_users_info` | `tg_admins_set` |
+| Profile | `catalog/profile.py` | `tg_profile_get` | `tg_profile_edit` |
+| Files | `catalog/media.py` | `tg_media_download` | `tg_files_send` |
+
+`tg_chats_mark_read` marks a chat or one forum topic, and `tg_messages_read` may mark what it
+returned when `mark_read` is true; both go through the marking rules of
+[confirmation-rules.md](confirmation-rules.md). U1's `tg_chats_list` and `tg_messages_send`
+complete the list.
+
+`tools.py` keeps every tool's declaration (its kind and its row in the kind table) and its
+closed argument schema; the catalogue modules hold, per tool, a validator (closed schema, every
+default filled before the digest), a describer (writes only: the reads a question needs, in
+one batched call per list of messages or users) and a runner. A runner takes its chat ids,
+message ids, texts and file from the approval the person confirmed, never from a new lookup, and
+makes one Telegram call from the write line. Every read result lists in
+`telegram_content_fields` the fields that hold text from Telegram (names, titles, messages,
+captions, bios, file names) and carries a notice that it is data, not instructions.
+
+A delete with no `for_everyone`, and a group creation with no `group_kind`, are refused by the
+validator with `needs_choice` before anything is prepared or run: the refusal dictates a choice
+question, with the person's last choice first, and Claude calls again with the pick. The last
+choices live in `choices.json` in the data folder (mode 0600), written by the broker only after
+an Allowed run (see [confirmation-rules.md](confirmation-rules.md)).
+## The file sandbox
+
+`files.py` decides which local file may leave the machine and where a download goes.
+
+- **Sending** (`tg_files_send`, and `photo_path` of `tg_chats_edit` and `tg_profile_edit`): the
+  path is expanded (`~`, or relative to the outbox) and resolved through every link. Only a
+  file inside the outbox folder (`outbox_dir`, default `~/Downloads/telegram-mcp/outbox`) is
+  admitted; a file in the data folder, or the same file (device and inode) as one there, is
+  refused whatever path or link names it; and only a non-empty regular file of at most 20 MB.
+  The question shows the resolved path, name and size. The file's device, inode, size and
+  modification time are kept in memory, keyed by the call's digest, for 180 s at most (100
+  records at most). At the send the path is checked again, opened without following a link at
+  the last step, compared with that record, and uploaded from that same open file; any
+  difference refuses with nothing uploaded, and the approval is used.
+- **Downloading** (`tg_media_download`, a read): the file goes into the downloads folder
+  (`downloads_dir`, default `~/Downloads/telegram-mcp`) only; the tool has no path argument.
+  The name is Telegram's, with separators, control and space characters replaced by `_`, no
+  leading dot and at most 200 characters, or `<chat>_<message>` plus an extension. The bytes go
+  to a new hidden partial file (mode 0600), which is then linked to the first free name of
+  `name`, `name (1)` … `name (999)`, and the partial name is removed. Nothing is ever replaced,
+  and a failure or a timeout leaves no file. Files over 20 MB are refused before downloading,
+  so one transfer fits in the 30 s Telegram call limit.
+
+A refused `outbox_dir` stops file sends only, and a refused `downloads_dir` stops downloads
+only. The log names a sent or downloaded file by path, name and size, never its content.
+
 ## What is not here yet
 
-This version has phone and QR-code login, logout, status, the log command, `tg_chats_list` and
-`tg_messages_send`, with the guard hook above, a shared Telegram connection, idle exit and log
-rotation. Other tools come later. The guard covers Claude's own tools only: another program
+This version has phone and QR-code login, logout, status, the log command and the 30 tools of
+the catalogue above, with the guard hook above, a shared Telegram connection, idle exit and log
+rotation. Folder ids above 1 from `tg_folders_list` are your custom folders; `tg_chats_list`
+lists the main list (0) and the archive (1) by folder. The guard covers Claude's own tools only: another program
 running as the same macOS user can still read `broker.secret`. This version is for trying out,
 not for daily use.

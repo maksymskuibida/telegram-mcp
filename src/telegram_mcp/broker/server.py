@@ -77,18 +77,21 @@ from telegram_mcp.gateway.models import (
     FloodWait,
     GatewayError,
     GatewayTimeout,
+    NotAUser,
     NotAuthorized,
     OutcomeUnknown,
     TelegramError,
+    TooLarge,
     TopicNotFound,
     UnreadState,
+    UserNotFound,
     account_label,
 )
 from telegram_mcp.gateway.protocol import GatewayFactory, TelegramGateway
 from telegram_mcp.paths import FixedPaths
 from telegram_mcp.prompts import NOT_ALLOWED_MESSAGE, PromptError, PromptFields, TopicRef
 from telegram_mcp.settings import Settings, SettingsError
-from telegram_mcp.tools import ASK_AGAIN, InvalidArguments
+from telegram_mcp.tools import ASK_AGAIN, InvalidArguments, NeedsChoice
 from telegram_mcp.vault import (
     SessionVault,
     StoredSession,
@@ -284,7 +287,7 @@ class Broker:
         self.secret_rotation = secret_rotation
         self.status_budget = status_budget
         self.logout_budget = logout_budget
-        self.registry = registry if registry is not None else default_registry()
+        self.registry = registry if registry is not None else default_registry(paths, clock=clock)
         self.gate = ConsentGate(self.registry.decls(), clock=clock)
         self.redactor = Redactor()
         self.diagnostics = Diagnostics(paths.diagnostics, self.redactor)
@@ -661,6 +664,8 @@ class Broker:
             return ToolFailure.fixed("not_found", "not_found_topic")
         if isinstance(error, FloodWait):
             return ToolFailure.flood(error.seconds)
+        if isinstance(error, UserNotFound | NotAUser | TooLarge):
+            return _catalog_failure(error)
         if isinstance(error, NotAuthorized):
             self._forget_session()
             return ToolFailure.fixed("no_session")
@@ -820,7 +825,8 @@ class Broker:
         except ToolFailure as failure:
             self._log_result(connection, tool, failure.code, failure.approval, raw)
             return failure.as_result()
-        self._log_result(connection, tool, "ok", approval, raw)
+        content = action.log_result(data) if action.log_result is not None else None
+        self._log_result(connection, tool, "ok", approval, raw, content)
         return {"ok": True, "data": data}
 
     async def _call_action(
@@ -1087,6 +1093,14 @@ class Broker:
     def _common_failure(self, error: Exception) -> ToolFailure | None:
         if isinstance(error, FloodWait):
             return _flood_failure(error.seconds)
+        if isinstance(error, PromptError):  # a tool's own refusal, with its code (BR25.5)
+            return ToolFailure(error.code, error.message)
+        if isinstance(error, InvalidArguments):
+            return ToolFailure("invalid_arguments", str(error))
+        if isinstance(error, TopicNotFound):
+            return ToolFailure.fixed("not_found", "not_found_topic")
+        if isinstance(error, UserNotFound | NotAUser | TooLarge):
+            return _catalog_failure(error)
         if isinstance(error, NotAuthorized):
             self._forget_session()
             return ToolFailure.fixed("no_session")
@@ -1347,6 +1361,7 @@ class Broker:
         result: str,
         approval: PendingApproval | None,
         raw: object,
+        content: str | None = None,
     ) -> None:
         chat_id = approval.chat_id if approval is not None else _peek(raw)[0]
         self._log_entry(
@@ -1356,6 +1371,7 @@ class Broker:
             result,
             approval_id=approval.id if approval is not None else None,
             chat_id=chat_id,
+            content=content,
         )
 
     def _log_gate_events(self, connection: Connection) -> None:
@@ -1427,6 +1443,22 @@ class Broker:
 # Helpers --------------------------------------------------------------------------------------
 
 
+def _catalog_failure(error: UserNotFound | NotAUser | TooLarge) -> ToolFailure:
+    """The gateway errors of U4's lookups and transfers, with a message naming what failed."""
+    if isinstance(error, TooLarge):
+        return ToolFailure(
+            "invalid_arguments",
+            f"The file is {error.size_bytes} bytes; files over 20 MB are not moved by this "
+            "tool. Download or send it in Telegram yourself.",
+        )
+    if isinstance(error, NotAUser):
+        return ToolFailure("not_found", "That username is a chat; use tg_chats_info.")
+    if error.username is not None:
+        return ToolFailure("not_found", f"No user has the username @{error.username}.")
+    named = ", ".join(str(number) for number in error.ids)
+    return ToolFailure("not_found", f"This account cannot see these users: {named}.")
+
+
 def _flood_failure(seconds: int, *, sent_nothing: bool = False) -> ToolFailure:
     if sent_nothing:
         message = f"Telegram asked to wait {seconds} s; nothing was sent. Ask again after that."
@@ -1449,6 +1481,8 @@ def _validated(action: ConsentAction, raw: object) -> tuple[dict[str, Any], str]
     try:
         args = action.validate(raw)
         return args, canonical_digest(action.tool, args)
+    except NeedsChoice as choice:  # the person chooses first; nothing is prepared or run
+        raise ToolFailure("needs_choice", str(choice)) from choice
     except (InvalidArguments, DigestError) as error:
         raise ToolFailure("invalid_arguments", str(error)) from error
 
@@ -1498,14 +1532,19 @@ def _failure_for(method: str) -> Any:
 
 
 def _peek(raw: object) -> tuple[int | None, str | None]:
-    """The chat id and text of raw arguments, for the log only, never for a decision."""
+    """The chat id and the text, query or target of raw arguments, for the log only, never for a
+    decision (NFR8.4, NFR8.6: what Claude looked for is logged too)."""
     if not isinstance(raw, dict):
         return None, None
-    chat, text = raw.get("chat"), raw.get("text")
+    chat = next((raw[k] for k in ("chat", "to_chat") if raw.get(k) is not None), None)
     chat_id = chat if isinstance(chat, int) and not isinstance(chat, bool) else None
     if isinstance(chat, str) and chat.lstrip("-").isdigit():
         chat_id = int(chat)
-    return chat_id, text if isinstance(text, str) else None
+    for key in ("text", "query", "caption", "link_or_username", "path"):
+        value = raw.get(key)
+        if isinstance(value, str):
+            return chat_id, value
+    return chat_id, None
 
 
 def _text_list(value: object) -> list[str] | None:

@@ -27,8 +27,10 @@ from telegram_mcp.tools import (
 SPECS = {spec.name: spec for spec in TOOL_SPECS}
 
 
-def test_u1_lists_two_tools_with_closed_schemas() -> None:
-    assert set(SPECS) == {CHATS_LIST, MESSAGES_SEND}
+def test_the_catalogue_lists_its_30_tools_with_closed_schemas() -> None:
+    # U1's two tools and U4's 28 (C5); the full list is checked in test_catalog_logging.
+    assert {CHATS_LIST, MESSAGES_SEND} <= set(SPECS)
+    assert len(SPECS) == len(TOOL_SPECS) == 30
     for spec in TOOL_SPECS:
         assert spec.input_schema["type"] == "object"
         assert spec.input_schema["additionalProperties"] is False

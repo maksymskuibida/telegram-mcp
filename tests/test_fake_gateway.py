@@ -290,10 +290,11 @@ async def test_mark_read_marks_up_to_max_id_and_nothing_beyond(fake_gateway: Fak
 async def test_reads_and_fetches_never_acknowledge_reading(fake_gateway: FakeGateway) -> None:
     ids = seeded(fake_gateway)
     assert [m.id for m in await fake_gateway.get_messages(ALICE.id, [ids[0], 999])] == [ids[0]]
-    assert [m.text for m in await fake_gateway.read_messages(ALICE.id, 2, None)] == ["m1", "m2"]
-    older = await fake_gateway.read_messages(ALICE.id, 5, None, before_id=ids[1])
+    # Newest first, as Telegram returns a history page (U4 BR22.3).
+    assert [m.text for m in await fake_gateway.read_messages(ALICE.id, 2)] == ["m2", "m1"]
+    older = await fake_gateway.read_messages(ALICE.id, 5, before_id=ids[1])
     assert [m.id for m in older] == [ids[0]]
-    assert [m.id for m in await fake_gateway.read_messages(FORUM.id, 5, 9)] == [ids[3]]
+    assert [m.id for m in await fake_gateway.read_messages(FORUM.id, 5, topic_id=9)] == [ids[3]]
     await fake_gateway.unread_state(ALICE.id, None)
     await fake_gateway.list_chats(None, 50, None)
     await fake_gateway.record_write("tg_chats_leave", approval_id="x")

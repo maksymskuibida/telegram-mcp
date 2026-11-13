@@ -17,6 +17,9 @@ from support.memory_keyring import MemoryKeyring
 from support.samples import sample_chats
 from telegram_mcp.gateway.fake import FakeGateway
 
+# The seeded account and the broker running the shipped catalogue (U4 tool tests).
+pytest_plugins = ["support.catalog"]
+
 
 @pytest.fixture(autouse=True)
 def home(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:

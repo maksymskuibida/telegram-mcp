@@ -97,8 +97,161 @@ class QrToken:
     expires_at: datetime
 
 
+Role = Literal["member", "admin", "creator", "none"]
+MediaKind = Literal["photo", "video", "voice", "audio", "document", "sticker", "other"]
+
+
+@dataclass(frozen=True)
+class ChatDetails:
+    """What tg_chats_info returns about one chat (C3 chat_info). ``name`` and ``description``
+    are Telegram content."""
+
+    id: int
+    name: str
+    type: ChatType
+    username: str | None = None
+    description: str | None = None
+    member_count: int | None = None
+    unread: int = 0
+    muted: bool = False
+    is_forum: bool = False
+    my_role: Role = "none"
+    pinned_message_id: int | None = None
+    saved_messages: bool = False
+
+    def ref(self) -> ChatRef:
+        return ChatRef(
+            id=self.id,
+            name=self.name,
+            type=self.type,
+            unread=self.unread,
+            muted=self.muted,
+            saved_messages=self.saved_messages,
+        )
+
+
+@dataclass(frozen=True)
+class FolderRef:
+    """One chat folder: 0 is the main list, 1 the archive."""
+
+    id: int
+    title: str
+
+
+@dataclass(frozen=True)
+class TopicInfo:
+    """One forum topic (C3 topics_list)."""
+
+    topic_id: int
+    title: str
+    unread: int = 0
+    closed: bool = False
+    pinned: bool = False
+
+
+@dataclass(frozen=True)
+class MediaRef:
+    """The file a message carries (C3 MediaRef); ``file_name`` is Telegram content."""
+
+    kind: str
+    size_bytes: int
+    file_name: str | None = None
+
+
+@dataclass(frozen=True)
+class Sender:
+    id: int
+    name: str
+
+
+@dataclass(frozen=True)
+class MessageView:
+    """One message as a read returns it. ``text``, the sender's name, the media file name and
+    ``forwarded_from`` are Telegram content."""
+
+    id: int
+    chat_id: int
+    date: datetime
+    sender: Sender | None
+    outgoing: bool
+    text: str
+    reply_to: int | None = None
+    topic_id: int | None = None
+    media: MediaRef | None = None
+    edited: bool = False
+    forwarded_from: str | None = None
+
+
+@dataclass(frozen=True)
+class SearchHit:
+    """One message found by a search across chats, with its chat."""
+
+    chat: ChatRef
+    message: MessageView
+
+
+@dataclass(frozen=True)
+class PersonInfo:
+    """A user as members, contacts and user profiles return them."""
+
+    id: int
+    name: str
+    username: str | None = None
+    phone: str | None = None
+    bio: str | None = None
+    is_bot: bool = False
+    is_contact: bool = False
+    role: Literal["member", "admin", "creator"] | None = None
+    admin_rights: tuple[tuple[str, bool], ...] | None = None
+
+
+@dataclass(frozen=True)
+class OwnProfile:
+    """The person's own profile: nothing about sessions, privacy or login methods (FR6.3)."""
+
+    id: int
+    first_name: str
+    last_name: str | None = None
+    username: str | None = None
+    bio: str | None = None
+    phone: str | None = None
+    has_photo: bool = False
+
+
+@dataclass(frozen=True)
+class ChatCandidate:
+    """One chat a lookup matched, so the AI can name it by id. ``name`` is Telegram content."""
+
+    chat_id: int
+    name: str
+    type: ChatType
+    username: str | None
+    match: Literal["id", "username", "exact_title", "partial_title"]
+
+
 class GatewayError(Exception):
     """Base of every error the gateway raises."""
+
+
+class TooLarge(GatewayError):
+    """A file is larger than the tool moves (BR26, NFR11.5)."""
+
+    def __init__(self, size_bytes: int) -> None:
+        super().__init__(f"the file is {size_bytes} bytes")
+        self.size_bytes = size_bytes
+
+
+class UserNotFound(GatewayError):
+    """The account cannot see these users (or this username names nobody)."""
+
+    def __init__(self, ids: tuple[int, ...] = (), username: str | None = None) -> None:
+        super().__init__("user not found")
+        self.ids = ids
+        self.username = username
+
+
+class NotAUser(GatewayError):
+    """A username names a group or a channel, not a person."""
 
 
 class NotAuthorized(GatewayError):

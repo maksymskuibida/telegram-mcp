@@ -12,10 +12,14 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
+from telegram_mcp.activity_log import utc_now
 from telegram_mcp.consent import ActionDecl, PendingApproval
+from telegram_mcp.files import FileStore
 from telegram_mcp.gateway.protocol import TelegramGateway
+from telegram_mcp.paths import FixedPaths
 from telegram_mcp.prompts import HeadlineDetails, PromptFields, TopicRef
 from telegram_mcp.tools import (
     CHATS_LIST,
@@ -49,6 +53,8 @@ class ConsentAction:
     describe: Describer | None = None
     run: Runner | None = None
     newest_returned: NewestReturned | None = None
+    log_result: Callable[[Any], str | None] | None = None
+    """What the result entry names (a file's path, name and size), never content (NFR8.5)."""
 
     @property
     def tool(self) -> str:
@@ -58,6 +64,8 @@ class ConsentAction:
 class ActionRegistry:
     def __init__(self, actions: Iterable[ConsentAction] = ()) -> None:
         self._actions: dict[str, ConsentAction] = {}
+        self.files: FileStore | None = None
+        """The file records of the file tools, when the catalogue has them."""
         for action in actions:
             self.register(action)
 
@@ -119,7 +127,22 @@ def _validator(tool: str) -> Validator:
     return lambda raw: validate_args(tool, raw if raw is not None else {})
 
 
-def default_registry() -> ActionRegistry:
+def default_registry(
+    paths: FixedPaths | None = None, *, clock: Callable[[], datetime] = utc_now
+) -> ActionRegistry:
+    """The shipped catalogue: U1's two tools and every U4 tool (C5). ``paths`` gives the
+    folders and the data folder the file tools use; ``clock`` times the file records."""
+    from telegram_mcp.catalog import build_actions
+
+    registry = u1_registry()
+    context, actions = build_actions(paths or FixedPaths.from_home(), clock)
+    for action in actions:
+        registry.register(action)
+    registry.files = context.files
+    return registry
+
+
+def u1_registry() -> ActionRegistry:
     """U1's tools: the chat list (a read) and the text send (a write)."""
     return ActionRegistry(
         [
