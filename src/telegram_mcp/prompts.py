@@ -119,6 +119,8 @@ class HeadlineDetails:
     rights: Mapping[str, Any] | None = None
     current_rights: Mapping[str, Any] | None = None
     changes: tuple[FieldChange, ...] = ()
+    group_kind: Literal["basic", "supergroup"] | None = None
+    """For a new group: a basic group or a supergroup, named in the question."""
 
 
 @dataclass(frozen=True)
@@ -517,7 +519,9 @@ def _topic_create(fields: PromptFields, headline: str, now: datetime) -> Rendere
 
 def _chat_create(fields: PromptFields, headline: str, now: datetime) -> Rendered:
     details = fields.details
-    kind = _need(details.new_chat_type, "new_chat_type")
+    kind: str = _need(details.new_chat_type, "new_chat_type")
+    if kind == "group" and details.group_kind is not None:
+        kind = "supergroup" if details.group_kind == "supergroup" else "basic group"
     title = sanitize_chat_name(_need(details.title, "title"))
     members = _need(details.members, "members")
     if members:

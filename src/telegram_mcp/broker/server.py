@@ -91,7 +91,7 @@ from telegram_mcp.gateway.protocol import GatewayFactory, TelegramGateway
 from telegram_mcp.paths import FixedPaths
 from telegram_mcp.prompts import NOT_ALLOWED_MESSAGE, PromptError, PromptFields, TopicRef
 from telegram_mcp.settings import Settings, SettingsError
-from telegram_mcp.tools import ASK_AGAIN, InvalidArguments
+from telegram_mcp.tools import ASK_AGAIN, InvalidArguments, NeedsChoice
 from telegram_mcp.vault import (
     SessionVault,
     StoredSession,
@@ -1481,6 +1481,8 @@ def _validated(action: ConsentAction, raw: object) -> tuple[dict[str, Any], str]
     try:
         args = action.validate(raw)
         return args, canonical_digest(action.tool, args)
+    except NeedsChoice as choice:  # the person chooses first; nothing is prepared or run
+        raise ToolFailure("needs_choice", str(choice)) from choice
     except (InvalidArguments, DigestError) as error:
         raise ToolFailure("invalid_arguments", str(error)) from error
 

@@ -364,11 +364,17 @@ _U4_SPECS: tuple[ToolSpec, ...] = (
     ),
     _write(
         MESSAGES_DELETE,
-        "Deletes 1 to 20 messages, only for you (for_everyone false) or for everyone.",
+        "Deletes 1 to 20 messages, only for you (for_everyone false) or for everyone (true). "
+        "Without for_everyone a choice question may come first (needs_choice): ask it exactly "
+        "as given, then call again with the person's pick.",
         {
             "chat": CHAT_PROPERTY,
             "message_ids": MESSAGE_IDS_PROPERTY,
-            "for_everyone": {"type": "boolean", "default": False},
+            "for_everyone": {
+                "type": "boolean",
+                "description": "Delete for everyone (true) or only for you (false); leave it "
+                "out to ask the person.",
+            },
         },
         "chat",
         "message_ids",
@@ -423,9 +429,15 @@ _U4_SPECS: tuple[ToolSpec, ...] = (
     ),
     _write(
         CHATS_CREATE,
-        "Creates a new group or channel, with 0 to 20 members (user ids) for a group.",
+        "Creates a new group or channel, with 0 to 20 members (user ids) for a group. For a "
+        "group without group_kind a choice question may come first (needs_choice): ask it "
+        "exactly as given, then call again with the person's pick.",
         {
             "type": {"enum": ["group", "channel"]},
+            "group_kind": {
+                "enum": ["basic", "supergroup"],
+                "description": "For a group: a basic group or a supergroup; leave it out to ask.",
+            },
             "title": {"type": "string", "minLength": 1, "maxLength": TITLE_LIMIT},
             "members": {
                 **MESSAGE_IDS_PROPERTY,

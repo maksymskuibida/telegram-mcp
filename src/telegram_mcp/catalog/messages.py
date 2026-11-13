@@ -14,11 +14,13 @@ from telegram_mcp.catalog.common import (
     Args,
     CatalogContext,
     chat_dict,
+    choice_message,
     message_dict,
     message_fields,
     named_messages,
     with_notice,
 )
+from telegram_mcp.choices import CHOICE_NOT_SAVED, DeleteScope
 from telegram_mcp.consent import PendingApproval
 from telegram_mcp.gateway.models import ChatRef, SearchHit
 from telegram_mcp.gateway.protocol import TelegramGateway
@@ -39,6 +41,7 @@ from telegram_mcp.tools import (
     QUERY_LIMIT,
     SEARCH_LIMIT,
     TEXT_LIMIT,
+    NeedsChoice,
 )
 
 
@@ -106,13 +109,44 @@ async def _run_edit(
 # tg_messages_delete (BR23.4) -------------------------------------------------------------------
 
 
-def _validate_delete(raw: object) -> dict[str, Any]:
-    args = Args(MESSAGES_DELETE, raw, ("chat", "message_ids", "for_everyone"))
-    return {
-        "chat": args.chat(),
-        "message_ids": args.ids("message_ids"),
-        "for_everyone": args.boolean("for_everyone", False),
-    }
+DELETE_QUESTION = "Delete these messages only for you or for everyone?"
+DELETE_OPTIONS = (("Only for you", "false"), ("For everyone", "true"))
+
+
+def delete_action(context: CatalogContext) -> ConsentAction:
+    """tg_messages_delete. With no ``for_everyone`` the person is asked to choose first, their
+    last choice offered first (the plan-page note A-1); the choice is remembered only after an
+    Allowed delete."""
+
+    def validate(raw: object) -> dict[str, Any]:
+        args = Args(MESSAGES_DELETE, raw, ("chat", "message_ids", "for_everyone"))
+        validated = {
+            "chat": args.chat(),
+            "message_ids": args.ids("message_ids"),
+            "for_everyone": args.boolean("for_everyone", None),
+        }
+        if validated["for_everyone"] is None:
+            last = context.choices.last_delete_scope()
+            raise NeedsChoice(
+                choice_message(
+                    DELETE_QUESTION,
+                    DELETE_OPTIONS,
+                    "for_everyone",
+                    None if last is None else "true" if last == "everyone" else "false",
+                )
+            )
+        return validated
+
+    async def run(
+        gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+    ) -> Any:
+        result: dict[str, Any] = await _run_delete(gateway, approval, args)
+        scope: DeleteScope = "everyone" if result["for_everyone"] else "me"
+        if not context.choices.remember(delete_scope=scope):
+            result["note"] = CHOICE_NOT_SAVED
+        return result
+
+    return ConsentAction(DECLS[MESSAGES_DELETE], validate, _describe_delete, run)
 
 
 async def _describe_delete(gateway: TelegramGateway, args: dict[str, Any]) -> PromptFields:
@@ -337,7 +371,7 @@ def read_actions() -> list[ConsentAction]:
 def write_actions(context: CatalogContext) -> list[ConsentAction]:
     return [
         ConsentAction(DECLS[MESSAGES_EDIT], _validate_edit, _describe_edit, _run_edit),
-        ConsentAction(DECLS[MESSAGES_DELETE], _validate_delete, _describe_delete, _run_delete),
+        delete_action(context),
         ConsentAction(DECLS[MESSAGES_FORWARD], _validate_forward, _describe_forward, _run_forward),
         ConsentAction(
             DECLS[MESSAGES_REACT],

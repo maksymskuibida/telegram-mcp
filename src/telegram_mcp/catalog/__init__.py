@@ -13,6 +13,7 @@ from datetime import datetime
 from telegram_mcp.actions import ConsentAction
 from telegram_mcp.catalog import chats, media, messages, people, profile
 from telegram_mcp.catalog.common import CatalogContext
+from telegram_mcp.choices import ChoiceStore
 from telegram_mcp.files import FileStore
 from telegram_mcp.paths import FixedPaths
 
@@ -21,7 +22,12 @@ def build_actions(
     paths: FixedPaths, clock: Callable[[], datetime]
 ) -> tuple[CatalogContext, list[ConsentAction]]:
     """Every U4 action, sharing one context."""
-    context = CatalogContext(paths=paths, files=FileStore(clock=clock), clock=clock)
+    context = CatalogContext(
+        paths=paths,
+        files=FileStore(clock=clock),
+        clock=clock,
+        choices=ChoiceStore.for_paths(paths),
+    )
     actions: list[ConsentAction] = []
     for family in (messages, chats, people, profile, media):
         actions.extend(family.write_actions(context))

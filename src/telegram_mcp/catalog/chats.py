@@ -16,10 +16,12 @@ from telegram_mcp.catalog.common import (
     Args,
     CatalogContext,
     chat_dict,
+    choice_message,
     require_group,
     with_notice,
 )
 from telegram_mcp.catalog.messages import approved, approved_chat
+from telegram_mcp.choices import CHOICE_NOT_SAVED
 from telegram_mcp.consent import PendingApproval, canonical_digest
 from telegram_mcp.files import NO_RECORD_MESSAGE, FileRefused, admit, open_admitted
 from telegram_mcp.gateway.models import ChatNotFound, ChatRef
@@ -51,6 +53,7 @@ from telegram_mcp.tools import (
     TOPICS_CREATE,
     TOPICS_LIST,
     InvalidArguments,
+    NeedsChoice,
 )
 
 _LINK_HOST = r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/"
@@ -103,19 +106,47 @@ async def _run_topic(
 # tg_chats_create -----------------------------------------------------------------------------
 
 
-def _validate_create(raw: object) -> dict[str, Any]:
-    args = Args(CHATS_CREATE, raw, ("type", "title", "members"))
-    kind = args.choice("type", ("group", "channel"))
-    members = args.ids("members", minimum=0)
-    if kind == "channel" and members:
-        raise InvalidArguments(
-            "members: a channel is created without members; invite people with tg_invites_create"
-        )
-    return {
-        "type": kind,
-        "title": args.required_text("title", max_len=TITLE_LIMIT),
-        "members": members,
-    }
+GROUP_QUESTION = "Create a basic group or a supergroup?"
+GROUP_OPTIONS = (("Basic group", '"basic"'), ("Supergroup", '"supergroup"'))
+
+
+def _create_validator(context: CatalogContext) -> Any:
+    """With type group and no ``group_kind`` the person is asked to choose first, their last
+    choice offered first (the plan-page note A-4); a channel needs no choice."""
+
+    def validate(raw: object) -> dict[str, Any]:
+        args = Args(CHATS_CREATE, raw, ("type", "title", "members", "group_kind"))
+        kind = args.choice("type", ("group", "channel"))
+        members = args.ids("members", minimum=0)
+        group_kind = args.raw.get("group_kind")
+        if kind == "channel":
+            if members:
+                raise InvalidArguments(
+                    "members: a channel is created without members; invite people with "
+                    "tg_invites_create"
+                )
+            if group_kind is not None:
+                raise InvalidArguments("group_kind is only for a group")
+        elif group_kind is None:
+            last = context.choices.last_group_kind()
+            raise NeedsChoice(
+                choice_message(
+                    GROUP_QUESTION,
+                    GROUP_OPTIONS,
+                    "group_kind",
+                    None if last is None else f'"{last}"',
+                )
+            )
+        elif group_kind not in ("basic", "supergroup"):
+            raise InvalidArguments("group_kind must be basic or supergroup")
+        return {
+            "type": kind,
+            "title": args.required_text("title", max_len=TITLE_LIMIT),
+            "members": members,
+            "group_kind": group_kind,
+        }
+
+    return validate
 
 
 async def _describe_create(gateway: TelegramGateway, args: dict[str, Any]) -> PromptFields:
@@ -131,23 +162,42 @@ async def _describe_create(gateway: TelegramGateway, args: dict[str, Any]) -> Pr
     return PromptFields(
         action="chat_create",
         tool=CHATS_CREATE,
-        details=HeadlineDetails(new_chat_type=args["type"], title=args["title"], members=members),
+        details=HeadlineDetails(
+            new_chat_type=args["type"],
+            title=args["title"],
+            members=members,
+            group_kind=args["group_kind"],
+        ),
     )
 
 
-async def _run_create(
-    gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
-) -> Any:
-    details = approved(approval).details
-    title, kind = details.title, details.new_chat_type
-    if title is None or kind is None:
-        raise ValueError("the approval names no title or type")
-    if kind == "channel":
-        chat_id = await gateway.create_channel(title)
-        return {"chat_id": chat_id, "type": "channel", "title": title}
-    members = [person.id for person in details.members or ()]
-    chat_id = await gateway.create_group(title, members, supergroup=True)
-    return {"chat_id": chat_id, "type": "supergroup", "title": title}
+def _create_runner(context: CatalogContext) -> Any:
+    async def run(
+        gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
+    ) -> Any:
+        details = approved(approval).details
+        title, kind = details.title, details.new_chat_type
+        if title is None or kind is None:
+            raise ValueError("the approval names no title or type")
+        if kind == "channel":
+            chat_id = await gateway.create_channel(title)
+            return {"chat_id": chat_id, "type": "channel", "title": title}
+        group_kind = details.group_kind
+        if group_kind is None:
+            raise ValueError("the approval names no group kind")
+        members = [person.id for person in details.members or ()]
+        supergroup = group_kind == "supergroup"
+        chat_id = await gateway.create_group(title, members, supergroup=supergroup)
+        result: dict[str, Any] = {
+            "chat_id": chat_id,
+            "type": "supergroup" if supergroup else "group",
+            "title": title,
+        }
+        if not context.choices.remember(group_kind=group_kind):
+            result["note"] = CHOICE_NOT_SAVED
+        return result
+
+    return run
 
 
 # tg_chats_join (BR23.7) ----------------------------------------------------------------------
@@ -499,7 +549,12 @@ def mark_action() -> ConsentAction:
 def write_actions(context: CatalogContext) -> list[ConsentAction]:
     return [
         ConsentAction(DECLS[TOPICS_CREATE], _validate_topic, _describe_topic, _run_topic),
-        ConsentAction(DECLS[CHATS_CREATE], _validate_create, _describe_create, _run_create),
+        ConsentAction(
+            DECLS[CHATS_CREATE],
+            _create_validator(context),
+            _describe_create,
+            _create_runner(context),
+        ),
         ConsentAction(DECLS[CHATS_JOIN], _validate_join, _describe_join, _run_join),
         ConsentAction(
             DECLS[CHATS_LEAVE], _validate_chat_only(CHATS_LEAVE), _describe_leave, _run_leave

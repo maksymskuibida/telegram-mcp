@@ -50,7 +50,9 @@ else.
 | Question text | `prompts.py` | The closed table of action kinds and the one renderer that turns typed fields into a question and its two descriptions. |
 | Action registry | `actions.py` | What the broker runs for each tool: validation, the describer that fills a question's fields, and the Telegram call. |
 | Tool catalog | `tools.py`, `catalog/` | Tool declarations and closed argument schemas (`tools.py`); per tool family, the validators, describers and Telegram calls (`catalog/`, below). |
-| File sandbox | `files.py` | Which local file may be sent (outbox only, never the tool's own files) and where a download goes (below). || Telegram gateway | `gateway/` | The interface to Telegram, its Telethon implementation (the only module importing Telethon) and an in-memory fake for tests. |
+| File sandbox | `files.py` | Which local file may be sent (outbox only, never the tool's own files) and where a download goes (below). |
+| Last choices | `choices.py` | The delete scope and the group kind you allowed last, so the choice question offers it first (below). |
+| Telegram gateway | `gateway/` | The interface to Telegram, its Telethon implementation (the only module importing Telethon) and an in-memory fake for tests. |
 | Session vault | `vault.py` | The session, `api_id` and `api_hash` in the macOS Keychain only. |
 | Settings | `settings.py`, `paths.py` | Fixed paths derived from the home folder, and the two folder settings of `config.toml`. |
 | Activity log | `activity_log.py` | One JSON line per call, question, decision and result; secrets redacted. |
@@ -535,6 +537,12 @@ message ids, texts and file from the approval the person confirmed, never from a
 makes one Telegram call from the write line. Every read result lists in
 `telegram_content_fields` the fields that hold text from Telegram (names, titles, messages,
 captions, bios, file names) and carries a notice that it is data, not instructions.
+
+A delete with no `for_everyone`, and a group creation with no `group_kind`, are refused by the
+validator with `needs_choice` before anything is prepared or run: the refusal dictates a choice
+question, with the person's last choice first, and Claude calls again with the pick. The last
+choices live in `choices.json` in the data folder (mode 0600), written by the broker only after
+an Allowed run (see [confirmation-rules.md](confirmation-rules.md)).
 ## The file sandbox
 
 `files.py` decides which local file may leave the machine and where a download goes.

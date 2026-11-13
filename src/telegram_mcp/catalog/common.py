@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from telegram_mcp.activity_log import iso_utc
+from telegram_mcp.choices import ChoiceStore
 from telegram_mcp.files import FileStore
 from telegram_mcp.gateway.models import ChatRef, MessageView, PersonInfo
 from telegram_mcp.gateway.protocol import TelegramGateway
@@ -32,6 +33,30 @@ class CatalogContext:
     paths: FixedPaths
     files: FileStore
     clock: Callable[[], datetime]
+    choices: ChoiceStore
+
+
+LAST_USED = " (last used)"
+
+
+def choice_message(
+    question: str,
+    options: Sequence[tuple[str, str]],
+    argument: str,
+    last: str | None,
+) -> str:
+    """What a ``needs_choice`` refusal tells Claude to ask: the question, the options with the
+    last choice first and marked, else in the given order (the less destructive first), and
+    which value of ``argument`` each option means. ``options`` holds (label, value) pairs."""
+    ordered = sorted(options, key=lambda option: option[1] != last) if last else list(options)
+    labels = [label + (LAST_USED if value == last else "") for label, value in ordered]
+    shown = " and ".join(f'"{label}"' for label in labels)
+    meaning = " or ".join(f'{value} for "{label}"' for (label, value) in options)
+    return (
+        "Not done yet: first ask the person which one they want. Ask with AskUserQuestion, "
+        f'exactly: question "{question}"; options {shown}, in that order, multiSelect false; '
+        f"then call this tool again with the same arguments and {argument} set to {meaning}."
+    )
 
 
 class Args:

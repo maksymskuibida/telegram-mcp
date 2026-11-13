@@ -24,7 +24,7 @@ with `not_allowed` and never asked about.
 | pin | `tg_messages_pin` | Pin message `<n>` in `<chat>`? | Pin it | Do not pin |
 | pin | `tg_messages_unpin` | Unpin message `<n>` in `<chat>`? | Unpin it | Keep it pinned |
 | topic_create | `tg_topics_create` | Create the topic «`<title>`» in `<chat>`? | Create the topic | Do not create |
-| chat_create | `tg_chats_create` | Create a new `<group or channel>` «`<title>`»? | Create it | Do not create |
+| chat_create | `tg_chats_create` | Create a new `<basic group, supergroup or channel>` «`<title>`»? | Create it | Do not create |
 | join | `tg_chats_join` | Join `<chat>`? (or: Join the chat at `<link>`?) | Join | Do not join |
 | leave | `tg_chats_leave` | Leave `<chat>`? | Leave | Stay |
 | chat_edit | `tg_chats_edit` | Change `<chat>`? | Save the changes | Do not change |
@@ -64,6 +64,28 @@ name cannot pose as another chat or as the question's own text.
 
 A question longer than **20,000 characters** is refused, not cut; Claude is told to split the
 call into smaller ones.
+
+## Choosing first: deleting and new groups
+
+Two actions have a choice only you can make, so the tool asks for it before the usual question:
+
+- `tg_messages_delete` without `for_everyone`: **Delete these messages only for you or for
+  everyone?**, options **Only for you** and **For everyone**.
+- `tg_chats_create` with type `group` and no `group_kind`: **Create a basic group or a
+  supergroup?**, options **Basic group** and **Supergroup**. (Telegram's apps create a basic
+  group, which Telegram upgrades to a supergroup when it grows or needs a supergroup feature.)
+  A channel needs no choice.
+
+The tool answers `needs_choice` and prepares nothing; Claude asks you in the question box and
+calls again with your pick. Your last pick comes first, marked **(last used)**; with no last
+pick, the less far-reaching one comes first (only for you; a basic group). Then the usual
+question follows and names the scope: `Delete 1 message(s) in … for everyone?`,
+`Create a new basic group «…»?`, `Create a new supergroup «…»?`.
+
+Your last pick of each is kept in `choices.json` in the data folder (mode 0600), holding only
+`delete_scope` (`everyone` or `me`) and `group_kind` (`basic` or `supergroup`). It is written
+only after an action you allowed has run; a Deny or an unanswered question changes nothing. A
+missing or damaged file just means there is no last pick.
 
 ## What each tool checks before asking
 
