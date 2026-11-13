@@ -459,3 +459,48 @@ async def test_every_write_result_names_what_changed(
         {"chat": ALICE.id, "message_ids": [FIRST], "for_everyone": True},
     )
     assert deleted["data"] == {"chat_id": ALICE.id, "deleted": [FIRST], "for_everyone": True}
+
+
+async def test_a_photo_change_shows_and_uploads_the_admitted_file(
+    approval_hook: RawClient, claude: RawClient, world: FakeGateway, paths: FixedPaths
+) -> None:
+    photo = put_file(paths, "me.jpg", b"jpeg bytes")
+    profile_args = {"first_name": "Maks", "photo_path": "me.jpg"}
+    asked = await check(approval_hook, "tg_profile_edit", profile_args)
+    assert question_text(asked) == (
+        "Change your own profile?\nfirst_name: Test Person → Maks\n"
+        f"File: {photo}\nName: me.jpg, 0.0 KB (10 bytes)"
+    )
+    await answer(approval_hook, asked)
+    done = await call(claude, "tg_profile_edit", profile_args)
+    assert done["data"] == {"changed": ["first_name", "photo"]}
+    assert world.profile_photos == [b"jpeg bytes"]
+    chat_args = {"chat": FAMILY.id, "photo_path": str(photo)}
+    edited = await confirmed_run(approval_hook, claude, "tg_chats_edit", chat_args)
+    assert edited["data"] == {"chat_id": FAMILY.id, "changed": ["photo"]}
+    assert world.chat_photos == [(FAMILY.id, b"jpeg bytes")]
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("tg_profile_edit", {"photo_path": "me.jpg"}),
+        ("tg_chats_edit", {"chat": FAMILY.id, "photo_path": "me.jpg"}),
+    ],
+)
+async def test_a_photo_change_with_no_file_record_changes_nothing(
+    approval_hook: RawClient,
+    claude: RawClient,
+    broker: Broker,
+    world: FakeGateway,
+    paths: FixedPaths,
+    tool: str,
+    args: dict[str, Any],
+) -> None:
+    put_file(paths, "me.jpg", b"jpeg bytes")
+    await confirm(approval_hook, tool, args)
+    assert broker.registry.files is not None
+    broker.registry.files.clear()
+    done = await call(claude, tool, args)
+    assert done["error"]["code"] == "not_allowed"
+    assert write_calls(world, {"edit_own_profile", "edit_chat"}) == []
