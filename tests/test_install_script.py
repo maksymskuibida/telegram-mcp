@@ -14,6 +14,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,6 +89,16 @@ else:
     raise SystemExit(3)
 """
 
+GIT_STUB = """\
+#!/bin/sh
+# `git ls-remote --exit-code --tags <url> refs/tags/<tag>`: 0 found, 2 not found, 128 no network.
+printf '%s\\n' "$*" >> "{root}/git-calls"
+grep -qx UNREACHABLE "{root}/remote-tags" && exit 128
+for arg in "$@"; do last=$arg; done
+grep -qx "${{last#refs/tags/}}" "{root}/remote-tags" || exit 2
+exit 0
+"""
+
 HOOK_RUN_STUB = """\
 #!/bin/sh
 printf '%s\\n' "$*" > "$CLAUDE_PLUGIN_ROOT/warmup-args"
@@ -139,6 +150,7 @@ class Rig:
             "uname": f"#!/bin/sh\necho {system}\n",
             "uv": "#!/bin/sh\nexit 0\n",
             "uvx": "#!/bin/sh\nexit 0\n",
+            "git": GIT_STUB.format(root=self.root),
             "claude": f"#!{sys.executable}\n"
             + CLAUDE_STUB.format(
                 state=str(self.state_file), calls=str(self.calls_file), cache=str(self.cache)
@@ -151,7 +163,17 @@ class Rig:
                 write_program(self.bin / name, text)
         for version in ("0.1.0", "0.2.0"):
             self.set_warmup_status(version, 0)
+        self.set_remote_tags("v0.1.0", "v0.2.0")
         self.set_state(markets=[], plugins=[])
+
+    def set_remote_tags(self, *tags: str, unreachable: bool = False) -> None:
+        """The tags the stub `git ls-remote` finds on GitHub, or GitHub unreachable."""
+        text = "UNREACHABLE\n" if unreachable else "".join(f"{tag}\n" for tag in tags)
+        (self.root / "remote-tags").write_text(text)
+
+    def git_calls(self) -> list[str]:
+        calls = self.root / "git-calls"
+        return calls.read_text().splitlines() if calls.exists() else []
 
     def set_warmup_status(self, version: str, status: int) -> None:
         write_program(self.cache / version / "hooks" / "run", HOOK_RUN_STUB.format(status=status))
@@ -183,14 +205,16 @@ class Rig:
     def changing_calls(self) -> list[list[str]]:
         return [call for call in self.calls() if "--json" not in call]
 
-    def run(self, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, *args: str, stdin: str | None = None, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         command = ["/bin/sh", str(SCRIPT), *args] if stdin is None else ["/bin/sh", "-s", *args]
         return subprocess.run(
             command,
             input=stdin,
             capture_output=True,
             text=True,
-            env={"PATH": f"{self.bin}:{SYSTEM_PATH}", "HOME": str(self.root)},
+            env={"PATH": f"{self.bin}:{SYSTEM_PATH}", "HOME": str(self.root), **(env or {})},
             check=False,
             timeout=60,
         )
@@ -302,6 +326,71 @@ def test_a_newer_tag_removes_the_old_copy_then_installs_the_new_one(rig: Rig) ->
     assert [m["ref"] for m in state["markets"]] == ["v0.2.0"]
     assert [p["version"] for p in state["plugins"]] == ["0.2.0"]
     assert (rig.cache / "0.2.0" / "warmup-args").exists()
+
+
+def test_a_move_checks_the_tag_on_github_before_removing_anything(rig: Rig) -> None:
+    rig.install_at("v0.1.0")
+    rig.run("--tag", "v0.2.0")
+    assert rig.git_calls() == [
+        f"ls-remote --exit-code --tags https://github.com/{REPO}.git refs/tags/v0.2.0"
+    ]
+
+
+def test_a_move_to_a_tag_that_does_not_exist_changes_nothing(rig: Rig) -> None:
+    rig.install_at("v0.1.0")
+    before = rig.state()
+    result = rig.run("--tag", "v9.9.9")
+    assert result.returncode == 2
+    assert "v9.9.9 does not exist" in result.stderr
+    assert "Nothing was changed" in result.stderr
+    assert rig.changing_calls() == []
+    assert rig.state() == before
+
+
+def test_a_move_with_github_unreachable_changes_nothing(rig: Rig) -> None:
+    rig.install_at("v0.1.0")
+    rig.set_remote_tags(unreachable=True)
+    before = rig.state()
+    result = rig.run("--tag", "v0.2.0")
+    assert result.returncode == 2
+    assert "could not reach" in result.stderr
+    assert "git exit 128" in result.stderr
+    assert rig.changing_calls() == []
+    assert rig.state() == before
+
+
+def test_a_fresh_install_does_not_need_to_ask_github_first(rig: Rig) -> None:
+    rig.set_remote_tags()
+    result = rig.run()
+    assert result.returncode == 0, result.stderr
+    assert rig.git_calls() == []
+
+
+def test_a_warm_up_past_its_limit_is_ended_with_everything_it_started(rig: Rig) -> None:
+    pid_file = rig.root / "slow-child.pid"
+    write_program(
+        rig.cache / "0.1.0" / "hooks" / "run",
+        f"#!/bin/sh\nsleep 30 &\necho $! > '{pid_file}'\nwait\n",
+    )
+    started = time.monotonic()
+    result = rig.run(env={"TELEGRAM_MCP_WARMUP_SECONDS": "2"})
+    assert time.monotonic() - started < 20
+    assert result.returncode == 0, result.stderr
+    assert "warning: the guard hook did not finish its first run" in result.stderr
+    assert "Terminated" not in result.stderr + result.stdout
+    child = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and process_alive(child):
+        time.sleep(0.1)
+    assert not process_alive(child)
+
+
+def process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def test_a_marketplace_at_the_tag_with_the_plugin_missing_installs_the_plugin_only(

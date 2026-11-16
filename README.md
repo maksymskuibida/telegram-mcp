@@ -61,8 +61,9 @@ What the script does, in order:
 2. **Reads** what Claude Code has installed (`claude plugin marketplace list --json` and
    `claude plugin list --json`).
    - Already installed at this tag: it says so and changes nothing.
-   - Installed at another tag: it removes that copy and installs this one, so the MCP server
-     and the hooks move together.
+   - Installed at another tag: it first checks with `git ls-remote` that the tag exists on
+     GitHub (if it does not, or GitHub cannot be reached, it refuses and changes nothing), then
+     removes that copy and installs this one, so the MCP server and the hooks move together.
    - A marketplace named `telegram-mcp` added from somewhere else (a local folder, another
      repository): it refuses and changes nothing; run `--uninstall` first.
 3. **Installs** the plugin for your user, pinned to the tag:
@@ -206,11 +207,11 @@ device (Settings → Devices).
 
 ## Update or roll back
 
-A release is a git tag `vX.Y.Z`. To move to another release, newer or older, run the install
-command with that tag:
+A release is a git tag `vX.Y.Z`. To move to another release, newer or older, run that
+release's own install script (replace both `vX.Y.Z` with the tag):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maksymskuibida/telegram-mcp/v0.1.0/install.sh | sh -s -- --tag vX.Y.Z
+curl -fsSL https://raw.githubusercontent.com/maksymskuibida/telegram-mcp/vX.Y.Z/install.sh | sh -s -- --tag vX.Y.Z
 ```
 
 The script removes the installed copy and installs the tag you named; your login, settings and
@@ -281,8 +282,16 @@ is listed, with what has been checked so far, in
   earlier run of the tool, possibly under another Python that uv installed. Choose
   **Always Allow** for the tool to use them; with **Deny** the tool reports the Keychain as
   unavailable. (Whether and when this prompt appears is not verified yet.)
-- **"A login is running in another terminal."** A `telegram-mcp login` is still open
-  somewhere. Finish or cancel it (Ctrl-C), then try again.
+- **"Another login is already running in a terminal."** (from `login`) or **"A login is
+  running in another terminal."** (from `status` and `logout`). A `telegram-mcp login` is still
+  open somewhere. Finish or cancel it (Ctrl-C), then try again.
+- **`telegram-mcp` fails with a path error after an update or an uninstall.** The alias in
+  `~/.zshrc` still names the old plugin folder. Replace it with the line the install script
+  printed for the new tag (or remove it after an uninstall).
+- **The install stops while cloning from GitHub** on a Mac with no GitHub SSH key. Claude Code
+  may try SSH first; tell git to use HTTPS for GitHub, then run the install again:
+  `git config --global url."https://github.com/".insteadOf git@github.com:` (whether this is
+  needed is not verified yet).
 - **Two Claude Code sessions at once** (say, the terminal and the desktop app) share one
   Telegram connection through one background process; you do not need to close either. The
   background process stops by itself after 10 minutes without calls.

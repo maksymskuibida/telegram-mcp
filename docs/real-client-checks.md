@@ -32,6 +32,7 @@ person, sending must not be treated as safe.
 | 19 | After that install, a session in the desktop app's Code tab lists the same tools and the hooks are active there | | | | | **Not verified.** |
 | 20 | Running the install command again for the same tag says nothing changed; running it with a newer tag moves both the MCP server and the hooks to that tag (`claude plugin list` shows the new version, `/mcp` the new server) | | | | | **Not verified.** The script is tested against a stub `claude` command line only. |
 | 21 | `--uninstall` removes the plugin, its MCP server and its hooks from Claude Code, and after `telegram-mcp logout` the three Keychain items are gone | | | | | **Not verified.** The script is tested against a stub `claude` command line only. |
+| 22 | On a Mac with no GitHub SSH key (and github.com not in `known_hosts`), the install command still clones the repository (Claude Code falls back to HTTPS), with no GitHub account needed | | | | | **Not verified.** A real install on a machine with GitHub SSH access cloned via SSH first. If it fails without SSH, the README's troubleshooting gives the `insteadOf` setting. |
 
 ## Manual smoke test (before each release)
 

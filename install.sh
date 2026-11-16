@@ -18,7 +18,7 @@ DEFAULT_TAG="v0.1.0"
 REPO="maksymskuibida/telegram-mcp"
 MARKETPLACE="telegram-mcp"
 PLUGIN_ID="telegram-mcp@telegram-mcp"
-WARMUP_SECONDS=120
+WARMUP_SECONDS=${TELEGRAM_MCP_WARMUP_SECONDS:-120}
 UV_INSTALL_URL="https://docs.astral.sh/uv/getting-started/installation/"
 CLAUDE_INSTALL_URL="https://code.claude.com/docs/en/setup"
 DATA_DIR="${HOME:-~}/Library/Application Support/telegram-mcp"
@@ -147,6 +147,19 @@ state_field() {
     printf '%s\n' "$state" | sed -n "s/^$1=//p"
 }
 
+# Before a move removes anything: the tag must exist on GitHub and GitHub must be reachable,
+# so a typo or no network never leaves the machine with nothing installed.
+check_tag_exists() {
+    tag_status=0
+    git ls-remote --exit-code --tags "https://github.com/$REPO.git" "refs/tags/$tag" \
+        </dev/null >/dev/null 2>&1 || tag_status=$?
+    case "$tag_status" in
+        0) return 0 ;;
+        2) refuse "the release tag $tag does not exist in https://github.com/$REPO. Nothing was changed." ;;
+        *) refuse "could not reach https://github.com/$REPO to check $tag (git exit $tag_status). Nothing was changed; check the network (and that git works: xcode-select --install) and run this again." ;;
+    esac
+}
+
 reinstall_hint() {
     if [ -n "$1" ] && is_tag "$1"; then
         say "curl -fsSL https://raw.githubusercontent.com/$REPO/$1/install.sh | sh"
@@ -191,7 +204,16 @@ check_installed() {
     fail "$message"
 }
 
+# Ends a process and every process under it (a hook run starts uvx, which starts Python).
+kill_tree() {
+    for child in $(pgrep -P "$1" 2>/dev/null); do
+        kill_tree "$child"
+    done
+    kill "$1" 2>/dev/null || true
+}
+
 # Runs a command with a time limit; macOS has no `timeout`. Answers the command's exit status.
+# At the limit the command and everything it started are ended, so nothing keeps running.
 run_limited() {
     limit=$1
     shift
@@ -203,12 +225,13 @@ run_limited() {
             sleep 1
             n=$((n + 1))
         done
-        kill "$job" 2>/dev/null
+        kill -0 "$job" 2>/dev/null && kill_tree "$job"
     ) >/dev/null 2>&1 &
     watcher=$!
     job_status=0
-    wait "$job" || job_status=$?
+    wait "$job" 2>/dev/null || job_status=$?
     kill "$watcher" >/dev/null 2>&1 || true
+    wait "$watcher" 2>/dev/null || true
     return "$job_status"
 }
 
@@ -255,6 +278,9 @@ install() {
         say "The telegram-mcp marketplace is at $tag but the plugin is missing; installing it."
     else
         [ "$mp_kind" = "ours" ] && previous=$mp_ref
+        if [ "$mp_kind" = "ours" ] || [ "$plugin_installed" = "1" ]; then
+            check_tag_exists
+        fi
         [ -n "$previous" ] && say "Moving telegram-mcp from $previous to $tag."
         remove_previous
     fi

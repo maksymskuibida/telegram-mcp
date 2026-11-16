@@ -51,6 +51,7 @@ def test_the_readme_install_command_names_the_same_tag() -> None:
     named = set(
         re.findall(r"raw\.githubusercontent\.com/maksymskuibida/telegram-mcp/([^/]+)/", readme)
     )
-    assert named == {tag}
+    # Every URL names this release, or the vX.Y.Z placeholder of the update command.
+    assert named == {tag, "vX.Y.Z"}
     pinned = set(re.findall(r"maksymskuibida/telegram-mcp#(v\d[^\s`]*)", readme))
     assert pinned == {tag}
