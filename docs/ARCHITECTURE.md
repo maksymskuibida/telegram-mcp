@@ -569,11 +569,50 @@ an Allowed run (see [confirmation-rules.md](confirmation-rules.md)).
 A refused `outbox_dir` stops file sends only, and a refused `downloads_dir` stops downloads
 only. The log names a sent or downloaded file by path, name and size, never its content.
 
+## Packaging and install
+
+The repository is itself the Claude Code plugin and a one-plugin marketplace
+(`.claude-plugin/marketplace.json`, plugin source `./`). The plugin declares the MCP server in
+`.mcp.json` and the three hooks in `hooks/hooks.json`; both run
+`uvx --constraints constraints.txt --from ${CLAUDE_PLUGIN_ROOT} telegram-mcp …`, so the
+installed plugin folder is the package source, and the server and the hooks always run the
+same code.
+
+`install.sh` installs with
+`claude plugin install telegram-mcp --marketplace maksymskuibida/telegram-mcp#<tag> --scope user`,
+which adds the marketplace pinned to the release tag and installs the plugin from that clone.
+The tag pinned on the marketplace source is the only version choice: there is no other
+version setting to keep in step.
+
+The script reads the state from `claude plugin marketplace list --json` (the marketplace's
+`source`, `repo` and `ref`) and `claude plugin list --json` (the plugin's `id`, `scope` and
+`installPath`), parsed with `osascript -l JavaScript` so it needs nothing beyond macOS. Same
+repository and tag with the plugin present: nothing changes. A marketplace with the same name
+from another source: it refuses. Otherwise it installs, then reads the state again and fails
+unless the marketplace is at the tag and the plugin is listed.
+
+**Moving to another tag is uninstall, remove the marketplace, install.** `claude plugin update`
+never moves a marketplace pinned to a tag, and a marketplace's source cannot be changed in
+place, so the script removes the old copy first. If the new install then fails, the old version
+is gone; the script says so and prints the command that reinstalls the previous tag.
+
+After installing, it runs `hooks/run guard` once with `{}` on standard input (at most 120 s),
+so uv has every package cached before Claude Code's first call: a warm start takes about half a
+second against about five seconds cold, well inside the guard's 10 s timeout. A failed warm-up
+is a warning, never a reason to undo the install.
+
+`--uninstall` uninstalls the plugin and removes the marketplace. It never deletes the data
+folder or the Keychain items: logging out first is the person's step, so that Telegram ends
+the session too.
+
+Fixed paths and the Keychain service name change only together with a migration step in the
+install script.
+
 ## What is not here yet
 
 This version has phone and QR-code login, logout, status, the log command and the 30 tools of
-the catalogue above, with the guard hook above, a shared Telegram connection, idle exit and log
-rotation. Folder ids above 1 from `tg_folders_list` are your custom folders; `tg_chats_list`
+the catalogue above, with the guard hook above, a shared Telegram connection, idle exit, log
+rotation and the one-command install script. Folder ids above 1 from `tg_folders_list` are your custom folders; `tg_chats_list`
 lists the main list (0) and the archive (1) by folder. The guard covers Claude's own tools only: another program
 running as the same macOS user can still read `broker.secret`. This version is for trying out,
 not for daily use.
