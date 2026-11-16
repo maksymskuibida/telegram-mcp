@@ -42,6 +42,12 @@ jobs:
       - name: Types
         run: uv run mypy --strict src tests scripts
 
+      - name: Install shellcheck
+        run: brew install shellcheck
+
+      - name: Shell scripts
+        run: shellcheck install.sh hooks/run
+
       - name: Tests with coverage (90% floor)
         run: uv run pytest --cov=telegram_mcp --cov-branch --cov-report=term-missing --cov-fail-under=90
 

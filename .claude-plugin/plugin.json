@@ -3,5 +3,7 @@
   "version": "0.1.0",
   "description": "Use your own Telegram account from Claude Code. Reading is free; every message sent asks you first in a question box.",
   "author": { "name": "maksymskuibida" },
-  "repository": "https://github.com/maksymskuibida/telegram-mcp"
+  "homepage": "https://github.com/maksymskuibida/telegram-mcp",
+  "repository": "https://github.com/maksymskuibida/telegram-mcp",
+  "keywords": ["telegram", "mcp", "messaging", "confirmation", "macos"]
 }

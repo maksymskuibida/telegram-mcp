@@ -5,6 +5,7 @@
 - macOS (the tool supports macOS only).
 - [uv](https://docs.astral.sh/uv/) 0.12 or later on `PATH`. `uv` installs Python 3.12 or later
   and the locked dependencies; nothing else is needed.
+- [shellcheck](https://www.shellcheck.net/) for the shell scripts (`brew install shellcheck`).
 - For a real login: your own Telegram `api_id` and `api_hash` from
   [my.telegram.org](https://my.telegram.org). The package ships no app credentials.
 
@@ -17,6 +18,7 @@ uv sync --locked
 uv run ruff check
 uv run ruff format --check
 uv run mypy --strict src tests scripts
+shellcheck install.sh hooks/run
 uv run pytest --cov=telegram_mcp --cov-branch --cov-report=term-missing --cov-fail-under=90
 uv run python scripts/check_constraints.py
 uv run pip-audit -r constraints.txt --disable-pip --no-deps
@@ -32,6 +34,14 @@ home, so no test reads or writes your real Keychain or data folder.
 
 The confirmation logic (`consent.py`), the broker's approval path and the hooks were written
 test-first, and every branch of them is covered.
+
+The install script `install.sh` is tested in `tests/test_install_script.py` as a real process:
+each test puts stub `claude`, `uv`, `uvx` and `uname` programs first on `PATH` (then only
+`/usr/bin:/bin`, for `osascript` and the shell's own tools). The `claude` stub keeps the
+marketplace and plugin state in a JSON file, applies install, uninstall and marketplace remove
+to it and records every call, and the installed plugin folder holds a stub `hooks/run` that
+records the guard warm-up. No test runs the real `claude`, `uv` or `uvx`. Coverage does not
+measure shell, so every exit path of the script has its own test instead.
 
 ## Dependencies
 
@@ -64,6 +74,9 @@ claude plugin marketplace add /path/to/telegram-mcp
 claude plugin install telegram-mcp@telegram-mcp
 ```
 
+The install script refuses to install over a copy added from a local folder; run
+`sh install.sh --uninstall` first.
+
 Then log in once, in a terminal (not inside Claude Code):
 
 ```bash
@@ -83,6 +96,35 @@ The session is stored in the macOS Keychain only.
 | `telegram-mcp serve` | Claude Code (the plugin's MCP server) | |
 | `telegram-mcp hook approval-pre` / `approval-post` | Claude Code, through `hooks/run` | always prints one JSON answer; `hooks/run` exits 2 when it cannot |
 | `telegram-mcp broker` | the other commands, on demand | |
+
+## Cut a release
+
+A release is a semantic-version tag `vX.Y.Z` on `main`, cut by hand once the checks pass.
+Rolling back is installing the previous tag with the install script.
+
+1. On a branch, set the new version in the four places `tests/test_release_version.py`
+   checks: `version` in `pyproject.toml`, `__version__` in `src/telegram_mcp/__init__.py`,
+   `version` in `.claude-plugin/plugin.json` and in the plugin entry of
+   `.claude-plugin/marketplace.json`. Then set `DEFAULT_TAG` in `install.sh` and every
+   `vX.Y.Z` in the README's install commands to the new tag; the same test checks them.
+   `tests/test_smoke.py` also names the version. Run `uv lock` so the lock records it.
+2. Run the checks above; all must pass.
+3. Open a pull request, wait for CI, squash-merge it.
+4. Tag the merge commit on `main` and push the tag:
+
+   ```bash
+   git switch main && git pull
+   git tag -a vX.Y.Z -m "telegram-mcp vX.Y.Z"
+   git push origin vX.Y.Z
+   ```
+
+5. Write the release notes on GitHub from the squashed commits since the previous tag
+   (`git log --oneline vPREVIOUS..vX.Y.Z`).
+6. Install the tag on your own Mac with the README's command and run the manual smoke test in
+   [real-client-checks.md](real-client-checks.md); record what you checked there.
+
+Fixed paths and the Keychain service name change only together with a migration step in
+`install.sh`.
 
 ## Real-client checks
 

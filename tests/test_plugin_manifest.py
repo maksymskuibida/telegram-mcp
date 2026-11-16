@@ -51,6 +51,24 @@ def test_the_plugin_and_marketplace_name_one_plugin_from_this_folder() -> None:
     assert plugin["version"] == version[1]
 
 
+PUBLIC_REPOSITORY = "https://github.com/maksymskuibida/telegram-mcp"
+
+
+def test_the_marketplace_entry_carries_the_plugin_version() -> None:
+    plugin = load(".claude-plugin/plugin.json")
+    (entry,) = load(".claude-plugin/marketplace.json")["plugins"]
+    assert entry["version"] == plugin["version"]
+
+
+def test_the_plugin_points_to_the_public_repository() -> None:
+    plugin = load(".claude-plugin/plugin.json")
+    assert plugin["homepage"] == PUBLIC_REPOSITORY
+    assert plugin["repository"] == PUBLIC_REPOSITORY
+    assert "telegram" in plugin["keywords"]
+    # A licence field names a licence file; the repository has none yet.
+    assert "license" not in plugin or any(ROOT.glob("LICEN[CS]E*"))
+
+
 def test_the_server_runs_the_pinned_versions() -> None:
     servers = load(".mcp.json")["mcpServers"]
     assert list(servers) == ["telegram"]
