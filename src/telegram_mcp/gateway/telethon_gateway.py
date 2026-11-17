@@ -9,7 +9,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import Any, BinaryIO, Literal, TypeVar
+from typing import Any, Literal, TypeVar
 
 from telethon import TelegramClient, errors, functions, utils
 from telethon.sessions import StringSession
@@ -26,17 +26,20 @@ from telegram_mcp.gateway.models import (
     ChatType,
     CodeDelivery,
     CodeExpired,
+    FileReferenceExpired,
     FloodWait,
     FolderRef,
     GatewayError,
     GatewayTimeout,
     Me,
+    MediaInfo,
     MediaRef,
     MessageView,
     NotAUser,
     NotAuthorized,
     OutcomeUnknown,
     OwnProfile,
+    PartRetryable,
     PasswordNeeded,
     PersonInfo,
     QrExpired,
@@ -50,6 +53,7 @@ from telegram_mcp.gateway.models import (
     TopicInfo,
     TopicNotFound,
     UnreadState,
+    UploadedFile,
     UserNotFound,
     decode_cursor,
     encode_cursor,
@@ -85,17 +89,22 @@ class TelethonGateway:
         self._own_id: int | None = None
         self._own_id_read = False
         self._qr: Any = None
+        # The message read for a download, kept so each part does not read it again; dropped
+        # when its file reference expires (BR28.3).
+        self._media: dict[tuple[int, int], Any] = {}
 
     async def _call(
         self,
         make: Callable[[], Awaitable[T]],
         *,
         write: bool = False,
+        part: bool = False,
         extra_seconds: float = 0.0,
     ) -> T:
         """Run one Telegram call with the 30 s limit (plus ``extra_seconds`` for a call that
         waits on purpose, like a QR scan), mapping every failure to a gateway error. For a
-        write, any failure after the connection is up is ``OutcomeUnknown``."""
+        write, any failure after the connection is up is ``OutcomeUnknown``; for a file part,
+        a timeout or a lost connection is ``PartRetryable`` (BR28.3)."""
         await self._ensure_connected()
         try:
             return await asyncio.wait_for(make(), self._timeout + extra_seconds)
@@ -104,6 +113,8 @@ class TelethonGateway:
         except errors.RPCError as error:
             raise _map_rpc_error(error) from error
         except (TimeoutError, ConnectionError, OSError) as error:
+            if part:
+                raise PartRetryable() from error
             if write:
                 raise OutcomeUnknown() from error
             if isinstance(error, TimeoutError):
@@ -555,14 +566,66 @@ class TelethonGateway:
             has_photo=user.photo is not None,
         )
 
-    async def download_media(
-        self, chat_id: int, message_id: int, file_obj: BinaryIO, max_bytes: int
-    ) -> int:
+    async def media_info(self, chat_id: int, message_id: int) -> MediaInfo | None:
+        """Read the message once more (a fresh file reference) and keep it for the parts."""
         found = await self._messages(chat_id, ids=[message_id])
-        if not found or found[0].media is None:
-            raise TelegramError("MEDIA_EMPTY")
-        await self._call(lambda: self._client.download_media(found[0], file=file_obj))
-        return int(file_obj.tell())
+        if not found:
+            raise TelegramError("MESSAGE_ID_INVALID")
+        message = found[0]
+        media = _media(message)
+        if media is None or getattr(message, "file", None) is None:
+            self._media.pop((chat_id, message_id), None)
+            return None
+        self._media[(chat_id, message_id)] = message
+        return MediaInfo(
+            kind=media.kind, size_bytes=media.size_bytes or None, file_name=media.file_name
+        )
+
+    async def download_part(self, chat_id: int, message_id: int, offset: int, limit: int) -> bytes:
+        """One part through ``iter_download`` at ``offset``, one request of ``limit`` bytes."""
+        message = self._media.get((chat_id, message_id))
+        if message is None:
+            if await self.media_info(chat_id, message_id) is None:
+                raise TelegramError("MEDIA_EMPTY")
+            message = self._media[(chat_id, message_id)]
+        size = getattr(message.file, "size", None) or None
+
+        async def fetch() -> list[bytes]:
+            chunks = self._client.iter_download(
+                message.media,
+                offset=offset,
+                request_size=limit,
+                chunk_size=limit,
+                limit=1,
+                file_size=size,
+            )
+            try:
+                return [bytes(chunk) async for chunk in chunks]
+            except (errors.FileReferenceExpiredError, errors.FileReferenceInvalidError) as error:
+                raise FileReferenceExpired() from error
+
+        try:
+            found = await self._call(fetch, part=True)
+        except FileReferenceExpired:
+            self._media.pop((chat_id, message_id), None)  # media_info reads it again
+            raise
+        return found[0] if found else b""
+
+    async def upload_part(
+        self, file_id: int, index: int, total: int, data: bytes, big: bool
+    ) -> None:
+        """``SaveFilePartRequest`` for a file of at most 10 MB, ``SaveBigFilePartRequest``
+        above that; each part one request under the 30 s limit."""
+        request: Any = (
+            functions.upload.SaveBigFilePartRequest(
+                file_id=file_id, file_part=index, file_total_parts=total, bytes=data
+            )
+            if big
+            else functions.upload.SaveFilePartRequest(file_id=file_id, file_part=index, bytes=data)
+        )
+        stored = await self._call(lambda: self._client(request), part=True)
+        if stored is False:
+            raise TelegramError("the file part was not stored")
 
     # U4 writes: any failure after the connection is up is OutcomeUnknown (NFR6). -------------
 
@@ -716,19 +779,7 @@ class TelethonGateway:
             write=True,
         )
 
-    async def _uploaded(self, photo: BinaryIO, name: str | None) -> Any:
-        return await self._call(
-            lambda: self._client.upload_file(photo, file_name=name or "photo.jpg"), write=True
-        )
-
-    async def edit_chat(
-        self,
-        chat_id: int,
-        title: str | None,
-        description: str | None,
-        photo: BinaryIO | None,
-        photo_name: str | None,
-    ) -> None:
+    async def edit_chat(self, chat_id: int, title: str | None, description: str | None) -> None:
         entity = await self._entity(chat_id)
         basic = isinstance(entity, types.Chat)
         if title is not None:
@@ -742,14 +793,6 @@ class TelethonGateway:
             peer = utils.get_input_peer(entity)
             request = functions.messages.EditChatAboutRequest(peer=peer, about=description)
             await self._request(request, write=True)
-        if photo is not None:
-            chat_photo = types.InputChatUploadedPhoto(file=await self._uploaded(photo, photo_name))
-            request = (
-                functions.messages.EditChatPhotoRequest(chat_id=entity.id, photo=chat_photo)
-                if basic
-                else functions.channels.EditPhotoRequest(channel=entity, photo=chat_photo)
-            )
-            await self._request(request, write=True)
 
     async def edit_own_profile(
         self,
@@ -757,8 +800,6 @@ class TelethonGateway:
         last_name: str | None,
         bio: str | None,
         username: str | None,
-        photo: BinaryIO | None,
-        photo_name: str | None,
     ) -> None:
         if (first_name, last_name, bio) != (None, None, None):
             request: Any = functions.account.UpdateProfileRequest(
@@ -767,23 +808,34 @@ class TelethonGateway:
             await self._request(request, write=True)
         if username is not None:
             await self._request(functions.account.UpdateUsernameRequest(username), write=True)
-        if photo is not None:
-            uploaded = await self._uploaded(photo, photo_name)
-            request = functions.photos.UploadProfilePhotoRequest(file=uploaded)
-            await self._request(request, write=True)
 
-    async def send_file(
-        self, chat_id: int, file_obj: BinaryIO, name: str, caption: str
+    # U4 final requests of an upload: one write each, never retried (BR28.5). ----------------
+
+    async def send_uploaded_file(
+        self, chat_id: int, uploaded: UploadedFile, caption: str
     ) -> SentMessage:
-        """Upload from the open file the sandbox checked, under its approved name."""
-        uploaded = await self._call(
-            lambda: self._client.upload_file(file_obj, file_name=name), write=True
-        )
+        """Send the stored parts as one file under its approved name, with its caption."""
         message = await self._call(
-            lambda: self._client.send_file(chat_id, uploaded, caption=caption, parse_mode=None),
+            lambda: self._client.send_file(
+                chat_id, _input_file(uploaded), caption=caption, parse_mode=None
+            ),
             write=True,
         )
         return SentMessage(id=int(message.id), chat_id=chat_id, date=message.date)
+
+    async def set_chat_photo(self, chat_id: int, uploaded: UploadedFile) -> None:
+        entity = await self._entity(chat_id)
+        photo = types.InputChatUploadedPhoto(file=_input_file(uploaded))
+        request: Any = (
+            functions.messages.EditChatPhotoRequest(chat_id=entity.id, photo=photo)
+            if isinstance(entity, types.Chat)
+            else functions.channels.EditPhotoRequest(channel=entity, photo=photo)
+        )
+        await self._request(request, write=True)
+
+    async def set_profile_photo(self, uploaded: UploadedFile) -> None:
+        request = functions.photos.UploadProfilePhotoRequest(file=_input_file(uploaded))
+        await self._request(request, write=True)
 
 
 _SENT_TYPES: tuple[tuple[type[Any], CodeDelivery], ...] = (
@@ -805,6 +857,15 @@ _NEXT_TYPES: tuple[tuple[type[Any], CodeDelivery], ...] = (
     (types.auth.CodeTypeMissedCall, "missed_call"),
     (types.auth.CodeTypeFragmentSms, "fragment"),
 )
+
+
+def _input_file(uploaded: UploadedFile) -> Any:
+    """The stored parts as Telegram's InputFile (with the checksum) or InputFileBig."""
+    if uploaded.big:
+        return types.InputFileBig(id=uploaded.file_id, parts=uploaded.parts, name=uploaded.name)
+    return types.InputFile(
+        id=uploaded.file_id, parts=uploaded.parts, name=uploaded.name, md5_checksum=uploaded.md5
+    )
 
 
 def _delivery(value: Any, table: tuple[tuple[type[Any], CodeDelivery], ...]) -> CodeDelivery:

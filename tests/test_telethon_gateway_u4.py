@@ -6,7 +6,6 @@ is outcome_unknown."""
 from __future__ import annotations
 
 import asyncio
-import io
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -18,13 +17,16 @@ from telethon.tl import types
 from telegram_mcp.gateway.models import (
     SAVED_MESSAGES,
     ChatNotFound,
+    FileReferenceExpired,
     FolderRef,
+    MediaInfo,
     NotAUser,
     OutcomeUnknown,
+    PartRetryable,
     TelegramError,
-    TooLarge,
     TopicInfo,
     TopicNotFound,
+    UploadedFile,
     UserNotFound,
 )
 from telegram_mcp.gateway.telethon_gateway import TelethonGateway
@@ -93,6 +95,7 @@ class Stub:
         self.permissions: Any = SimpleNamespace(is_creator=False, is_admin=False)
         self.fail: dict[str, BaseException | str] = {}
         self.session = SimpleNamespace(save=lambda: "s")
+        self.media_data = b""
 
     async def _record(self, name: str, *args: Any, **kwargs: Any) -> None:
         self.calls.append((name, args, kwargs))
@@ -147,9 +150,23 @@ class Stub:
         await self._record("get_permissions", chat, user)
         return self.permissions
 
-    async def download_media(self, found: Any, file: Any) -> None:
-        await self._record("download_media", found.id)
-        file.write(b"x" * found.file.size)
+    def iter_download(self, media: Any, **options: Any) -> Any:
+        """One part of ``media_data`` at the offset asked, as Telethon's iterator yields it."""
+        self.calls.append(("iter_download", (media,), options))
+        how = self.fail.pop("iter_download", None)
+        data = self.media_data
+
+        async def chunks() -> Any:
+            if how == "hang":
+                await asyncio.Event().wait()
+            if isinstance(how, BaseException):
+                raise how
+            start = options["offset"]
+            piece = data[start : start + options["request_size"]]
+            if piece:
+                yield piece
+
+        return chunks()
 
     async def edit_message(self, *args: Any, **kwargs: Any) -> Any:
         await self._record("edit_message", *args, **kwargs)
@@ -167,10 +184,6 @@ class Stub:
 
     async def unpin_message(self, *args: Any, **kwargs: Any) -> None:
         await self._record("unpin_message", *args, **kwargs)
-
-    async def upload_file(self, file: Any, **kwargs: Any) -> Any:
-        await self._record("upload_file", file.read(), **kwargs)
-        return types.InputFile(id=1, parts=1, name=kwargs.get("file_name", ""), md5_checksum="")
 
     async def send_file(self, *args: Any, **kwargs: Any) -> Any:
         await self._record("send_file", *args, **kwargs)
@@ -416,17 +429,93 @@ async def test_own_profile(gateway: TelethonGateway, stub: Stub) -> None:
     )
 
 
-async def test_download_writes_into_the_given_file(gateway: TelethonGateway, stub: Stub) -> None:
-    stub.messages = [message(3, media=object(), file=SimpleNamespace(size=5, name="a"))]
-    target = io.BytesIO()
-    assert await gateway.download_media(TEAM_ID, 3, target, 100) == 5
-    with pytest.raises(TooLarge):
-        await gateway.download_media(TEAM_ID, 3, io.BytesIO(), 4)
+def with_media(stub: Stub, data: bytes, *, size: int | None = None, name: str = "a.pdf") -> Any:
+    media = SimpleNamespace(kind="document")
+    file = SimpleNamespace(size=len(data) if size is None else size, name=name)
+    found = message(3, media=media, file=file, document=object())
+    stub.messages = [found]
+    stub.media_data = data
+    return media
+
+
+def downloads(stub: Stub) -> list[dict[str, Any]]:
+    return [call[2] for call in stub.calls if call[0] == "iter_download"]
+
+
+async def test_media_info_reads_kind_size_and_name(gateway: TelethonGateway, stub: Stub) -> None:
+    with_media(stub, b"12345", name="r.pdf")
+    assert await gateway.media_info(TEAM_ID, 3) == MediaInfo("document", 5, "r.pdf")
+    with_media(stub, b"", size=0)
+    assert (await gateway.media_info(TEAM_ID, 3)) == MediaInfo("document", None, "a.pdf")
     stub.messages = [message(3)]
-    with pytest.raises(TelegramError):
-        await gateway.download_media(TEAM_ID, 3, io.BytesIO(), 100)
-    assert [c[0] for c in stub.calls].count("download_media") == 1
+    assert await gateway.media_info(TEAM_ID, 3) is None  # a message with no media
+    stub.messages = []
+    with pytest.raises(TelegramError, match="MESSAGE_ID_INVALID"):
+        await gateway.media_info(TEAM_ID, 3)
     no_read_acknowledgement(stub)
+
+
+async def test_download_parts_use_iter_download_at_their_offsets(
+    gateway: TelethonGateway, stub: Stub
+) -> None:
+    media = with_media(stub, b"0123456789")
+    assert await gateway.download_part(TEAM_ID, 3, 0, 4) == b"0123"
+    assert await gateway.download_part(TEAM_ID, 3, 8, 4) == b"89"
+    assert await gateway.download_part(TEAM_ID, 3, 12, 4) == b""
+    asked = downloads(stub)
+    assert [(c["offset"], c["request_size"], c["limit"]) for c in asked] == [
+        (0, 4, 1),
+        (8, 4, 1),
+        (12, 4, 1),
+    ]
+    assert all(call[1] == (media,) for call in stub.calls if call[0] == "iter_download")
+    assert [c[0] for c in stub.calls].count("get_messages") == 1  # the message is read once
+    no_read_acknowledgement(stub)
+
+
+async def test_an_expired_file_reference_is_reported_and_the_message_read_again(
+    gateway: TelethonGateway, stub: Stub
+) -> None:
+    with_media(stub, b"0123456789")
+    stub.fail["iter_download"] = errors.FileReferenceExpiredError(None)
+    with pytest.raises(FileReferenceExpired):
+        await gateway.download_part(TEAM_ID, 3, 4, 4)
+    assert await gateway.download_part(TEAM_ID, 3, 4, 4) == b"4567"
+    assert [c[0] for c in stub.calls].count("get_messages") == 2
+
+
+async def test_a_part_that_times_out_or_drops_may_be_tried_again(stub: Stub) -> None:
+    gateway = TelethonGateway(
+        "", 1, "0" * 32, client_factory=lambda *a, **k: stub, call_timeout=0.05
+    )
+    with_media(stub, b"0123456789")
+    stub.fail["iter_download"] = "hang"
+    with pytest.raises(PartRetryable):
+        await gateway.download_part(TEAM_ID, 3, 0, 4)
+    stub.fail["iter_download"] = ConnectionError()
+    with pytest.raises(PartRetryable):
+        await gateway.download_part(TEAM_ID, 3, 0, 4)
+    stub.fail["call"] = "hang"
+    with pytest.raises(PartRetryable):
+        await gateway.upload_part(1, 0, 1, b"x", big=False)
+    stub.messages = [message(3)]
+    gateway_without = TelethonGateway("", 1, "0" * 32, client_factory=lambda *a, **k: stub)
+    with pytest.raises(TelegramError, match="MEDIA_EMPTY"):
+        await gateway_without.download_part(TEAM_ID, 3, 0, 4)
+
+
+async def test_small_files_use_save_file_part_and_big_ones_save_big_file_part(
+    gateway: TelethonGateway, stub: Stub
+) -> None:
+    await gateway.upload_part(77, 0, 2, b"abc", big=False)
+    await gateway.upload_part(78, 1, 30, b"def", big=True)
+    (small,) = requests_of(stub, functions.upload.SaveFilePartRequest)
+    assert (small.file_id, small.file_part, small.bytes) == (77, 0, b"abc")
+    (big,) = requests_of(stub, functions.upload.SaveBigFilePartRequest)
+    assert (big.file_id, big.file_part, big.file_total_parts, big.bytes) == (78, 1, 30, b"def")
+    stub.responses[functions.upload.SaveFilePartRequest] = False
+    with pytest.raises(TelegramError, match="not stored"):
+        await gateway.upload_part(77, 1, 2, b"x", big=False)
 
 
 # Writes ----------------------------------------------------------------------------------------
@@ -521,35 +610,65 @@ async def test_invite_links_and_admin_rights(gateway: TelethonGateway, stub: Stu
 
 
 async def test_editing_a_chat(gateway: TelethonGateway, stub: Stub) -> None:
-    await gateway.edit_chat(FAMILY_ID, "Fam 2", "About", io.BytesIO(b"img"), "p.jpg")
+    await gateway.edit_chat(FAMILY_ID, "Fam 2", "About")
     assert requests_of(stub, functions.messages.EditChatTitleRequest)[0].title == "Fam 2"
     assert requests_of(stub, functions.messages.EditChatAboutRequest)[0].about == "About"
-    assert len(requests_of(stub, functions.messages.EditChatPhotoRequest)) == 1
-    await gateway.edit_chat(TEAM_ID, "Team 2", None, None, None)
+    await gateway.edit_chat(TEAM_ID, "Team 2", None)
     assert requests_of(stub, functions.channels.EditTitleRequest)[0].title == "Team 2"
+    assert not requests_of(stub, functions.messages.EditChatPhotoRequest)
 
 
 async def test_editing_the_own_profile(gateway: TelethonGateway, stub: Stub) -> None:
-    await gateway.edit_own_profile("Ada", None, "bio", "ada_new", io.BytesIO(b"me"), "me.jpg")
+    await gateway.edit_own_profile("Ada", None, "bio", "ada_new")
     (profile,) = requests_of(stub, functions.account.UpdateProfileRequest)
     assert (profile.first_name, profile.last_name, profile.about) == ("Ada", None, "bio")
     assert requests_of(stub, functions.account.UpdateUsernameRequest)[0].username == "ada_new"
-    assert len(requests_of(stub, functions.photos.UploadProfilePhotoRequest)) == 1
     stub.requests.clear()
-    await gateway.edit_own_profile(None, None, None, "", None, None)
+    await gateway.edit_own_profile(None, None, None, "")
     assert [type(r) for r in stub.requests] == [functions.account.UpdateUsernameRequest]
 
 
-async def test_send_file_uploads_the_open_file_under_its_name(
+SMALL = UploadedFile(file_id=5, parts=2, name="r.pdf", big=False, md5="ab" * 16)
+BIG = UploadedFile(file_id=6, parts=40, name="film.mp4", big=True)
+
+
+async def test_the_final_send_uses_the_stored_parts_under_their_name(
     gateway: TelethonGateway, stub: Stub
 ) -> None:
-    sent = await gateway.send_file(TEAM_ID, io.BytesIO(b"report"), "r.pdf", "caption")
+    sent = await gateway.send_uploaded_file(TEAM_ID, SMALL, "caption")
     assert sent.id == 77
-    upload = next(c for c in stub.calls if c[0] == "upload_file")
-    assert upload[1] == (b"report",)
-    assert upload[2] == {"file_name": "r.pdf"}
-    send = next(c for c in stub.calls if c[0] == "send_file")
+    (send,) = [c for c in stub.calls if c[0] == "send_file"]
+    assert send[1][0] == TEAM_ID
+    assert send[1][1] == types.InputFile(id=5, parts=2, name="r.pdf", md5_checksum="ab" * 16)
     assert send[2] == {"caption": "caption", "parse_mode": None}
+    await gateway.send_uploaded_file(TEAM_ID, BIG, "")
+    assert stub.calls[-1][1][1] == types.InputFileBig(id=6, parts=40, name="film.mp4")
+
+
+async def test_photo_final_requests_use_the_stored_parts(
+    gateway: TelethonGateway, stub: Stub
+) -> None:
+    await gateway.set_chat_photo(FAMILY_ID, SMALL)
+    (basic,) = requests_of(stub, functions.messages.EditChatPhotoRequest)
+    assert basic.chat_id == FAMILY.id
+    assert basic.photo.file.id == SMALL.file_id
+    await gateway.set_chat_photo(TEAM_ID, SMALL)
+    assert len(requests_of(stub, functions.channels.EditPhotoRequest)) == 1
+    await gateway.set_profile_photo(BIG)
+    (profile,) = requests_of(stub, functions.photos.UploadProfilePhotoRequest)
+    assert profile.file == types.InputFileBig(id=6, parts=40, name="film.mp4")
+
+
+async def test_a_final_request_that_hangs_is_outcome_unknown(stub: Stub) -> None:
+    gateway = TelethonGateway(
+        "", 1, "0" * 32, client_factory=lambda *a, **k: stub, call_timeout=0.05
+    )
+    stub.fail["send_file"] = "hang"
+    with pytest.raises(OutcomeUnknown):
+        await gateway.send_uploaded_file(TEAM_ID, SMALL, "")
+    stub.fail["call"] = ConnectionError()
+    with pytest.raises(OutcomeUnknown):
+        await gateway.set_profile_photo(SMALL)
 
 
 async def test_a_hanging_write_times_out_as_outcome_unknown(stub: Stub) -> None:
