@@ -70,6 +70,36 @@ def start_upload(
         raise
 
 
+def start_photo_upload(
+    context: CatalogContext,
+    approval: PendingApproval,
+    changed: list[str],
+    *,
+    tool: str,
+    chat_id: int | None,
+    final: Callable[[AdmittedFile], FinalCall],
+    final_request: str,
+) -> Transfer:
+    """BR28.11: the photo of a chat or profile change, after its other fields changed. When the
+    photo cannot start, the refusal says which fields were already changed, so the person is
+    never told nothing happened when something did."""
+    try:
+        return start_upload(
+            context,
+            approval,
+            tool=tool,
+            chat_id=chat_id,
+            final=final,
+            final_request=final_request,
+        )
+    except PromptError as refused:
+        if not changed:
+            raise
+        applied = ", ".join(changed)
+        message = f"{refused.message} The photo was not set, but these were changed: {applied}."
+        raise type(refused)(refused.code, message) from refused
+
+
 def starts_with_photo(args: dict[str, Any]) -> bool:
     return args.get("photo_path") is not None
 

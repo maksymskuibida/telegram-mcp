@@ -22,7 +22,7 @@ from telegram_mcp.catalog.common import (
     require_group,
     with_notice,
 )
-from telegram_mcp.catalog.media import start_upload, starts_with_photo
+from telegram_mcp.catalog.media import start_photo_upload, starts_with_photo
 from telegram_mcp.catalog.messages import approved, approved_chat
 from telegram_mcp.choices import CHOICE_NOT_SAVED
 from telegram_mcp.consent import PendingApproval, canonical_digest
@@ -321,9 +321,10 @@ def chat_edit_actions(context: CatalogContext) -> ConsentAction:
         if fields.file is None:
             return result
         assert approval is not None  # noqa: S101 (approved() checked it)
-        transfer = start_upload(
+        transfer = start_photo_upload(
             context,
             approval,
+            changed,
             tool=CHATS_EDIT,
             chat_id=chat.id,
             final=_chat_photo_final(chat.id),

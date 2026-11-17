@@ -505,4 +505,46 @@ async def test_a_photo_change_with_no_file_record_changes_nothing(
     broker.registry.files.clear()
     done = await call(claude, tool, args)
     assert done["error"]["code"] == "not_allowed"
+    assert "were changed" not in done["error"]["message"]
     assert write_calls(world, {"edit_own_profile", "edit_chat"}) == []
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "request_name", "fields"),
+    [
+        (
+            "tg_profile_edit",
+            {"first_name": "Maks", "bio": "Hi", "photo_path": "me.jpg"},
+            "edit_own_profile",
+            "first_name, bio",
+        ),
+        (
+            "tg_chats_edit",
+            {"chat": FAMILY.id, "title": "Kin", "photo_path": "me.jpg"},
+            "edit_chat",
+            "title",
+        ),
+    ],
+)
+async def test_a_photo_that_cannot_start_after_other_fields_changed_names_those_fields(
+    approval_hook: RawClient,
+    claude: RawClient,
+    broker: Broker,
+    world: FakeGateway,
+    paths: FixedPaths,
+    tool: str,
+    args: dict[str, Any],
+    request_name: str,
+    fields: str,
+) -> None:
+    put_file(paths, "me.jpg", b"jpeg bytes")
+    await confirm(approval_hook, tool, args)
+    assert broker.registry.files is not None
+    broker.registry.files.clear()  # the photo can no longer start
+    done = await call(claude, tool, args)
+    assert done["error"]["code"] == "not_allowed"
+    message = done["error"]["message"]
+    assert f"The photo was not set, but these were changed: {fields}." in message
+    assert [name for name, _ in write_calls(world, {request_name})] == [request_name]
+    assert world.final_requests() == []
+    assert broker.transfers.records() == []

@@ -7,7 +7,7 @@ from typing import Any
 
 from telegram_mcp.actions import ConsentAction
 from telegram_mcp.catalog.common import Args, CatalogContext, with_notice
-from telegram_mcp.catalog.media import start_upload, starts_with_photo
+from telegram_mcp.catalog.media import start_photo_upload, starts_with_photo
 from telegram_mcp.catalog.messages import approved
 from telegram_mcp.consent import PendingApproval, canonical_digest
 from telegram_mcp.files import admit_photo
@@ -75,13 +75,15 @@ def profile_edit_action(context: CatalogContext) -> ConsentAction:
                 values.get("bio"),
                 values.get("username"),
             )
-        result: dict[str, Any] = {"changed": list(values)}
+        changed = list(values)
+        result: dict[str, Any] = {"changed": changed}
         if fields.file is None:
             return result
         assert approval is not None  # noqa: S101 (approved() checked it)
-        transfer = start_upload(
+        transfer = start_photo_upload(
             context,
             approval,
+            changed,
             tool=PROFILE_EDIT,
             chat_id=None,
             final=lambda record: _set_profile_photo,
