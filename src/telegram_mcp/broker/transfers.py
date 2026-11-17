@@ -132,6 +132,7 @@ MESSAGES = {
     "too_large": "The file passed 4000 MiB, the largest file Telegram stores.",
     "not_started": "Other sends were still running, so the file was not sent.",
 }
+QUEUE_FULL_MESSAGE = "Too many file transfers are running; try again when one finishes."
 ACCEPTED_NOTE = (
     "The transfer runs in the background. Follow it with tg_transfers_list (transfer_id, and "
     "wait_seconds up to 25 to wait for its end); stop it with tg_transfers_cancel."

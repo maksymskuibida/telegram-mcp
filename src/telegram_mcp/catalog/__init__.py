@@ -11,7 +11,7 @@ from collections.abc import Callable
 from datetime import datetime
 
 from telegram_mcp.actions import ConsentAction
-from telegram_mcp.catalog import chats, media, messages, people, profile
+from telegram_mcp.catalog import chats, media, messages, people, profile, transfers
 from telegram_mcp.catalog.common import CatalogContext
 from telegram_mcp.choices import ChoiceStore
 from telegram_mcp.files import FileStore
@@ -35,4 +35,5 @@ def build_actions(
     for reads in (chats, messages, people, profile):
         actions.extend(reads.read_actions())
     actions.extend(media.read_actions(context))
+    actions.extend(transfers.read_actions(context))
     return context, actions

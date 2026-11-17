@@ -7,11 +7,13 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from telegram_mcp.activity_log import iso_utc
+from telegram_mcp.broker.transfers import TransferQueue
 from telegram_mcp.choices import ChoiceStore
-from telegram_mcp.files import FileStore
+from telegram_mcp.files import FileStore, free_space
 from telegram_mcp.gateway.models import ChatRef, MessageView, PersonInfo
 from telegram_mcp.gateway.protocol import TelegramGateway
 from telegram_mcp.paths import FixedPaths
@@ -28,12 +30,21 @@ MAX_LIST = 20
 @dataclass
 class CatalogContext:
     """What the catalogue's actions need besides the gateway: the fixed paths (folders and
-    the data folder) and the file records kept between a question and its send."""
+    the data folder), the file records kept between a question and its upload, and the
+    broker's background transfers, which the broker hands over when it starts (BR28.1)."""
 
     paths: FixedPaths
     files: FileStore
     clock: Callable[[], datetime]
     choices: ChoiceStore
+    transfers: TransferQueue | None = None
+    free_space: Callable[[Path], int] = free_space
+
+    def queue(self) -> TransferQueue:
+        """The broker's transfer queue; a registry used without a broker has none."""
+        if self.transfers is None:
+            raise PromptError("telegram_error", "File transfers run only inside the broker.")
+        return self.transfers
 
 
 LAST_USED = " (last used)"

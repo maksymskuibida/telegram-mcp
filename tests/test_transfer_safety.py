@@ -39,7 +39,7 @@ CONTENT = b"0123456789"  # three parts of 4 bytes
 
 
 @pytest.fixture
-def clock() -> ManualClock:  # type: ignore[override]
+def clock() -> ManualClock:
     """Replaces the catalogue's stepping clock: here time moves only when a test moves it."""
     return ManualClock()
 
@@ -351,7 +351,7 @@ async def test_a_full_queue_refuses_the_send_and_keeps_its_approval(
     await confirm(approval_hook, SEND, args)
     refused = await call(claude, SEND, args)
     assert refused["error"]["code"] == "telegram_error"
-    assert "too many file transfers" in refused["error"]["message"]
+    assert "too many file transfers" in refused["error"]["message"].lower()
     waiting = started[-1]["data"]["transfer_id"]
     assert (await call(claude, CANCEL, {"transfer_id": waiting}))["ok"]
     accepted = await call(claude, SEND, args)  # the same approval, still confirmed

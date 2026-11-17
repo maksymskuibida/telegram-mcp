@@ -75,6 +75,8 @@ INVITES_CREATE = "tg_invites_create"
 ADMINS_SET = "tg_admins_set"
 PROFILE_EDIT = "tg_profile_edit"
 FILES_SEND = "tg_files_send"
+TRANSFERS_LIST = "tg_transfers_list"
+TRANSFERS_CANCEL = "tg_transfers_cancel"
 
 READ_TOOLS = (
     CHATS_LIST,
@@ -89,6 +91,8 @@ READ_TOOLS = (
     USERS_INFO,
     PROFILE_GET,
     MEDIA_DOWNLOAD,
+    TRANSFERS_LIST,
+    TRANSFERS_CANCEL,
 )
 WRITE_KINDS: dict[str, str] = {
     MESSAGES_SEND: "send",
@@ -228,6 +232,7 @@ EMOJI_LIMIT = 16
 ABOUT_LIMIT = 255
 MAX_EXPIRE_SECONDS = 31_536_000
 MAX_USAGE_LIMIT = 99_999
+LIST_WAIT_LIMIT = 25
 
 
 def _schema(
@@ -337,11 +342,38 @@ _U4_SPECS: tuple[ToolSpec, ...] = (
     _read(PROFILE_GET, "Show your own profile: name, username, bio, phone and photo.", {}),
     _read(
         MEDIA_DOWNLOAD,
-        "Save a message's file (up to 20 MB) into your downloads folder and return its path, "
-        "name and size, never its content. It never replaces an existing file.",
+        "Save a message's file (up to 4000 MiB) into your downloads folder. It returns at once "
+        "with a transfer that runs in the background; tg_transfers_list shows its progress and, "
+        "when done, the file's path, name and size, never its content. It never replaces an "
+        "existing file.",
         {"chat": CHAT_PROPERTY, "message_id": MESSAGE_ID_PROPERTY},
         "chat",
         "message_id",
+    ),
+    _read(
+        TRANSFERS_LIST,
+        "Show the background file transfers (sends and downloads), newest first: state, "
+        "progress, and at the end the result or why it stopped. With transfer_id, only that "
+        "one, and wait_seconds (up to 25) waits for it to finish. A transfer stops only after "
+        "60 s with no progress. It changes nothing on Telegram.",
+        {
+            "transfer_id": {"type": "string", "minLength": 1, "maxLength": 64},
+            "wait_seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": LIST_WAIT_LIMIT,
+                "default": 0,
+                "description": "Only with transfer_id: wait up to this long for it to end.",
+            },
+        },
+    ),
+    _read(
+        TRANSFERS_CANCEL,
+        "Stop a background file transfer that is waiting or moving; a stopped send has sent "
+        "nothing, and a stopped download leaves no file. A file already being sent can no "
+        "longer be stopped. It changes nothing on Telegram.",
+        {"transfer_id": {"type": "string", "minLength": 1, "maxLength": 64}},
+        "transfer_id",
     ),
     ToolSpec(
         CHATS_MARK_READ,
@@ -458,8 +490,9 @@ _U4_SPECS: tuple[ToolSpec, ...] = (
     _write(CHATS_LEAVE, "Leaves a group or channel.", {"chat": CHAT_PROPERTY}, "chat"),
     _write(
         CHATS_EDIT,
-        "Changes a group's or channel's title, description or photo (photo_path: a file in the "
-        "outbox folder).",
+        "Changes a group's or channel's title, description or photo (photo_path: a file of up "
+        "to 10 MB in the outbox folder). The title and description change at once; the photo "
+        "is uploaded in the background (photo_transfer_id, see tg_transfers_list).",
         {
             "chat": CHAT_PROPERTY,
             "title": {"type": "string", "minLength": 1, "maxLength": TITLE_LIMIT},
@@ -498,8 +531,9 @@ _U4_SPECS: tuple[ToolSpec, ...] = (
     ),
     _write(
         PROFILE_EDIT,
-        "Changes your own name, bio, username or photo (photo_path: a file in the outbox "
-        "folder); an empty username removes it.",
+        "Changes your own name, bio, username or photo (photo_path: a file of up to 10 MB in "
+        "the outbox folder); an empty username removes it. The photo is uploaded in the "
+        "background (photo_transfer_id, see tg_transfers_list).",
         {
             "first_name": {"type": "string", "minLength": 1, "maxLength": 64},
             "last_name": {"type": "string", "maxLength": 64},
@@ -510,7 +544,10 @@ _U4_SPECS: tuple[ToolSpec, ...] = (
     ),
     _write(
         FILES_SEND,
-        "Sends a local file (up to 20 MB) from the outbox folder, with an optional caption.",
+        "Sends a local file (up to 2000 MiB) from the outbox folder, with an optional caption. "
+        "After the Allow it returns at once with a transfer that uploads in the background; "
+        "tg_transfers_list shows its progress and the sent message, and nothing is sent until "
+        "the whole file is uploaded.",
         {
             "chat": CHAT_PROPERTY,
             "path": PATH_PROPERTY,

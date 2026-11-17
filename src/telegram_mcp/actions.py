@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from telegram_mcp.activity_log import utc_now
 from telegram_mcp.consent import ActionDecl, PendingApproval
@@ -29,6 +29,9 @@ from telegram_mcp.tools import (
     send_result,
     validate_args,
 )
+
+if TYPE_CHECKING:
+    from telegram_mcp.catalog.common import CatalogContext
 
 Validator = Callable[[object], dict[str, Any]]
 Describer = Callable[[TelegramGateway, dict[str, Any]], Awaitable[PromptFields]]
@@ -55,6 +58,12 @@ class ConsentAction:
     newest_returned: NewestReturned | None = None
     log_result: Callable[[Any], str | None] | None = None
     """What the result entry names (a file's path, name and size), never content (NFR8.5)."""
+    starts_transfer: Callable[[dict[str, Any]], bool] | None = None
+    """For a write that accepts a background transfer with these arguments: the broker refuses
+    it while 20 transfers wait, before its approval is used (BR28.1)."""
+    uses_telegram: bool = True
+    """False for a read that acts only on the broker's own state (the transfer tools): it runs
+    without opening the Telegram connection (NFR2.10)."""
 
     @property
     def tool(self) -> str:
@@ -66,6 +75,8 @@ class ActionRegistry:
         self._actions: dict[str, ConsentAction] = {}
         self.files: FileStore | None = None
         """The file records of the file tools, when the catalogue has them."""
+        self.context: CatalogContext | None = None
+        """The catalogue's shared context; the broker gives it the transfer queue."""
         for action in actions:
             self.register(action)
 
@@ -139,6 +150,7 @@ def default_registry(
     for action in actions:
         registry.register(action)
     registry.files = context.files
+    registry.context = context
     return registry
 
 

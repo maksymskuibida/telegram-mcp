@@ -163,6 +163,11 @@ def admit(
     )
 
 
+def admit_photo(given: str, paths: FixedPaths) -> AdmittedFile:
+    """BR25.3: a ``photo_path`` is admitted as any file, with Telegram's 10 MB photo limit."""
+    return admit(given, paths, max_bytes=MAX_PHOTO_BYTES, max_label=MAX_PHOTO_LABEL)
+
+
 def _own_files(data_dir: Path) -> set[tuple[int, int]]:
     """The device and inode of every file in the data folder (BR25.2)."""
     found: set[tuple[int, int]] = set()

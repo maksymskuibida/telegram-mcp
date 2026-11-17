@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Callable
 from typing import Any
 
 from telegram_mcp.actions import ConsentAction
+from telegram_mcp.broker.transfers import FinalCall
 from telegram_mcp.catalog.common import (
     CHAT_ID_TEXT,
     Args,
@@ -20,11 +22,12 @@ from telegram_mcp.catalog.common import (
     require_group,
     with_notice,
 )
+from telegram_mcp.catalog.media import start_upload, starts_with_photo
 from telegram_mcp.catalog.messages import approved, approved_chat
 from telegram_mcp.choices import CHOICE_NOT_SAVED
 from telegram_mcp.consent import PendingApproval, canonical_digest
-from telegram_mcp.files import NO_RECORD_MESSAGE, FileRefused, admit, open_admitted
-from telegram_mcp.gateway.models import ChatNotFound, ChatRef
+from telegram_mcp.files import AdmittedFile, admit_photo
+from telegram_mcp.gateway.models import ChatNotFound, ChatRef, UploadedFile
 from telegram_mcp.gateway.protocol import TelegramGateway
 from telegram_mcp.prompts import (
     FieldChange,
@@ -293,7 +296,7 @@ def chat_edit_actions(context: CatalogContext) -> ConsentAction:
             changes.append(FieldChange("description", found.description, args["description"]))
         file = None
         if args["photo_path"] is not None:
-            admitted = admit(args["photo_path"], context.paths)
+            admitted = admit_photo(args["photo_path"], context.paths)
             context.files.put(canonical_digest(CHATS_EDIT, args), admitted)
             file = admitted.fields()
         return PromptFields(
@@ -307,25 +310,40 @@ def chat_edit_actions(context: CatalogContext) -> ConsentAction:
     async def run(
         gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
     ) -> Any:
+        """BR28.11: the title and description change at once; the photo is a transfer, which
+        is not created when changing a field fails."""
         fields, chat = approved(approval), approved_chat(approval)
         values = {change.field: change.after for change in fields.details.changes}
         changed = list(values)
+        if changed:
+            await gateway.edit_chat(chat.id, values.get("title"), values.get("description"))
+        result: dict[str, Any] = {"chat_id": chat.id, "changed": changed}
         if fields.file is None:
-            await gateway.edit_chat(
-                chat.id, values.get("title"), values.get("description"), None, None
-            )
-            return {"chat_id": chat.id, "changed": changed}
+            return result
         assert approval is not None  # noqa: S101 (approved() checked it)
-        record = context.files.take(approval.args_digest)
-        if record is None:
-            raise FileRefused("not_allowed", NO_RECORD_MESSAGE)
-        with open_admitted(record, context.paths) as photo:
-            await gateway.edit_chat(
-                chat.id, values.get("title"), values.get("description"), photo, record.name
-            )
-        return {"chat_id": chat.id, "changed": [*changed, "photo"]}
+        transfer = start_upload(
+            context,
+            approval,
+            tool=CHATS_EDIT,
+            chat_id=chat.id,
+            final=_chat_photo_final(chat.id),
+            final_request="chat_photo",
+        )
+        return {**result, "photo_transfer_id": transfer.transfer_id}
 
-    return ConsentAction(DECLS[CHATS_EDIT], _validate_edit, describe, run)
+    return ConsentAction(
+        DECLS[CHATS_EDIT], _validate_edit, describe, run, starts_transfer=starts_with_photo
+    )
+
+
+def _chat_photo_final(chat_id: int) -> Callable[[AdmittedFile], FinalCall]:
+    """The final request of a chat photo (BR28.5)."""
+
+    async def set_photo(gateway: TelegramGateway, uploaded: UploadedFile) -> dict[str, Any]:
+        await gateway.set_chat_photo(chat_id, uploaded)
+        return {"chat_id": chat_id, "changed": ["photo"]}
+
+    return lambda record: set_photo
 
 
 # tg_invites_create (BR23.8) --------------------------------------------------------------------
