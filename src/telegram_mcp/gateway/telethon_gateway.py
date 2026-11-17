@@ -573,7 +573,11 @@ class TelethonGateway:
             raise TelegramError("MESSAGE_ID_INVALID")
         message = found[0]
         media = _media(message)
-        if media is None or getattr(message, "file", None) is None:
+        if (
+            media is None
+            or getattr(message, "file", None) is None
+            or _download_source(message) is None
+        ):
             self._media.pop((chat_id, message_id), None)
             return None
         self._media[(chat_id, message_id)] = message
@@ -589,10 +593,15 @@ class TelethonGateway:
                 raise TelegramError("MEDIA_EMPTY")
             message = self._media[(chat_id, message_id)]
         size = getattr(message.file, "size", None) or None
+        # The Photo or Document itself, never ``message.media``: a link preview's picture
+        # sits inside MessageMediaWebPage, which iter_download cannot cast (TypeError).
+        source = _download_source(message)
+        if source is None:
+            raise TelegramError("MEDIA_EMPTY")
 
         async def fetch() -> list[bytes]:
             chunks = self._client.iter_download(
-                message.media,
+                source,
                 offset=offset,
                 request_size=limit,
                 chunk_size=limit,
@@ -981,6 +990,13 @@ def _person(user: Any) -> PersonInfo:
         is_bot=bool(getattr(user, "bot", False)),
         is_contact=bool(getattr(user, "contact", False)),
     )
+
+
+def _download_source(message: Any) -> Any:
+    """The Photo or Document to download: Telethon's ``photo`` and ``document`` also find a
+    link preview's picture or file, which ``message.media`` (MessageMediaWebPage) does not."""
+    photo = getattr(message, "photo", None)
+    return photo if photo is not None else getattr(message, "document", None)
 
 
 def _media(message: Any) -> MediaRef | None:

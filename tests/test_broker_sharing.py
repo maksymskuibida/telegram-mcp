@@ -116,7 +116,7 @@ async def test_two_reads_run_side_by_side(
 async def test_at_most_ten_reads_reach_telegram_and_the_wait_counts_in_their_limit(
     start_broker: Callable[..., Awaitable[Broker]], paths: FixedPaths, fake_gateway: FakeGateway
 ) -> None:
-    broker = await start_broker(call_limit=1.0)
+    broker = await start_broker(call_limit=2.0)
     readers = [await RawClient.connect(paths) for _ in range(12)]
     await list_chats(readers[0])
     fake_gateway.script("list_chats", hang=True, times=12)
@@ -127,9 +127,10 @@ async def test_at_most_ten_reads_reach_telegram_and_the_wait_counts_in_their_lim
     assert fake_gateway.call_names().count("list_chats") == 1 + 10
     results = await asyncio.gather(*tasks)
     assert [result["error"]["code"] for result in results] == ["telegram_timeout"] * 12
-    # The two that waited for a place were answered inside the same 1 s limit, not after
-    # a second limit of their own.
-    assert time.monotonic() - started < 1.5
+    # The two that waited for a place were answered inside the same 2 s limit, not after
+    # a second limit of their own (that would take about 4 s). The 1 s margin on each side
+    # keeps a slow CI runner from failing the check.
+    assert time.monotonic() - started < 3.0
 
 
 # Part 2: two sessions end to end -------------------------------------------------------------
