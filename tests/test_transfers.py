@@ -174,6 +174,14 @@ async def until_final(item: Transfer, seconds: float = 60) -> None:
         await item.ended.wait()
 
 
+async def until(condition: Callable[[], bool], seconds: float = 10) -> None:
+    """Wait (real time, at most ``seconds``) until ``condition()`` holds. The disk work of a
+    transfer runs on threads, so a fixed ``settle()`` cannot say when it is done."""
+    async with asyncio.timeout(seconds):
+        while not condition():  # noqa: ASYNC110 - thread work sets no event to wait on
+            await asyncio.sleep(0.002)
+
+
 # Order, places and the waiting limit (BR28.1, NFR11.15) ----------------------------------------
 
 
@@ -189,11 +197,13 @@ async def test_one_transfer_per_direction_moves_and_the_rest_wait_in_order(
     fake_gateway.script("upload_part", hang=True, part=0)
     first, second, third = (download(queue, folder, media(fake_gateway)) for _ in range(3))
     sending, waiting_upload = upload(queue, paths, "a.pdf"), upload(queue, paths, "b.pdf")
+    await until(lambda: first.state == "transferring" and sending.state == "transferring")
     await settle()
     states = [str(t.state) for t in (first, second, third, sending, waiting_upload)]
     assert states == ["transferring", "queued", "queued", "transferring", "queued"]
     assert queue.waiting == 3
     await queue.cancel(first.transfer_id)
+    await until(lambda: all(t.is_final for t in (second, third)))
     await settle()
     assert ended_list == [first, second, third]  # each started when the one before ended
     assert (str(second.state), str(third.state)) == ("done", "done")
@@ -309,6 +319,7 @@ async def test_a_message_deleted_during_the_download_ends_it_not_found(
     fake_gateway.script("download_part", delay=5, error=FileReferenceExpired(), part=1)
     message_id = media(fake_gateway)
     gone = download(queue, folder, message_id)
+    await until(lambda: len(listing(folder)) == 1)
     await settle()
     await fake_gateway.delete(ALICE.id, [message_id], True)  # deleted while part 1 runs
     await drive(clock, ended(gone))
@@ -435,6 +446,7 @@ async def test_a_cancel_waits_for_a_request_that_ignores_it_at_most_30_s(
 
     monkeypatch.setattr(fake_gateway, "download_part", stubborn)
     stuck = download(queue, folder, media(fake_gateway))
+    await until(lambda: len(listing(folder)) == 1)
     await settle()
     cancelling = asyncio.ensure_future(queue.cancel(stuck.transfer_id))
     moved = await drive(clock, cancelling.done)
@@ -442,7 +454,7 @@ async def test_a_cancel_waits_for_a_request_that_ignores_it_at_most_30_s(
     assert (str(stuck.state), stuck.code) == ("cancelled", "cancelled")
     assert len(listing(folder)) == 1  # the stuck request's task still owns its partial file
     release.set()
-    await settle()
+    await until(lambda: listing(folder) == [] and bool(ended_list))
     assert listing(folder) == []  # removed when that task ended
     assert (str(stuck.state), ended_list) == ("cancelled", [stuck])
 
@@ -512,6 +524,7 @@ async def test_a_cancelled_download_leaves_no_file_and_a_final_one_is_unchanged(
     queue, _ = make_queue(clock)
     fake_gateway.script("download_part", hang=True, part=1)
     going = download(queue, folder, media(fake_gateway))
+    await until(lambda: len(listing(folder)) == 1)
     await settle()
     assert len(listing(folder)) == 1  # the hidden partial file
     stopped, already = await queue.cancel(going.transfer_id)
@@ -565,6 +578,7 @@ async def test_a_file_cut_short_during_the_upload_is_not_sent(
     queue, _ = make_queue(clock)
     fake_gateway.script("upload_part", delay=5, part=0)
     cut = upload(queue, paths)
+    await until(lambda: cut.state == "transferring")
     await settle()
     os.truncate(str(cut.path), 3)  # the open file now ends inside part 0's successor
     await drive(clock, ended(cut))
@@ -663,7 +677,7 @@ async def test_final_records_are_kept_one_hour_and_at_most_100(
     done: list[Transfer] = []
     for _ in range(103):
         done.append(download(queue, folder, message, size=2))
-        await settle()
+        await until_final(done[-1], 10)
     assert all(str(t.state) == "done" for t in done)
     kept = {r["transfer_id"] for r in queue.records()}
     assert len(kept) == 100
