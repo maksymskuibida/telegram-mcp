@@ -126,10 +126,15 @@ part, sends the file or sets the photo, and only when the file is still the one 
 about. So:
 
 - **"Nothing was sent"**: the transfer stopped before that final request (it was cancelled, no
-  progress for 60 s, a long flood wait, an error, the broker stopped, or the file changed during
-  the upload). Nobody received anything. Sending it needs a new question.
-- **"The file may or may not have been sent" (`unknown`)**: the final request timed out or lost
-  its connection. It is never made again; look at the chat before asking to send it again.
+  progress for 60 s, a long flood wait, an error, the broker stopped, the file changed during
+  the upload, or the connection for the final request could not be opened). Nobody received
+  anything. Sending it needs a new question.
+- **"The file may or may not have been sent" (`unknown`)**: the final request was made, then
+  timed out or lost its connection. It is never made again; look at the chat before asking to
+  send it again.
+
+When a chat or profile change also sets a photo, the other fields change at once. If the photo
+then cannot start, the error names the fields that were already changed.
 
 If 20 transfers are already waiting, the send is refused before your Allow is used, so calling
 again later runs it without a new question (within the usual 60 s).

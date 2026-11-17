@@ -601,8 +601,8 @@ stateDiagram-v2
   transferring --> sending : upload, last part stored, file unchanged
   transferring --> done : download, file placed
   sending --> done : Telegram answered
-  sending --> failed : Telegram refused
-  sending --> unknown : timeout or lost connection (never sent again)
+  sending --> failed : Telegram refused / connection not opened
+  sending --> unknown : request made, then timeout or lost connection (never sent again)
 ```
 
 Text version: a transfer starts queued and becomes transferring when its direction is free; a
@@ -610,8 +610,9 @@ cancel or a stop ends a queued one. While transferring, each completed part is p
 ends failed after 60 s with no progress, on a flood wait over 30 s, on an error, a full disk, a
 stop or a changed file, and cancelled on a cancel. An upload whose last part is stored and
 whose file is unchanged becomes sending; a download whose file is placed is done. A sending
-upload ends done, failed when Telegram refuses, or unknown on a timeout. done, failed,
-cancelled and unknown never change.
+upload ends done, failed when Telegram refuses or the connection for the final request cannot
+be opened, or unknown on a timeout after the request was made. done, failed, cancelled and
+unknown never change.
 
 - **Places.** One upload and one download transfer at a time; up to 20 wait, each starting in
   the order it was accepted. With 20 waiting, a new one is refused before a send's approval is
@@ -628,12 +629,17 @@ cancelled and unknown never change.
 - **Uploads send once.** Parts are stored under a random file id that nobody can see (small
   files up to 10 MB with their checksum, larger ones as big-file parts). Only the final request
   (send the file with its caption, or set the chat or profile photo) makes them visible, and it
-  enters the write line once, with the usual 30 s limit. An upload that ends before it has sent
-  nothing ("Nothing was sent"); a final request that times out is `unknown` ("look at the chat
-  before sending it again") and is never made again. The broker never restarts a transfer and
-  never uses an approval twice.
+  enters the write line once. The connection is opened first, under its own 30 s limit, and
+  the request then has the usual 30 s limit. An upload that ends before the request is made
+  has sent nothing ("Nothing was sent"); a final request that times out is `unknown` ("look at
+  the chat before sending it again") and is never made again. The broker never restarts a
+  transfer and never uses an approval twice.
+- **Stopping.** A cancel or a broker stop ends a transfer even while a timed-out part is still
+  closing, and waits for the transfer's task at most 30 s on the clock. Each part's disk read
+  or write runs off the event loop, so a slow disk never holds up other calls or the timers.
 - **Photo changes.** `tg_chats_edit` and `tg_profile_edit` change the other fields at once and
-  return `photo_transfer_id`; the photo is set by the transfer's final request.
+  return `photo_transfer_id`; the photo is set by the transfer's final request. When the photo
+  cannot start after other fields changed, the error names those fields.
 - **Records.** A record shows the transfer's direction, tool, state, chat, name, path (the
   outbox file, or the downloaded file once done), size, bytes done, percent, times, seconds
   since the last progress, and at the end its result or its code and message. Names can be
