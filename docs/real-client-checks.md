@@ -88,7 +88,8 @@ unread.
     outbox and a link to `activity.log` in the outbox (both refused).
 13. **Downloads:** download a photo, a video and a file with no name; download the same one
     twice (the second is `name (1).ext`). Download a large file (several hundred MB) and follow
-    it to `done`; the file appears under its name only at the end.
+    it to `done`; the file appears under its name only at the end. Download the photo of a
+    channel post whose picture is a link preview: it lands in the downloads folder as a photo.
 14. **Cancel and stop:** start a large download and cancel it with `tg_transfers_cancel`: it
     ends `cancelled` and no file is left in the downloads folder. Start a large send and run
     `telegram-mcp logout` while it moves: nothing is sent to the chat (log in again
