@@ -81,11 +81,19 @@ unread.
     description and photo (a picture in the outbox), create an invite link with an expiry and a
     limit, give a member one admin right, leave the group.
 11. **Profile:** change your bio and back, set a profile photo from the outbox.
-12. **Files:** send a 20 MB file from the outbox (time it: it must finish inside 30 s);
-    replace the file between the question and the second call and check nothing is sent; try
-    a file outside the outbox and a link to `activity.log` in the outbox (both refused).
+12. **Files:** send a 20 MB file from the outbox: the call returns a `transfer_id` at once;
+    follow it with `tg_transfers_list` (with `wait_seconds`) until it is `done` and the file is
+    in the chat. There is no 30 s requirement: it may take as long as it moves. Replace the file
+    between the question and the second call and check nothing is sent; try a file outside the
+    outbox and a link to `activity.log` in the outbox (both refused).
 13. **Downloads:** download a photo, a video and a file with no name; download the same one
-    twice (the second is `name (1).ext`); a file over 20 MB is refused before downloading.
-14. Read `activity.log`: every call and result is there, a file is named by path, name and
+    twice (the second is `name (1).ext`). Download a large file (several hundred MB) and follow
+    it to `done`; the file appears under its name only at the end.
+14. **Cancel and stop:** start a large download and cancel it with `tg_transfers_cancel`: it
+    ends `cancelled` and no file is left in the downloads folder. Start a large send and run
+    `telegram-mcp logout` while it moves: nothing is sent to the chat (log in again
+    afterwards). Start a large download and end the broker hard (`kill -9` with the pid from
+    `telegram-mcp status`): the next broker start removes the `.telegram-mcp-*.part` file.
+15. Read `activity.log`: every call and result is there, a file is named by path, name and
     size only, a created invite link and a joined invite link show `t.me/+…`, and no session or
     `api_hash` appears.

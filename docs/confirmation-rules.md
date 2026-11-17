@@ -103,7 +103,7 @@ These are refused before any question, so you are never asked about something th
 | `tg_chats_edit`, `tg_profile_edit` | Nothing to change; a title, name, bio or username outside its limits (bio and description at most 255 characters, a username 5 to 32 letters, digits or underscores, or empty to remove it). |
 | `tg_invites_create` | An expiry outside 60 s to one year, a usage limit outside 1 to 99,999. |
 | `tg_admins_set` | A chat that is not a supergroup or channel; a right that is not one of the 11. |
-| `tg_files_send`, `photo_path` | A file outside the outbox folder, one of the tool's own files, a missing file, a folder or pipe, an empty file, or a file over 20 MB. |
+| `tg_files_send`, `photo_path` | A file outside the outbox folder, one of the tool's own files, a missing file, a folder or pipe, an empty file, or a file over Telegram's limit (2000 MiB for a send, 10 MB for a photo). |
 
 Whether your account may make a change (an admin right, a channel you do not own) is
 Telegram's to decide: it refuses after your Allow with `telegram_error`, and nothing is retried.
@@ -116,6 +116,23 @@ between the question and the run does not change what is done. A join uses the u
 link you approved. A file send checks the file again and uploads it only if it is the same file
 (same device, inode, size and modification time) you were asked about; otherwise nothing is
 sent and the tool must ask again.
+
+A file send's question is the same as before; what changes is what happens after Allow. The
+call returns at once with a transfer that uploads the file in the background (a photo change
+changes its other fields at once and uploads the photo the same way). Your Allow is used when
+the transfer is accepted: whatever happens to it, it is never run again from that answer. The
+uploaded parts are stored where nobody can see them; only one final request, after the last
+part, sends the file or sets the photo, and only when the file is still the one you were asked
+about. So:
+
+- **"Nothing was sent"**: the transfer stopped before that final request (it was cancelled, no
+  progress for 60 s, a long flood wait, an error, the broker stopped, or the file changed during
+  the upload). Nobody received anything. Sending it needs a new question.
+- **"The file may or may not have been sent" (`unknown`)**: the final request timed out or lost
+  its connection. It is never made again; look at the chat before asking to send it again.
+
+If 20 transfers are already waiting, the send is refused before your Allow is used, so calling
+again later runs it without a new question (within the usual 60 s).
 
 If Telegram asks to wait before a change is sent, the change is not sent and the tool says how
 long to wait; ask again after that. If the connection drops after a change was sent, the tool

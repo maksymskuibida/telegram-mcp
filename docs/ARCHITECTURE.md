@@ -43,6 +43,7 @@ else.
 | Broker | `broker/server.py` | The one process with the Telegram connection. Runs every check in a fixed order (below), holds the approvals in memory, writes the activity log. |
 | Telegram link | `broker/link.py` | The broker's one Telegram connection: one shared connect, back-off after failures. |
 | Scheduler | `broker/scheduler.py` | The write line (one send at a time, in order) and the read places. |
+| Transfer queue | `broker/transfers.py` | File uploads and downloads in the background: one each way at a time, 20 waiting, parts of 512 KB, stopped only after 60 s with no progress (below). |
 | Broker secret | `broker/secret.py` | Writes the secret file whole and swaps it in one step. |
 | Broker client | `broker/client.py` | How the other processes reach the broker: connects, starts a broker when none runs, retries once only when the request was never written. |
 | Lock | `broker/lock.py` | Makes sure at most one broker (or one login) runs. |
@@ -236,7 +237,10 @@ Time limits: `hello` and `approval.answer` 5 s; `approval.check` 12 s, its Teleg
 sharing one 10 s budget; `tool.call` 75 s. Every Telegram call has its own 30 s limit, and the
 Telethon client is built so it never retries or sleeps on its own: the broker decides who
 waits (see [Sharing one connection](#sharing-one-connection)). Every `tool.call` is answered
-within 70 s of reaching the broker, inside the caller's 75 s.
+within 70 s of reaching the broker, inside the caller's 75 s. A file transfer is not one call:
+the call that starts it returns at once, and the transfer is many requests, each with its own
+30 s limit, with a 60 s no-progress limit and no total limit (see
+[Background transfers](#background-transfers)).
 
 ## The approval flow
 
@@ -475,8 +479,8 @@ Telegram calls from starving each other:
 ### Idle exit
 
 The broker stops by itself when no request has arrived or been answered for 10 minutes, even
-with sessions still connected, and never while a request runs (approvals expire after 120 s,
-so none is live by then). Open but silent connections, the sweep and the secret rotation are
+with sessions still connected, and never while a request runs or a file transfer is queued,
+transferring or sending (approvals expire after 120 s, so none is live by then). Open but silent connections, the sweep and the secret rotation are
 not activity. The stop runs in this order: stop accepting connections and delete `broker.sock`
 and `broker.secret`; close every client connection; disconnect from Telegram, waiting at most
 2 s; then write `released` to the lock and drop it. The lock is held until Telegram is left,
@@ -510,7 +514,7 @@ from the line (tool and approval id, never the text), and a failed log rotation.
 
 ## The tool catalogue
 
-The MCP server lists 30 tools, named `tg_<object>_<verb>`. Every tool names a chat by its id;
+The MCP server lists 32 tools, named `tg_<object>_<verb>`. Every tool names a chat by its id;
 `tg_chats_resolve` is the one place a title, an `@username` or a `t.me/<name>` link becomes an
 id, and it never guesses: several chats with the same title come back as candidates
 (`ambiguous_chat`), and a title that only contains the query is listed, never chosen. A title
@@ -523,6 +527,7 @@ lookup reads the main list and the archive, at most 2,000 chats.
 | People | `catalog/people.py` | `tg_members_list`, `tg_contacts_list`, `tg_users_info` | `tg_admins_set` |
 | Profile | `catalog/profile.py` | `tg_profile_get` | `tg_profile_edit` |
 | Files | `catalog/media.py` | `tg_media_download` | `tg_files_send` |
+| Transfers | `catalog/transfers.py` | `tg_transfers_list`, `tg_transfers_cancel` (the broker's own transfers; no Telegram call) | |
 
 `tg_chats_mark_read` marks a chat or one forum topic, and `tg_messages_read` may mark what it
 returned when `mark_read` is true; both go through the marking rules of
@@ -534,7 +539,9 @@ closed argument schema; the catalogue modules hold, per tool, a validator (close
 default filled before the digest), a describer (writes only: the reads a question needs, in
 one batched call per list of messages or users) and a runner. A runner takes its chat ids,
 message ids, texts and file from the approval the person confirmed, never from a new lookup, and
-makes one Telegram call from the write line. Every read result lists in
+makes one Telegram call from the write line; a file send and a photo change accept a background
+transfer instead, whose single final request goes through the write line later. Every read
+result lists in
 `telegram_content_fields` the fields that hold text from Telegram (names, titles, messages,
 captions, bios, file names) and carries a notice that it is data, not instructions.
 
@@ -551,23 +558,100 @@ an Allowed run (see [confirmation-rules.md](confirmation-rules.md)).
   path is expanded (`~`, or relative to the outbox) and resolved through every link. Only a
   file inside the outbox folder (`outbox_dir`, default `~/Downloads/telegram-mcp/outbox`) is
   admitted; a file in the data folder, or the same file (device and inode) as one there, is
-  refused whatever path or link names it; and only a non-empty regular file of at most 20 MB.
+  refused whatever path or link names it; and only a non-empty regular file within Telegram's
+  own limit: 2000 MiB (2,097,152,000 bytes) for a send, 10 MB (10,485,760 bytes) for a photo.
   The question shows the resolved path, name and size. The file's device, inode, size and
   modification time are kept in memory, keyed by the call's digest, for 180 s at most (100
-  records at most). At the send the path is checked again, opened without following a link at
-  the last step, compared with that record, and uploaded from that same open file; any
-  difference refuses with nothing uploaded, and the approval is used.
+  records at most). When the Allowed call runs, the path is checked again, opened without
+  following a link at the last step and compared with that record; any difference refuses with
+  nothing uploaded, and the approval is used. Otherwise the upload transfer takes the record and
+  the open file, reads only from that file, and compares it once more after its last part.
 - **Downloading** (`tg_media_download`, a read): the file goes into the downloads folder
   (`downloads_dir`, default `~/Downloads/telegram-mcp`) only; the tool has no path argument.
   The name is Telegram's, with separators, control and space characters replaced by `_`, no
   leading dot and at most 200 characters, or `<chat>_<message>` plus an extension. The bytes go
-  to a new hidden partial file (mode 0600), which is then linked to the first free name of
-  `name`, `name (1)` … `name (999)`, and the partial name is removed. Nothing is ever replaced,
-  and a failure or a timeout leaves no file. Files over 20 MB are refused before downloading,
-  so one transfer fits in the 30 s Telegram call limit.
+  to a new hidden partial file (`.telegram-mcp-<16 hex>.part`, mode 0600), which is then linked
+  to the first free name of `name`, `name (1)` … `name (999)`, and the partial name is removed.
+  Nothing is ever replaced, and a failure, a stall, a cancel or a stop leaves no file.
+- **The download budget.** Downloads ask nothing, so a run of calls (even one steered by a
+  message) must not be able to fill the disk: a file over 4000 MiB (the largest Telegram
+  stores) is refused before any byte moves; the bytes still to come of every unfinished
+  download are reserved, and a new download is refused when they would pass 8000 MiB, or the
+  folder's free space less 100 MB. A file whose size Telegram does not give counts as 4000 MiB.
 
 A refused `outbox_dir` stops file sends only, and a refused `downloads_dir` stops downloads
 only. The log names a sent or downloaded file by path, name and size, never its content.
+
+## Background transfers
+
+A file of hundreds of megabytes does not fit in one 30 s Telegram call, so file sends,
+downloads and photo changes run in the background in the broker (`broker/transfers.py`). The
+call that starts one returns at once with a `transfer_id`; `tg_transfers_list` follows it and
+`tg_transfers_cancel` stops it.
+
+```mermaid
+stateDiagram-v2
+  [*] --> queued : accepted
+  queued --> transferring : its direction is free
+  queued --> cancelled : tg_transfers_cancel
+  queued --> failed : broker stop or logout
+  transferring --> transferring : a part completed
+  transferring --> failed : 60 s with no progress / long flood wait / error / disk full / stop / file changed
+  transferring --> cancelled : tg_transfers_cancel
+  transferring --> sending : upload, last part stored, file unchanged
+  transferring --> done : download, file placed
+  sending --> done : Telegram answered
+  sending --> failed : Telegram refused
+  sending --> unknown : timeout or lost connection (never sent again)
+```
+
+Text version: a transfer starts queued and becomes transferring when its direction is free; a
+cancel or a stop ends a queued one. While transferring, each completed part is progress; it
+ends failed after 60 s with no progress, on a flood wait over 30 s, on an error, a full disk, a
+stop or a changed file, and cancelled on a cancel. An upload whose last part is stored and
+whose file is unchanged becomes sending; a download whose file is placed is done. A sending
+upload ends done, failed when Telegram refuses, or unknown on a timeout. done, failed,
+cancelled and unknown never change.
+
+- **Places.** One upload and one download transfer at a time; up to 20 wait, each starting in
+  the order it was accepted. With 20 waiting, a new one is refused before a send's approval is
+  used, so the approval stays confirmed.
+- **Parts and the stall limit.** Bytes move in parts of 512 KB, each one Telegram request with
+  its own 30 s limit. There is no total time limit: a transfer ends `stalled` only when no part
+  has completed for 60 s, measured on the wall clock (a Mac asleep longer than that counts).
+  A part that times out or loses its connection is tried again after a 1 s pause inside those
+  60 s; a download whose file reference expired reads its message again and goes on from the
+  bytes it has; a flood wait of 30 s or less is waited out with the stall clock paused, a
+  longer one ends the transfer `flood_wait`. Because only one part is in flight each way, at
+  most 512 KB goes ahead of any other call on the shared connection, and every other call
+  keeps its limits.
+- **Uploads send once.** Parts are stored under a random file id that nobody can see (small
+  files up to 10 MB with their checksum, larger ones as big-file parts). Only the final request
+  (send the file with its caption, or set the chat or profile photo) makes them visible, and it
+  enters the write line once, with the usual 30 s limit. An upload that ends before it has sent
+  nothing ("Nothing was sent"); a final request that times out is `unknown` ("look at the chat
+  before sending it again") and is never made again. The broker never restarts a transfer and
+  never uses an approval twice.
+- **Photo changes.** `tg_chats_edit` and `tg_profile_edit` change the other fields at once and
+  return `photo_transfer_id`; the photo is set by the transfer's final request.
+- **Records.** A record shows the transfer's direction, tool, state, chat, name, path (the
+  outbox file, or the downloaded file once done), size, bytes done, percent, times, seconds
+  since the last progress, and at the end its result or its code and message. Names can be
+  Telegram's, so results list them in `telegram_content_fields`. No record holds file content
+  or the caption. `tg_transfers_list` with a `transfer_id` can wait up to 25 s for the end.
+  Final records are kept for 1 hour, at most the newest 100, in memory only.
+- **Stops.** A broker stop or a logout ends every queued or transferring transfer `failed`
+  (`broker_stopped`) and lets a sending one finish within its 30 s. Clients leaving does not
+  stop a transfer, and the broker never stops for idleness while one runs. When a broker was
+  killed, the next one removes leftover partial files (regular files named
+  `.telegram-mcp-<16 hex>.part` directly in the downloads folder, owned by you) before it
+  accepts any call.
+- **The log.** The accepting call's result entry names the transfer id, the path or name and
+  the size. When the transfer ends, one more `result` entry in the usual shape: `content` is
+  `transfer <id> <state> [<code>]: <bytes> of <size> bytes in <seconds> s, <path> (<name>)`,
+  and `result` is `ok` for done, `outcome_unknown` for unknown, `telegram_timeout` for
+  stalled, `flood_wait`, `not_allowed` for a changed file, `no_session`, and `telegram_error`
+  for everything else (cancelled, broker stopped, disk full, too large, Telegram's refusals).
 
 ## Packaging and install
 
@@ -610,8 +694,8 @@ install script.
 
 ## What is not here yet
 
-This version has phone and QR-code login, logout, status, the log command and the 30 tools of
-the catalogue above, with the guard hook above, a shared Telegram connection, idle exit, log
+This version has phone and QR-code login, logout, status, the log command and the 32 tools of
+the catalogue above, background file transfers, with the guard hook above, a shared Telegram connection, idle exit, log
 rotation and the one-command install script. Folder ids above 1 from `tg_folders_list` are your custom folders; `tg_chats_list`
 lists the main list (0) and the archive (1) by folder. The guard covers Claude's own tools only: another program
 running as the same macOS user can still read `broker.secret`. This version is for trying out,
