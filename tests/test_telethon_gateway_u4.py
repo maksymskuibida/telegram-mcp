@@ -501,6 +501,55 @@ async def test_media_with_nothing_to_download_is_no_media(
     assert await gateway.media_info(TEAM_ID, 3) is None
 
 
+async def test_a_link_preview_document_downloads_the_document_with_its_name_and_size(
+    gateway: TelethonGateway, stub: Stub
+) -> None:
+    web_page = SimpleNamespace(kind="web page")
+    document = SimpleNamespace(kind="the preview document")
+    file = SimpleNamespace(size=9, name="report.pdf")
+    stub.messages = [message(3, media=web_page, file=file, document=document)]
+    stub.media_data = b"012345678"
+    assert await gateway.media_info(TEAM_ID, 3) == MediaInfo("document", 9, "report.pdf")
+    assert await gateway.download_part(TEAM_ID, 3, 4, 4) == b"4567"
+    assert [call[1] for call in stub.calls if call[0] == "iter_download"] == [(document,)]
+
+
+async def test_download_part_with_nothing_left_to_fetch_is_refused_without_a_request(
+    gateway: TelethonGateway, stub: Stub
+) -> None:
+    with_media(stub, b"0123456789")
+    assert await gateway.media_info(TEAM_ID, 3) is not None  # the message is kept for its parts
+    kept = stub.messages[0]
+    kept.photo = None
+    kept.document = None
+    with pytest.raises(TelegramError, match="MEDIA_EMPTY"):
+        await gateway.download_part(TEAM_ID, 3, 0, 4)
+    assert downloads(stub) == []
+
+
+async def test_reads_and_downloads_agree_on_what_a_media_is(
+    gateway: TelethonGateway, stub: Stub
+) -> None:
+    # A location: a read shows media of kind other, and there is nothing to download.
+    location = message(3, media=SimpleNamespace(kind="geo"))
+    # A link preview with a photo: a read shows a photo, and the download reports that photo.
+    preview = message(
+        4,
+        media=SimpleNamespace(kind="web page"),
+        photo=SimpleNamespace(kind="the preview photo"),
+        file=SimpleNamespace(size=6, name=None),
+    )
+    stub.messages = [preview, location]
+    views = {view.id: view for view in await gateway.read_messages(TEAM_ID, 2)}
+    assert views[3].media is not None
+    assert views[3].media.kind == "other"
+    assert await gateway.media_info(TEAM_ID, 3) is None
+    assert views[4].media is not None
+    assert (views[4].media.kind, views[4].media.size_bytes) == ("photo", 6)
+    assert await gateway.media_info(TEAM_ID, 4) == MediaInfo("photo", 6, None)
+    no_read_acknowledgement(stub)
+
+
 async def test_an_expired_file_reference_is_reported_and_the_message_read_again(
     gateway: TelethonGateway, stub: Stub
 ) -> None:
