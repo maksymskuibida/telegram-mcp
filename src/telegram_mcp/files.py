@@ -2,23 +2,29 @@
 
 A file is sent only from the outbox folder, after every link in its path is followed, never
 when it is one of the tool's own files (by path or by device and inode), and only when it is a
-non-empty regular file of at most 20 MB. Its identity is kept in memory, keyed by the call's
-digest, from the question until the send; the send opens the same path without following a
-link at the last step, compares the open file with that identity, and uploads from that open
-file, so what leaves the machine is what the person approved (NFR3.2).
+non-empty regular file within Telegram's own limit: 2000 MiB for a send, 10 MB for a photo. Its
+identity is kept in memory, keyed by the call's digest, from the question until the upload is
+accepted; then the same path is opened without following a link at the last step, the open
+file is compared with that identity, and the upload reads only from that open file. After the
+last part the file is compared once more before the final send request (BR28.5), so what
+leaves the machine is what the person approved (NFR3.2, NFR3.3).
 
-A download goes into the downloads folder only: it is written to a new hidden partial file,
-then given its name only if nothing exists under that name, and the partial file is removed
-on every failure (NFR2.4)."""
+A download goes into the downloads folder only, within a budget: at most 4000 MiB per file, at
+most 8000 MiB still to come over every unfinished download, and never more than the free space
+less 100 MB (BR26.1). It is written to a new hidden partial file, then given its name only if
+nothing exists under that name, and the partial file is removed on every failure (NFR2.4).
+Partial files a killed broker left behind are removed when the next broker starts (BR28.9)."""
 
 from __future__ import annotations
 
 import os
+import re
 import secrets
+import shutil
 import stat
 import unicodedata
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,9 +34,20 @@ from telegram_mcp.paths import FixedPaths
 from telegram_mcp.prompts import FileFields, PromptError
 from telegram_mcp.settings import Settings, SettingsError
 
-MAX_FILE_BYTES = 20 * 1024 * 1024
-"""Sends and downloads are capped so one transfer fits in the 30 s call limit at 10 Mbit/s."""
-MAX_FILE_LABEL = "20 MB"
+MiB = 1024 * 1024
+MAX_SEND_BYTES = 2_097_152_000
+"""2000 MiB: 4000 parts of 512 KB, the most Telegram takes for one file without Premium."""
+MAX_SEND_LABEL = "2000 MiB"
+MAX_PHOTO_BYTES = 10_485_760
+"""10 MB, Telegram's limit for a photo (BR25.3)."""
+MAX_PHOTO_LABEL = "10 MB"
+MAX_DOWNLOAD_BYTES = 4_194_304_000
+"""4000 MiB, the largest file Telegram stores (BR26.1)."""
+MAX_DOWNLOAD_LABEL = "4000 MiB"
+DOWNLOAD_BUDGET_BYTES = 8000 * MiB
+"""What every unfinished download may still bring in, together (BR26.1)."""
+FREE_SPACE_FLOOR_BYTES = 100 * MiB
+"""The free space a download always leaves in the downloads folder."""
 RECORD_LIFETIME = timedelta(seconds=180)
 """The 120 s question plus the 60 s to use an Allow."""
 MAX_RECORDS = 100
@@ -38,6 +55,8 @@ MAX_RECORDS = 100
 NAME_LIMIT = 200
 CLASH_LIMIT = 999
 PRIVATE_FILE = 0o600
+PARTIAL_PREFIX = ".telegram-mcp-"
+PARTIAL_NAME = re.compile(r"^\.telegram-mcp-[0-9a-f]{16}\.part$")
 MEDIA_EXTENSIONS = {"photo": ".jpg", "video": ".mp4", "voice": ".ogg"}
 _HIDDEN = {"Cc", "Cf", "Zl", "Zp", "Zs", "Cs", "Co", "Cn"}
 CHANGED_MESSAGE = (
@@ -96,8 +115,15 @@ def _expand(given: str, outbox: Path, home: Path) -> str:
     return str(outbox / given)
 
 
-def admit(given: str, paths: FixedPaths) -> AdmittedFile:
+def admit(
+    given: str,
+    paths: FixedPaths,
+    *,
+    max_bytes: int = MAX_SEND_BYTES,
+    max_label: str = MAX_SEND_LABEL,
+) -> AdmittedFile:
     """BR25.1 to BR25.3: the file at ``given`` if it may be sent, else :class:`FileRefused`.
+    ``max_bytes`` is Telegram's limit: a send's by default, a photo's for ``photo_path``.
     The file is never opened here."""
     outbox = Path(os.path.realpath(folder_for(paths, "outbox_dir")))
     resolved = Path(os.path.realpath(_expand(given, outbox, paths.home)))
@@ -120,11 +146,11 @@ def admit(given: str, paths: FixedPaths) -> AdmittedFile:
         raise FileRefused("invalid_arguments", f"{resolved} is not a regular file.")
     if info.st_size == 0:
         raise FileRefused("invalid_arguments", f"{resolved}: the file is empty.")
-    if info.st_size > MAX_FILE_BYTES:
+    if info.st_size > max_bytes:
         raise FileRefused(
             "invalid_arguments",
-            f"{resolved} is {info.st_size} bytes; files over {MAX_FILE_LABEL} are not sent by "
-            "this tool. Send it in Telegram yourself.",
+            f"{resolved} is {info.st_size} bytes; Telegram takes at most {max_label} "
+            f"({max_bytes} bytes) here.",
         )
     return AdmittedFile(
         given_path=given,
@@ -154,7 +180,7 @@ def open_admitted(record: AdmittedFile, paths: FixedPaths) -> BinaryIO:
     """BR25.5: check the stored path again, open it without following a link at the last step,
     compare the open file with the record, and return that open file for the upload."""
     try:
-        current = admit(record.resolved_path, paths)
+        current = admit(record.resolved_path, paths, max_bytes=max(record.size_bytes, 1))
     except FileRefused as refused:
         raise FileRefused("not_allowed", CHANGED_MESSAGE) from refused
     if current.identity() != record.identity():
@@ -170,6 +196,22 @@ def open_admitted(record: AdmittedFile, paths: FixedPaths) -> BinaryIO:
         os.close(descriptor)
         raise FileRefused("not_allowed", CHANGED_MESSAGE)
     return os.fdopen(descriptor, "rb")
+
+
+def unchanged(record: AdmittedFile, opened: BinaryIO) -> bool:
+    """BR28.5: after an upload's last part, the open file still has the approved size and
+    last-modified time, and the stored path still names that same file (device and inode,
+    without following a link at the last step)."""
+    try:
+        now_open = os.fstat(opened.fileno())
+        at_path = os.stat(record.resolved_path, follow_symlinks=False)
+    except (OSError, ValueError):
+        return False
+    return (
+        stat.S_ISREG(at_path.st_mode)
+        and (now_open.st_size, now_open.st_mtime_ns) == (record.size_bytes, record.modified_ns)
+        and (at_path.st_dev, at_path.st_ino) == (record.device, record.inode)
+    )
 
 
 class FileStore:
@@ -249,21 +291,21 @@ def _candidates(name: str) -> list[str]:
     return [name] + [f"{stem} ({number}){extension}" for number in range(1, CLASH_LIMIT + 1)]
 
 
-async def place_download(
-    folder: Path, wanted: str, write: Callable[[BinaryIO], Awaitable[int]]
-) -> Placed:
-    """BR26.3: write into a new hidden partial file in ``folder``, then link it to the first
-    free name of ``wanted``, ``wanted (1)`` … ``(999)``; the partial name is always removed,
-    and on a failure nothing is left behind."""
-    partial = folder / f".telegram-mcp-{secrets.token_hex(8)}.part"
+def create_partial(folder: Path) -> tuple[Path, int]:
+    """BR26.3: a new hidden partial file in ``folder``, readable by the person only, and its
+    open descriptor; a download transfer appends to it as its parts arrive."""
+    partial = folder / f"{PARTIAL_PREFIX}{secrets.token_hex(8)}.part"
     descriptor = os.open(
         partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, PRIVATE_FILE
     )
+    return partial, descriptor
+
+
+def place_partial(folder: Path, partial: Path, wanted: str) -> Placed:
+    """BR26.3: link the complete partial file to the first free name of ``wanted``,
+    ``wanted (1)`` … ``(999)``, never replacing a file; the partial name is always removed."""
     try:
-        with os.fdopen(descriptor, "wb") as target:
-            await write(target)
-            target.flush()
-        size = os.stat(partial).st_size
+        size = os.stat(partial, follow_symlinks=False).st_size
         for name in _candidates(wanted):
             final = folder / name
             try:
@@ -276,3 +318,57 @@ async def place_download(
         )
     finally:
         partial.unlink(missing_ok=True)
+
+
+def free_space(folder: Path) -> int:
+    """The bytes free on the disk of ``folder``."""
+    return shutil.disk_usage(folder).free
+
+
+def check_download_budget(
+    folder: Path, size_bytes: int | None, reserved_bytes: int, free_bytes: int
+) -> None:
+    """BR26.1: refuse a download over 4000 MiB, one that would take the bytes still to come of
+    every unfinished download past 8000 MiB, and one the downloads folder's free space less
+    100 MB cannot hold together with them. An unknown size counts as 4000 MiB."""
+    if size_bytes is not None and size_bytes > MAX_DOWNLOAD_BYTES:
+        raise FileRefused(
+            "invalid_arguments",
+            f"The file is {size_bytes} bytes; Telegram stores at most {MAX_DOWNLOAD_LABEL} "
+            f"({MAX_DOWNLOAD_BYTES} bytes) per file.",
+        )
+    counted = size_bytes if size_bytes is not None else MAX_DOWNLOAD_BYTES
+    if reserved_bytes + counted > DOWNLOAD_BUDGET_BYTES:
+        raise FileRefused(
+            "invalid_arguments",
+            "Too much is already being downloaded; wait for a download to finish.",
+        )
+    needed = reserved_bytes + counted + FREE_SPACE_FLOOR_BYTES
+    if free_bytes < needed:
+        raise FileRefused(
+            "invalid_arguments", f"Not enough free space in {folder}: {needed} bytes needed."
+        )
+
+
+def sweep_partials(folder: Path) -> list[str]:
+    """BR28.9: remove the partial files a killed broker left directly in ``folder``: regular
+    files named ``.telegram-mcp-<16 hex>.part`` owned by this user, and nothing else. Returns
+    the names removed."""
+    removed: list[str] = []
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return removed
+    for name in names:
+        if not PARTIAL_NAME.match(name):
+            continue
+        path = folder / name
+        try:
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                continue
+            path.unlink()
+        except OSError:
+            continue
+        removed.append(name)
+    return removed
