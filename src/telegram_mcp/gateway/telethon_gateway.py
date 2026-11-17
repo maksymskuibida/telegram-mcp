@@ -47,7 +47,6 @@ from telegram_mcp.gateway.models import (
     SentCodeInfo,
     SentMessage,
     TelegramError,
-    TooLarge,
     TopicInfo,
     TopicNotFound,
     UnreadState,
@@ -562,9 +561,6 @@ class TelethonGateway:
         found = await self._messages(chat_id, ids=[message_id])
         if not found or found[0].media is None:
             raise TelegramError("MEDIA_EMPTY")
-        size = int(getattr(found[0].file, "size", 0) or 0)
-        if size > max_bytes:
-            raise TooLarge(size)
         await self._call(lambda: self._client.download_media(found[0], file=file_obj))
         return int(file_obj.tell())
 

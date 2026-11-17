@@ -81,7 +81,6 @@ from telegram_mcp.gateway.models import (
     NotAuthorized,
     OutcomeUnknown,
     TelegramError,
-    TooLarge,
     TopicNotFound,
     UnreadState,
     UserNotFound,
@@ -664,7 +663,7 @@ class Broker:
             return ToolFailure.fixed("not_found", "not_found_topic")
         if isinstance(error, FloodWait):
             return ToolFailure.flood(error.seconds)
-        if isinstance(error, UserNotFound | NotAUser | TooLarge):
+        if isinstance(error, UserNotFound | NotAUser):
             return _catalog_failure(error)
         if isinstance(error, NotAuthorized):
             self._forget_session()
@@ -1099,7 +1098,7 @@ class Broker:
             return ToolFailure("invalid_arguments", str(error))
         if isinstance(error, TopicNotFound):
             return ToolFailure.fixed("not_found", "not_found_topic")
-        if isinstance(error, UserNotFound | NotAUser | TooLarge):
+        if isinstance(error, UserNotFound | NotAUser):
             return _catalog_failure(error)
         if isinstance(error, NotAuthorized):
             self._forget_session()
@@ -1443,14 +1442,8 @@ class Broker:
 # Helpers --------------------------------------------------------------------------------------
 
 
-def _catalog_failure(error: UserNotFound | NotAUser | TooLarge) -> ToolFailure:
-    """The gateway errors of U4's lookups and transfers, with a message naming what failed."""
-    if isinstance(error, TooLarge):
-        return ToolFailure(
-            "invalid_arguments",
-            f"The file is {error.size_bytes} bytes; files over 20 MB are not moved by this "
-            "tool. Download or send it in Telegram yourself.",
-        )
+def _catalog_failure(error: UserNotFound | NotAUser) -> ToolFailure:
+    """The gateway errors of U4's lookups, with a message naming what failed."""
     if isinstance(error, NotAUser):
         return ToolFailure("not_found", "That username is a chat; use tg_chats_info.")
     if error.username is not None:
