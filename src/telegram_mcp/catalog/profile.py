@@ -7,9 +7,11 @@ from typing import Any
 
 from telegram_mcp.actions import ConsentAction
 from telegram_mcp.catalog.common import Args, CatalogContext, with_notice
+from telegram_mcp.catalog.media import start_photo_upload, starts_with_photo
 from telegram_mcp.catalog.messages import approved
 from telegram_mcp.consent import PendingApproval, canonical_digest
-from telegram_mcp.files import NO_RECORD_MESSAGE, FileRefused, admit, open_admitted
+from telegram_mcp.files import admit_photo
+from telegram_mcp.gateway.models import UploadedFile
 from telegram_mcp.gateway.protocol import TelegramGateway
 from telegram_mcp.prompts import FieldChange, HeadlineDetails, PromptFields
 from telegram_mcp.tools import ABOUT_LIMIT, DECLS, PROFILE_EDIT, PROFILE_GET, InvalidArguments
@@ -49,7 +51,7 @@ def profile_edit_action(context: CatalogContext) -> ConsentAction:
         )
         file = None
         if args["photo_path"] is not None:
-            admitted = admit(args["photo_path"], context.paths)
+            admitted = admit_photo(args["photo_path"], context.paths)
             context.files.put(canonical_digest(PROFILE_EDIT, args), admitted)
             file = admitted.fields()
         return PromptFields(
@@ -62,22 +64,42 @@ def profile_edit_action(context: CatalogContext) -> ConsentAction:
     async def run(
         gateway: TelegramGateway, approval: PendingApproval | None, args: dict[str, Any]
     ) -> Any:
+        """BR28.11: names, bio and username change at once; the photo is a transfer, which is
+        not created when changing a field fails."""
         fields = approved(approval)
         values = {change.field: change.after for change in fields.details.changes}
-        first, last = values.get("first_name"), values.get("last_name")
-        bio, username = values.get("bio"), values.get("username")
+        if values:
+            await gateway.edit_own_profile(
+                values.get("first_name"),
+                values.get("last_name"),
+                values.get("bio"),
+                values.get("username"),
+            )
+        changed = list(values)
+        result: dict[str, Any] = {"changed": changed}
         if fields.file is None:
-            await gateway.edit_own_profile(first, last, bio, username, None, None)
-            return {"changed": list(values)}
+            return result
         assert approval is not None  # noqa: S101 (approved() checked it)
-        record = context.files.take(approval.args_digest)
-        if record is None:
-            raise FileRefused("not_allowed", NO_RECORD_MESSAGE)
-        with open_admitted(record, context.paths) as photo:
-            await gateway.edit_own_profile(first, last, bio, username, photo, record.name)
-        return {"changed": [*values, "photo"]}
+        transfer = start_photo_upload(
+            context,
+            approval,
+            changed,
+            tool=PROFILE_EDIT,
+            chat_id=None,
+            final=lambda record: _set_profile_photo,
+            final_request="profile_photo",
+        )
+        return {**result, "photo_transfer_id": transfer.transfer_id}
 
-    return ConsentAction(DECLS[PROFILE_EDIT], _validate, describe, run)
+    return ConsentAction(
+        DECLS[PROFILE_EDIT], _validate, describe, run, starts_transfer=starts_with_photo
+    )
+
+
+async def _set_profile_photo(gateway: TelegramGateway, uploaded: UploadedFile) -> dict[str, Any]:
+    """The final request of a profile photo (BR28.5)."""
+    await gateway.set_profile_photo(uploaded)
+    return {"changed": ["photo"]}
 
 
 def _validate_get(raw: object) -> dict[str, Any]:

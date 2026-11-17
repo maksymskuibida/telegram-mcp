@@ -48,7 +48,7 @@ async def test_lists_every_tool_with_closed_schemas(paths: FixedPaths) -> None:
         listed = await session.list_tools()
     tools = {tool.name: tool for tool in listed.tools}
     assert {"tg_chats_list", SEND, "tg_files_send", "tg_messages_read"} <= set(tools)
-    assert len(tools) == 30
+    assert len(tools) == 32
     assert all(tool.input_schema["additionalProperties"] is False for tool in tools.values())
     description = tools[SEND].description or ""
     assert description.startswith("The first call never sends: ")

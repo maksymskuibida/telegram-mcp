@@ -159,6 +159,31 @@ class MediaRef:
 
 
 @dataclass(frozen=True)
+class MediaInfo:
+    """What a download needs to know before it starts (C3 media_info): the media's kind, its
+    size, and Telegram's file name (Telegram content). ``size_bytes`` is None when Telegram
+    gives no size; a size of 0 is read as unknown too, since Telegram never stores an empty
+    file (BR26.1)."""
+
+    kind: str
+    size_bytes: int | None
+    file_name: str | None = None
+
+
+@dataclass(frozen=True)
+class UploadedFile:
+    """The parts of one upload stored on Telegram under a random id (C3 upload_part). Nobody
+    can see them until a final request uses them (BR28.4). ``big`` says the parts were stored
+    as big-file parts (files over 10 MB); ``md5`` is the checksum of a small file's bytes."""
+
+    file_id: int
+    parts: int
+    name: str
+    big: bool
+    md5: str = ""
+
+
+@dataclass(frozen=True)
 class Sender:
     id: int
     name: str
@@ -233,12 +258,15 @@ class GatewayError(Exception):
     """Base of every error the gateway raises."""
 
 
-class TooLarge(GatewayError):
-    """A file is larger than the tool moves (BR26, NFR11.5)."""
+class FileReferenceExpired(GatewayError):
+    """A download part was refused because the media's file reference expired; reading the
+    message again (``media_info``) gives a fresh one, and the download goes on from where it
+    was (BR28.3)."""
 
-    def __init__(self, size_bytes: int) -> None:
-        super().__init__(f"the file is {size_bytes} bytes")
-        self.size_bytes = size_bytes
+
+class PartRetryable(GatewayError):
+    """A file part request timed out or lost its connection. A part stores or reads nothing
+    anyone can see, so it may be tried again inside the stall limit (BR28.3)."""
 
 
 class UserNotFound(GatewayError):

@@ -5,12 +5,13 @@ FakeGateway, BR13.1)."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, cast
+from typing import Any, Literal, cast
 
 from telegram_mcp.gateway.models import (
     BadCode,
@@ -20,17 +21,20 @@ from telegram_mcp.gateway.models import (
     ChatRef,
     ChatType,
     CodeExpired,
+    FileReferenceExpired,
     FloodWait,
     FolderRef,
     GatewayError,
     GatewayTimeout,
     Me,
+    MediaInfo,
     MediaRef,
     MessageView,
     NotAUser,
     NotAuthorized,
     OutcomeUnknown,
     OwnProfile,
+    PartRetryable,
     PasswordNeeded,
     PersonInfo,
     QrExpired,
@@ -41,10 +45,10 @@ from telegram_mcp.gateway.models import (
     SentCodeInfo,
     SentMessage,
     TelegramError,
-    TooLarge,
     TopicInfo,
     TopicNotFound,
     UnreadState,
+    UploadedFile,
     UserNotFound,
     decode_cursor,
     encode_cursor,
@@ -68,6 +72,8 @@ ADMIN_RIGHT_NAMES = (
 FAKE_CONFIG_NAME = "fake-gateway.json"
 FAKE_RECORD_NAME = "fake-gateway-calls.jsonl"
 READ_ACKNOWLEDGING_CALLS = frozenset({"mark_read"})
+FINAL_REQUESTS = frozenset({"send_uploaded_file", "set_chat_photo", "set_profile_photo"})
+"""The requests that make an upload visible to anyone (BR28.4, BR28.5)."""
 
 
 @dataclass
@@ -82,8 +88,9 @@ class Script:
     times: int | None = 1
     delay: float = 0.0
     result: Any = None
-    after_bytes: int | None = None
-    """For download_media: write this many bytes, then raise ``error``."""
+    part: int | None = None
+    """For download_part and upload_part: the script applies only to the part with this
+    number (offset // limit for a download, the index for an upload); None means any part."""
 
 
 @dataclass(frozen=True)
@@ -209,6 +216,10 @@ class FakeGateway:
     invites: list[str] = field(default_factory=list)
     profile_photos: list[bytes] = field(default_factory=list)
     chat_photos: list[tuple[int, bytes]] = field(default_factory=list)
+    uploaded_parts: dict[int, dict[int, bytes]] = field(default_factory=dict)
+    """The parts stored per upload file id; nobody sees them until a final request."""
+    unknown_size: set[tuple[int, int]] = field(default_factory=set)
+    """Media (chat id, message id) whose size Telegram does not give."""
     _next_message_id: int = 1000
     _next_seeded_id: int = 0
     _next_chat_id: int = -1000000009000
@@ -223,10 +234,11 @@ class FakeGateway:
         times: int | None = 1,
         delay: float = 0.0,
         result: Any = None,
-        after_bytes: int | None = None,
+        part: int | None = None,
     ) -> None:
         """Make the next ``times`` calls of ``call`` wait ``delay`` seconds, then raise, hang,
-        drop after sending, go on, or return ``result``."""
+        drop after sending, go on, or return ``result``. With ``part``, only the calls for that
+        part of a download or an upload."""
         self.scripts.setdefault(call, []).append(
             Script(
                 error=error,
@@ -235,7 +247,7 @@ class FakeGateway:
                 times=times,
                 delay=delay,
                 result=result,
-                after_bytes=after_bytes,
+                part=part,
             )
         )
 
@@ -410,31 +422,41 @@ class FakeGateway:
     def call_names(self) -> list[str]:
         return [name for name, _ in self.calls]
 
-    async def _enter(self, name: str, /, **args: Any) -> Script | None:
+    async def _enter(self, name: str, /, _part: int | None = None, **args: Any) -> Script | None:
         self.calls.append((name, args))
         if self.record_path is not None:
             with self.record_path.open("a", encoding="utf-8") as record:
                 record.write(json.dumps({"call": name, "args": args}, default=str) + "\n")
-        script = self._take_script(name)
+        script = self._take_script(name, _part)
         if script is not None:
             if script.delay > 0:
                 await self.sleep(script.delay)
             if script.hang:
                 await asyncio.Event().wait()
-            if script.error is not None and script.after_bytes is None:
+            if script.error is not None:
                 raise script.error
         return script
 
-    def _take_script(self, name: str) -> Script | None:
+    def _take_script(self, name: str, part: int | None = None) -> Script | None:
         queue = self.scripts.get(name)
         if not queue:
             return None
-        script = queue[0]
+        script = next((s for s in queue if s.part is None or s.part == part), None)
+        if script is None:
+            return None
         if script.times is not None:
             script.times -= 1
             if script.times <= 0:
-                queue.pop(0)
+                queue.remove(script)
         return script
+
+    def final_requests(self) -> list[tuple[str, dict[str, Any]]]:
+        """Every request that made an upload visible (send the file, set a photo)."""
+        return [(name, args) for name, args in self.calls if name in FINAL_REQUESTS]
+
+    def part_calls(self, name: str) -> list[dict[str, Any]]:
+        """The recorded arguments of every ``download_part`` or ``upload_part`` call."""
+        return [args for call, args in self.calls if call == name]
 
     async def connect(self) -> None:
         await self._enter("connect")
@@ -703,24 +725,65 @@ class FakeGateway:
             )
         return self.profile
 
-    async def download_media(
-        self, chat_id: int, message_id: int, file_obj: BinaryIO, max_bytes: int
-    ) -> int:
-        script = await self._enter(
-            "download_media", chat_id=chat_id, message_id=message_id, max_bytes=max_bytes
+    async def media_info(self, chat_id: int, message_id: int) -> MediaInfo | None:
+        await self._enter("media_info", chat_id=chat_id, message_id=message_id)
+        self._require_authorized()
+        self._require_chat(chat_id)
+        message = self.message(chat_id, message_id)
+        if message is None:
+            raise TelegramError("MESSAGE_ID_INVALID")
+        if message.media is None:
+            return None
+        unknown = (chat_id, message_id) in self.unknown_size or message.media_size == 0
+        return MediaInfo(
+            kind=message.media,
+            size_bytes=None if unknown else message.media_size,
+            file_name=message.file_name,
+        )
+
+    async def download_part(self, chat_id: int, message_id: int, offset: int, limit: int) -> bytes:
+        """One part of the seeded media: its stored bytes, or zeros up to its size when the
+        test seeded only a size (a large file without holding its bytes)."""
+        await self._enter(
+            "download_part",
+            _part=offset // limit if limit else None,
+            chat_id=chat_id,
+            message_id=message_id,
+            offset=offset,
+            limit=limit,
         )
         self._require_authorized()
         message = self.message(chat_id, message_id)
         if message is None or message.media is None:
             raise TelegramError("MEDIA_EMPTY")
-        if message.media_size > max_bytes:
-            raise TooLarge(message.media_size)
-        data = self.media_bytes.get((chat_id, message_id), b"\0" * message.media_size)
-        if script is not None and script.after_bytes is not None:
-            file_obj.write(data[: script.after_bytes])
-            raise script.error or TelegramError("download failed")
-        file_obj.write(data)
-        return len(data)
+        stored = self.media_bytes.get((chat_id, message_id))
+        if stored is not None:
+            return stored[offset : offset + limit]
+        return b"\0" * max(0, min(limit, message.media_size - offset))
+
+    async def upload_part(
+        self, file_id: int, index: int, total: int, data: bytes, big: bool
+    ) -> None:
+        await self._enter(
+            "upload_part",
+            _part=index,
+            file_id=file_id,
+            index=index,
+            total=total,
+            size=len(data),
+            big=big,
+        )
+        self._require_authorized()
+        self.uploaded_parts.setdefault(file_id, {})[index] = bytes(data)
+
+    def _assembled(self, uploaded: UploadedFile) -> bytes:
+        parts = self.uploaded_parts.get(uploaded.file_id, {})
+        if sorted(parts) != list(range(uploaded.parts)):
+            raise TelegramError("FILE_PARTS_INVALID")
+        data = b"".join(parts[index] for index in range(uploaded.parts))
+        if not uploaded.big and uploaded.md5 != hashlib.md5(data).hexdigest():  # noqa: S324
+            raise TelegramError("MD5_CHECKSUM_INVALID")
+        return data
 
     # U4 writes ---------------------------------------------------------------------------
 
@@ -864,28 +927,15 @@ class FakeGateway:
         self.roles[(chat_id, user_id)] = "admin" if any(rights.values()) else "member"
         self._sent(script)
 
-    async def edit_chat(
-        self,
-        chat_id: int,
-        title: str | None,
-        description: str | None,
-        photo: BinaryIO | None,
-        photo_name: str | None,
-    ) -> None:
+    async def edit_chat(self, chat_id: int, title: str | None, description: str | None) -> None:
         script = await self._write(
-            "edit_chat",
-            chat_id=chat_id,
-            title=title,
-            description=description,
-            photo_name=photo_name,
+            "edit_chat", chat_id=chat_id, title=title, description=description
         )
         chat = self._chat(chat_id)
         if title is not None:
             self.chats[[c.id for c in self.chats].index(chat_id)] = replace(chat, name=title)
         if description is not None:
             self.extras.setdefault(chat_id, ChatExtra()).description = description
-        if photo is not None:
-            self.chat_photos.append((chat_id, photo.read()))
         self._sent(script)
 
     async def edit_own_profile(
@@ -894,8 +944,6 @@ class FakeGateway:
         last_name: str | None,
         bio: str | None,
         username: str | None,
-        photo: BinaryIO | None,
-        photo_name: str | None,
     ) -> None:
         script = await self._write(
             "edit_own_profile",
@@ -903,7 +951,6 @@ class FakeGateway:
             last_name=last_name,
             bio=bio,
             username=username,
-            photo_name=photo_name,
         )
         current = self._profile()
         changes: dict[str, Any] = {
@@ -916,23 +963,41 @@ class FakeGateway:
             )
             if value is not None
         }
-        if photo is not None:
-            self.profile_photos.append(photo.read())
-            changes["has_photo"] = True
         self.profile = replace(current, **changes)
         self._sent(script)
 
-    async def send_file(
-        self, chat_id: int, file_obj: BinaryIO, name: str, caption: str
+    # U4 final requests of an upload (BR28.5) ---------------------------------------------------
+
+    async def send_uploaded_file(
+        self, chat_id: int, uploaded: UploadedFile, caption: str
     ) -> SentMessage:
-        script = await self._write("send_file", chat_id=chat_id, name=name, caption=caption)
+        script = await self._write(
+            "send_uploaded_file",
+            chat_id=chat_id,
+            file_id=uploaded.file_id,
+            name=uploaded.name,
+            caption=caption,
+        )
         self._require_chat(chat_id)
-        data = file_obj.read()
+        data = self._assembled(uploaded)
         self._next_message_id += 1
         message = SentMessage(id=self._next_message_id, chat_id=chat_id, date=datetime.now(UTC))
-        self.sent_files.append(SentFile(chat_id, name, caption, data, message))
+        self.sent_files.append(SentFile(chat_id, uploaded.name, caption, data, message))
         self._sent(script)
         return message
+
+    async def set_chat_photo(self, chat_id: int, uploaded: UploadedFile) -> None:
+        script = await self._write("set_chat_photo", chat_id=chat_id, file_id=uploaded.file_id)
+        self._require_chat(chat_id)
+        self.chat_photos.append((chat_id, self._assembled(uploaded)))
+        self._sent(script)
+
+    async def set_profile_photo(self, uploaded: UploadedFile) -> None:
+        script = await self._write("set_profile_photo", file_id=uploaded.file_id)
+        data = self._assembled(uploaded)
+        self.profile_photos.append(data)
+        self.profile = replace(self._profile(), has_photo=True)
+        self._sent(script)
 
     def _require_authorized(self) -> None:
         if not self.authorized:
@@ -986,5 +1051,7 @@ def _error_from_name(name: str | None) -> GatewayError | None:
         "outcome_unknown": OutcomeUnknown,
         "chat_not_found": ChatNotFound,
         "code_expired": CodeExpired,
+        "file_reference_expired": FileReferenceExpired,
+        "part_retryable": PartRetryable,
     }
     return simple[kind]()

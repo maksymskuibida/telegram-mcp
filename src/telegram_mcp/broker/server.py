@@ -29,7 +29,7 @@ import stat
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from telegram_mcp import __version__
 from telegram_mcp.actions import ActionRegistry, ConsentAction, default_registry
@@ -59,6 +59,14 @@ from telegram_mcp.broker.scheduler import (
     WriteLine,
 )
 from telegram_mcp.broker.secret import new_secret, remove_leftovers, write_secret
+from telegram_mcp.broker.transfers import (
+    ACCEPTING_CLIENT,
+    QUEUE_FULL_MESSAGE,
+    FinalNotStarted,
+    Transfer,
+    TransferQueue,
+    TransferState,
+)
 from telegram_mcp.consent import (
     ActionKind,
     Allow,
@@ -71,6 +79,7 @@ from telegram_mcp.consent import (
     Refuse,
     canonical_digest,
 )
+from telegram_mcp.files import sweep_partials
 from telegram_mcp.gateway.models import (
     ChatNotFound,
     ChatRef,
@@ -80,8 +89,8 @@ from telegram_mcp.gateway.models import (
     NotAUser,
     NotAuthorized,
     OutcomeUnknown,
+    PartRetryable,
     TelegramError,
-    TooLarge,
     TopicNotFound,
     UnreadState,
     UserNotFound,
@@ -171,6 +180,17 @@ ASK_AGAIN_CONTENT = {
     "ask_again_unneeded": "ask again: nothing to reopen",
 }
 UNUSED_CONTENT = "allowed but not used within 60 s"
+TRANSFER_RESULTS = {
+    "outcome_unknown": "outcome_unknown",
+    "stalled": "telegram_timeout",
+    "flood_wait": "flood_wait",
+    "changed": "not_allowed",
+    "no_session": "no_session",
+}
+"""BR28.10, NFR8.7: the ErrorCode nearest a transfer's end; every other code is
+telegram_error, and the exact transfer code stays in the entry's content."""
+NO_GATEWAY = cast("TelegramGateway", None)
+"""What a read that never reaches Telegram is given in place of the gateway (NFR2.10)."""
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -300,6 +320,15 @@ class Broker:
         )
         self.writes = WriteLine(clock=clock, on_drop=self._write_dropped)
         self.reads = ReadPlaces()
+        self.transfers = TransferQueue(
+            clock=clock,
+            sleep=sleep,
+            open_gateway=self._transfer_gateway,
+            final_line=self._final_line,
+            on_end=self._log_transfer_end,
+        )
+        if self.registry.context is not None:
+            self.registry.context.transfers = self.transfers
         self._clock = clock
         self._sleep = sleep
         self._vault = vault or SessionVault(paths.keychain_service)
@@ -340,6 +369,7 @@ class Broker:
         try:
             self.diagnostics.start()
             self.diagnostics.write(f"broker {__version__} starting, pid {os.getpid()}")
+            self._sweep_partials()  # before any call can accept a transfer (BR28.9)
             await self._open_endpoint()
             _require_private_modes(self.paths)
         except BaseException:
@@ -399,6 +429,7 @@ class Broker:
         if server is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(server.wait_closed(), DISCONNECT_LIMIT_SECONDS)
+        await self.transfers.close()  # before the write line, so a final send can finish
         await self.writes.close()
         await self.link.close(DISCONNECT_LIMIT_SECONDS)
         self._lock.release()
@@ -553,6 +584,69 @@ class Broker:
         self._vault_result = None
         self.link.mark_dropped()
 
+    # Background transfers (BR28) --------------------------------------------------------------
+
+    async def _transfer_gateway(self) -> TelegramGateway:
+        """The connection a transfer's next request uses. No session ends the transfer; a
+        connection that cannot be opened now is tried again inside the stall limit."""
+        if self._logging_out:
+            raise NotAuthorized()
+        try:
+            return await self._open_gateway(await self._session())
+        except ToolFailure as failure:
+            if failure.code in ("no_session", "keychain_locked"):
+                raise NotAuthorized() from failure
+            raise PartRetryable() from failure
+
+    async def _final_line(self, transfer: Transfer, run: Callable[[], Awaitable[Any]]) -> Any:
+        """BR28.5: an upload's final request enters the write line as one write. It does not
+        depend on a client's connection: clients leaving never stops a transfer."""
+        item = WriteItem(
+            tool=transfer.tool,
+            approval_id=transfer.approval_id or transfer.transfer_id,
+            arrived_at=self._clock(),
+            is_open=lambda: True,
+            run=run,
+        )
+        try:
+            return await self.writes.submit(item)
+        except (WriteDropped, LineFull) as unsent:
+            raise FinalNotStarted() from unsent
+
+    def _log_transfer_end(self, transfer: Transfer) -> None:
+        """BR28.10, NFR8.7: one entry in C8's shape when a transfer becomes final."""
+        code = f" {transfer.code}" if transfer.code else ""
+        ended = transfer.finished_at or self._clock()
+        seconds = int((ended - transfer.created_at).total_seconds())
+        size = transfer.size_bytes if transfer.size_bytes is not None else "unknown"
+        where = transfer.path or "no file kept"
+        content = (
+            f"transfer {transfer.transfer_id} {transfer.state}{code}: {transfer.bytes_done} of "
+            f"{size} bytes in {seconds} s, {where} ({transfer.name})"
+        )
+        result = "ok"
+        if transfer.state is not TransferState.DONE:
+            result = TRANSFER_RESULTS.get(transfer.code or "", "telegram_error")
+        self._log_entry(
+            transfer.client,
+            "result",
+            transfer.tool,
+            result,
+            approval_id=transfer.approval_id,
+            chat_id=transfer.chat_id,
+            content=content,
+        )
+
+    def _sweep_partials(self) -> None:
+        """BR28.9: remove partial downloads a killed broker left behind."""
+        try:
+            folder = Settings.folder(self.paths, "downloads_dir")
+        except SettingsError:
+            return
+        removed = sweep_partials(folder)
+        if removed:
+            self.diagnostics.write(f"removed {len(removed)} leftover partial download file(s)")
+
     # approval.check -------------------------------------------------------------------------
 
     async def _approval_check(self, connection: Connection, params: dict[str, Any]) -> Any:
@@ -664,7 +758,7 @@ class Broker:
             return ToolFailure.fixed("not_found", "not_found_topic")
         if isinstance(error, FloodWait):
             return ToolFailure.flood(error.seconds)
-        if isinstance(error, UserNotFound | NotAUser | TooLarge):
+        if isinstance(error, UserNotFound | NotAUser):
             return _catalog_failure(error)
         if isinstance(error, NotAuthorized):
             self._forget_session()
@@ -811,6 +905,7 @@ class Broker:
         if not isinstance(tool, str):
             return ToolFailure("invalid_arguments", "tool must be a tool name").as_result()
         raw = params.get("args")
+        ACCEPTING_CLIENT.set(connection.label)  # names the client in a transfer's end entry
         try:
             if self.gate.kind_of(tool) is not ActionKind.READ and not connection.is_claude_code:
                 raise ToolFailure.fixed("unsupported_client")
@@ -835,6 +930,8 @@ class Broker:
         decl = action.decl
         if decl.kind is ActionKind.READ and not decl.marks_read_option:
             args = _validated_read(action, raw)
+            if not action.uses_telegram:
+                return await self._run_local(action, args), None
             gateway = await self._open_gateway(stored)
             return await self._run_read(connection, action, gateway, args), None
         raw, _ = _split_ask_again(raw)  # ask_again never changes what runs (BR12.5)
@@ -853,10 +950,16 @@ class Broker:
             return await self._mark(connection, action, gateway, args, digest)
         if self.writes.is_full:
             raise ToolFailure("telegram_error", MESSAGES["line_full"])
+        starts = action.starts_transfer is not None and action.starts_transfer(args)
+        if starts and self.transfers.is_full:  # BR28.1: refused before the approval is used
+            raise ToolFailure("telegram_error", QUEUE_FULL_MESSAGE)
         approval = self._consume(action.tool, digest)  # used here: the write enters the line
+        label = connection.label
         try:
             data = await self._queue_write(
-                connection, approval, lambda: self._run_write(action, gateway, approval, args)
+                connection,
+                approval,
+                lambda: self._run_write(action, gateway, approval, args, label),
             )
         except ToolFailure as failure:
             failure.approval = approval
@@ -911,6 +1014,17 @@ class Broker:
         async with asyncio.timeout(self.call_limit), self.reads.place():
             return await action.run(gateway, None, args)
 
+    async def _run_local(self, action: ConsentAction, args: dict[str, Any]) -> Any:
+        """A read of the broker's own state (the transfer tools): no read place, no Telegram
+        connection, at most ``wait_seconds`` (25 s) inside the call limit (NFR11.14)."""
+        if action.run is None:
+            raise ToolFailure("not_allowed", NOT_ALLOWED_MESSAGE)
+        try:
+            async with asyncio.timeout(self.call_limit):
+                return await action.run(NO_GATEWAY, None, args)
+        except Exception as error:
+            raise self._read_failure(error) from error
+
     def _may_wait_out(self, seconds: int, arrived: datetime) -> bool:
         if seconds > LONGEST_READ_FLOOD_WAIT_SECONDS:
             return False
@@ -949,12 +1063,14 @@ class Broker:
         gateway: TelegramGateway,
         approval: PendingApproval,
         args: dict[str, Any],
+        label: str = "unknown",
     ) -> Any:
         """Run exactly what was approved (BR3.9), from the write line."""
         if action.run is None:
             raise ToolFailure("not_allowed", NOT_ALLOWED_MESSAGE)
         if self._logging_out:  # a logout started while this write waited: the session is gone
             raise ToolFailure.fixed("no_session")
+        ACCEPTING_CLIENT.set(label)  # this runs in the write line's task
         try:
             async with asyncio.timeout(self.call_limit):
                 return await action.run(gateway, approval, args)
@@ -1099,7 +1215,7 @@ class Broker:
             return ToolFailure("invalid_arguments", str(error))
         if isinstance(error, TopicNotFound):
             return ToolFailure.fixed("not_found", "not_found_topic")
-        if isinstance(error, UserNotFound | NotAUser | TooLarge):
+        if isinstance(error, UserNotFound | NotAUser):
             return _catalog_failure(error)
         if isinstance(error, NotAuthorized):
             self._forget_session()
@@ -1204,6 +1320,7 @@ class Broker:
             return ToolFailure.fixed("no_session").as_result()
         self._logging_out = True
         try:
+            await self.transfers.close()  # BR28.9: a logout ends every transfer
             await self.writes.wait_idle()
             self.gate.drop_open()
             ended = await self._end_session()
@@ -1290,9 +1407,15 @@ class Broker:
                 )
 
     def stop_if_idle(self) -> None:
-        """Stop after ten minutes with no request, never while one runs. Open but silent
-        connections, the sweep and the secret rotation are not activity."""
-        if self._stopped.is_set() or self.running_requests or self.writes.busy:
+        """Stop after ten minutes with no request, never while one runs or while a transfer is
+        queued, transferring or sending (BR28.9). Open but silent connections, the sweep and
+        the secret rotation are not activity."""
+        if (
+            self._stopped.is_set()
+            or self.running_requests
+            or self.writes.busy
+            or self.transfers.busy
+        ):
             return
         idle = self._seconds_since(self._last_activity)
         if idle >= self.idle_limit:
@@ -1443,14 +1566,8 @@ class Broker:
 # Helpers --------------------------------------------------------------------------------------
 
 
-def _catalog_failure(error: UserNotFound | NotAUser | TooLarge) -> ToolFailure:
-    """The gateway errors of U4's lookups and transfers, with a message naming what failed."""
-    if isinstance(error, TooLarge):
-        return ToolFailure(
-            "invalid_arguments",
-            f"The file is {error.size_bytes} bytes; files over 20 MB are not moved by this "
-            "tool. Download or send it in Telegram yourself.",
-        )
+def _catalog_failure(error: UserNotFound | NotAUser) -> ToolFailure:
+    """The gateway errors of U4's lookups, with a message naming what failed."""
     if isinstance(error, NotAUser):
         return ToolFailure("not_found", "That username is a chat; use tg_chats_info.")
     if error.username is not None:

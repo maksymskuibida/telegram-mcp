@@ -4,13 +4,14 @@ the unread check and the mark)."""
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import BinaryIO, Protocol
+from typing import Protocol
 
 from telegram_mcp.gateway.models import (
     ChatDetails,
     ChatRef,
     FolderRef,
     Me,
+    MediaInfo,
     MessageView,
     OwnProfile,
     PersonInfo,
@@ -20,6 +21,7 @@ from telegram_mcp.gateway.models import (
     SentMessage,
     TopicInfo,
     UnreadState,
+    UploadedFile,
 )
 
 
@@ -124,11 +126,24 @@ class TelegramGateway(Protocol):
 
     async def own_profile(self) -> OwnProfile: ...
 
-    async def download_media(
-        self, chat_id: int, message_id: int, file_obj: BinaryIO, max_bytes: int
-    ) -> int:
-        """Write a message's media into ``file_obj``; the number of bytes written. ``TooLarge``
-        before writing when it is over ``max_bytes``."""
+    async def media_info(self, chat_id: int, message_id: int) -> MediaInfo | None:
+        """The kind, size and file name of one message's media, or None when the message has
+        no media. Reading it again gives the download a fresh file reference (BR28.3)."""
+
+    async def download_part(self, chat_id: int, message_id: int, offset: int, limit: int) -> bytes:
+        """One part of a message's media, at most ``limit`` bytes from ``offset``, as one
+        request under the 30 s limit; fewer bytes than ``limit`` means the file ended. Raises
+        ``FileReferenceExpired`` when the reference must be read again, ``PartRetryable``
+        when the request timed out or lost its connection."""
+
+    # U4: file parts. A part is stored under a random id that nobody can see (BR28.4). --------
+
+    async def upload_part(
+        self, file_id: int, index: int, total: int, data: bytes, big: bool
+    ) -> None:
+        """Store part ``index`` (from 0) of ``total`` under ``file_id``, as one request under the
+        30 s limit: the small-file request, or with ``big`` the big-file request. Raises
+        ``PartRetryable`` when the request timed out or lost its connection."""
 
     # U4: writes. ---------------------------------------------------------------------------
 
@@ -166,15 +181,8 @@ class TelegramGateway(Protocol):
         self, chat_id: int, user_id: int, rights: dict[str, bool]
     ) -> None: ...
 
-    async def edit_chat(
-        self,
-        chat_id: int,
-        title: str | None,
-        description: str | None,
-        photo: BinaryIO | None,
-        photo_name: str | None,
-    ) -> None:
-        """Change the fields given; None leaves a field as it is."""
+    async def edit_chat(self, chat_id: int, title: str | None, description: str | None) -> None:
+        """Change the fields given; None leaves a field as it is. The photo is a transfer."""
 
     async def edit_own_profile(
         self,
@@ -182,15 +190,21 @@ class TelegramGateway(Protocol):
         last_name: str | None,
         bio: str | None,
         username: str | None,
-        photo: BinaryIO | None,
-        photo_name: str | None,
     ) -> None:
-        """Change the fields given; None leaves a field as it is."""
+        """Change the fields given; None leaves a field as it is. The photo is a transfer."""
 
-    async def send_file(
-        self, chat_id: int, file_obj: BinaryIO, name: str, caption: str
+    # U4: the final requests of an upload, each one write under the 30 s limit (BR28.5). -----
+
+    async def send_uploaded_file(
+        self, chat_id: int, uploaded: UploadedFile, caption: str
     ) -> SentMessage:
-        """Upload from the open file object (the one that was checked, NFR3.2)."""
+        """Send the uploaded parts as one file with its caption."""
+
+    async def set_chat_photo(self, chat_id: int, uploaded: UploadedFile) -> None:
+        """Make the uploaded parts the chat's photo."""
+
+    async def set_profile_photo(self, uploaded: UploadedFile) -> None:
+        """Make the uploaded parts the account's profile photo."""
 
 
 GatewayFactory = Callable[[str, int, str], TelegramGateway]

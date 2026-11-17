@@ -1,20 +1,26 @@
 """The catalogue itself and what its tools leave in the activity log (test-after). Covers BR20.1 to
-BR20.3, NFR1.1, NFR1.4 and NFR8.4 to NFR8.6: exactly the 30 tools of C5 with C2's kinds, honest
-descriptions, no secret in any argument, result field or log entry, every call and result logged,
-and files named by path, name and size only."""
+BR20.3, BR28.10, NFR1.1, NFR1.4, NFR4.4 and NFR8.4 to NFR8.7: exactly the 32 tools of C5 with C2's
+kinds, honest descriptions, no secret in any argument, result field or log entry, every call and
+result logged, files named by path, name and size only, and one end entry per transfer in C8's
+existing shape."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
+
+import pytest
 
 from support.catalog import (
     CAROL,
     CLUB,
+    PHOTO,
     PHOTO_BYTES,
     answer,
     call,
     check,
     confirmed_run,
+    finished,
     log_entries,
     put_file,
 )
@@ -23,6 +29,8 @@ from support.samples import ALICE, FAMILY, FORUM, TEAM
 from telegram_mcp.actions import default_registry
 from telegram_mcp.consent import ActionKind
 from telegram_mcp.gateway.fake import FakeGateway
+from telegram_mcp.gateway.models import FloodWait, TelegramError
+from telegram_mcp.log_reader import parse_entry
 from telegram_mcp.paths import FixedPaths
 from telegram_mcp.tools import ASK_AGAIN_SENTENCE, TOOL_SPECS, WRITE_FIRST_CALL
 from telegram_mcp.vault import SessionVault
@@ -61,6 +69,8 @@ C5 = {
     "tg_profile_edit": "W",
     "tg_media_download": "R",
     "tg_files_send": "W",
+    "tg_transfers_list": "R",
+    "tg_transfers_cancel": "R",
 }
 C2_WRITE_KINDS = {
     "send": ["tg_messages_send"],
@@ -134,6 +144,10 @@ def test_descriptions_say_whether_a_tool_asks_or_marks() -> None:
     assert "only when the chat or topic has unread messages" in specs["tg_chats_mark_read"]
     assert "unless mark_read is true" in specs["tg_messages_read"]
     assert "older unread ones included" in specs["tg_messages_read"]
+    for tool in ("tg_transfers_list", "tg_transfers_cancel"):
+        assert "It changes nothing on Telegram." in specs[tool]
+    assert "returns at once" in specs["tg_media_download"]
+    assert "returns at once" in specs["tg_files_send"]
 
 
 def test_no_argument_names_a_secret_or_a_telegram_method() -> None:
@@ -158,7 +172,12 @@ async def run_every_u4_tool(
 ) -> list[dict[str, Any]]:
     """Every U4 tool once (reads, writes, the mark), returning each result."""
     results = [await call(client, tool, args) for tool, args in READS]
-    results.append(await call(client, "tg_media_download", {"chat": ALICE.id, "message_id": 3}))
+    download = await call(client, "tg_media_download", {"chat": ALICE.id, "message_id": 3})
+    results.append(download)
+    await finished(client, download)
+    results.append(await call(client, "tg_transfers_list", {}))
+    stop = {"transfer_id": download["data"]["transfer_id"]}
+    results.append(await call(client, "tg_transfers_cancel", stop))
     for tool, args, _, _ in sorted(WRITES, key=lambda write: write[0] == "tg_messages_delete"):
         results.append(await confirmed_run(hook, client, tool, args))
     results.append(
@@ -189,7 +208,14 @@ async def test_every_tool_call_and_result_is_logged_without_secrets(
     results = await run_every_u4_tool(approval_hook, claude, world, paths)
     assert all(result["ok"] for result in results), [r for r in results if not r["ok"]]
     for result in results:
-        assert SECRET_NAMES.isdisjoint(field_names(result["data"]))
+        names = field_names(result["data"])
+        if "transfers" in result["data"]:
+            # A transfer record's ``code`` is why it ended (entities.md Transfer), never a login
+            # code; its value is one of the closed transfer codes.
+            codes = {record["code"] for record in result["data"]["transfers"]}
+            assert codes <= {None, "stalled", "cancelled", "broker_stopped", "telegram_error"}
+            names -= {"code"}
+        assert SECRET_NAMES.isdisjoint(names)
     entries = log_entries(paths)
     for tool in set(C5) - {"tg_chats_list", "tg_messages_send"}:
         events = [e for e in entries if e["tool"] == tool]
@@ -206,25 +232,138 @@ async def test_every_tool_call_and_result_is_logged_without_secrets(
     assert "FakeInvite" not in text
 
 
+def results_of(paths: FixedPaths, tool: str) -> list[dict[str, Any]]:
+    return [e for e in log_entries(paths) if e["tool"] == tool and e["event"] == "result"]
+
+
 async def test_files_are_logged_by_path_name_and_size_only(
     approval_hook: RawClient, claude: RawClient, paths: FixedPaths
 ) -> None:
     path = put_file(paths, "report.pdf", b"PRIVATE-CONTENT-1234")
     args = {"chat": ALICE.id, "path": str(path)}
-    assert (await confirmed_run(approval_hook, claude, "tg_files_send", args))["ok"]
+    accepted = await confirmed_run(approval_hook, claude, "tg_files_send", args)
+    up = accepted["data"]["transfer_id"]
+    sent_record = await finished(claude, accepted)
     download = await call(claude, "tg_media_download", {"chat": ALICE.id, "message_id": 3})
-    saved = download["data"]["path"]
+    down = download["data"]["transfer_id"]
+    saved = (await finished(claude, download))["path"]
     entries = log_entries(paths)
     prompt = next(e for e in entries if e["tool"] == "tg_files_send" and e["event"] == "prompt")
     assert f"File: {path}" in prompt["content"]
     assert "report.pdf, 0.0 KB (20 bytes)" in prompt["content"]
-    sent = [e for e in entries if e["tool"] == "tg_files_send" and e["event"] == "result"][-1]
-    assert sent["content"] == f"{path} (report.pdf, 20 bytes)"
-    got = [e for e in entries if e["tool"] == "tg_media_download" and e["event"] == "result"][-1]
-    assert got["content"] == f"{saved} (holiday.jpg, {len(PHOTO_BYTES)} bytes)"
+    started, ended = results_of(paths, "tg_files_send")
+    assert started["content"] == f"transfer {up} transferring: {path} (report.pdf, 20 bytes)"
+    assert ended["content"].startswith(f"transfer {up} done: 20 of 20 bytes in ")
+    assert ended["content"].endswith(f" s, {path} (report.pdf)")
+    assert (ended["result"], ended["approval_id"]) == ("ok", started["approval_id"])
+    assert sent_record["result"]["path"] == str(path)
+    started, ended = results_of(paths, "tg_media_download")
+    size = len(PHOTO_BYTES)
+    assert (
+        started["content"]
+        == f"transfer {down} transferring: holiday.jpg (holiday.jpg, {size} bytes)"
+    )
+    assert ended["content"].startswith(f"transfer {down} done: {size} of {size} bytes in ")
+    assert ended["content"].endswith(f" s, {saved} (holiday.jpg)")
     text = paths.log.read_text(encoding="utf-8")
     assert "PRIVATE-CONTENT-1234" not in text
     assert PHOTO_BYTES.decode("latin-1") not in text
+
+
+def ends(paths: FixedPaths, transfer_id: str) -> list[dict[str, Any]]:
+    """The end entries of one transfer, each parsed as U6's log reader parses it."""
+    found = []
+    for line in paths.log.read_text(encoding="utf-8").splitlines():
+        entry = parse_entry(line)
+        assert entry is not None, line
+        content = entry.get("content") or ""
+        if content.startswith(f"transfer {transfer_id} ") and " of " in content:
+            found.append(entry)
+    return found
+
+
+Setup = Callable[[FakeGateway], None]
+
+
+@pytest.mark.parametrize(
+    ("tool", "setup", "state", "code", "result"),
+    [
+        ("tg_files_send", lambda fake: None, "done", None, "ok"),
+        (
+            "tg_files_send",
+            lambda fake: fake.script("send_uploaded_file", drop_after_send=True),
+            "unknown",
+            "outcome_unknown",
+            "outcome_unknown",
+        ),
+        (
+            "tg_media_download",
+            lambda fake: fake.script("download_part", hang=True, times=None),
+            "failed",
+            "stalled",
+            "telegram_timeout",
+        ),
+        (
+            "tg_media_download",
+            lambda fake: fake.script("download_part", error=FloodWait(120)),
+            "failed",
+            "flood_wait",
+            "flood_wait",
+        ),
+        (
+            "tg_media_download",
+            lambda fake: fake.script("download_part", error=TelegramError("FILE_PART_INVALID")),
+            "failed",
+            "telegram_error",
+            "telegram_error",
+        ),
+    ],
+    ids=["done-upload", "unknown-upload", "stalled-download", "flood-download", "refused"],
+)
+async def test_each_transfer_end_is_one_entry_with_the_nearest_error_code(
+    approval_hook: RawClient,
+    claude: RawClient,
+    world: FakeGateway,
+    paths: FixedPaths,
+    tool: str,
+    setup: Setup,
+    state: str,
+    code: str | None,
+    result: str,
+) -> None:
+    setup(world)
+    if tool == "tg_files_send":
+        path = put_file(paths, "report.pdf", b"report")
+        args: dict[str, Any] = {"chat": ALICE.id, "path": str(path)}
+        accepted = await confirmed_run(approval_hook, claude, tool, args)
+    else:
+        accepted = await call(claude, tool, {"chat": ALICE.id, "message_id": PHOTO})
+    record = await finished(claude, accepted)
+    assert (record["state"], record["code"]) == (state, code)
+    (entry,) = ends(paths, accepted["data"]["transfer_id"])
+    assert (entry["event"], entry["tool"], entry["result"], entry["chat_id"]) == (
+        "result",
+        tool,
+        result,
+        ALICE.id,
+    )
+    assert entry["client"] == "mcp-server:claude-code"
+    assert entry["content"].startswith(f"transfer {accepted['data']['transfer_id']} {state}")
+    if code is not None:
+        assert f" {state} {code}:" in entry["content"]  # the exact transfer code stays in it
+    assert (entry["approval_id"] is not None) == (tool == "tg_files_send")
+
+
+async def test_a_cancelled_download_ends_with_telegram_error_and_its_code(
+    claude: RawClient, world: FakeGateway, paths: FixedPaths
+) -> None:
+    world.script("download_part", hang=True, times=None)
+    accepted = await call(claude, "tg_media_download", {"chat": ALICE.id, "message_id": PHOTO})
+    tid = accepted["data"]["transfer_id"]
+    assert (await call(claude, "tg_transfers_cancel", {"transfer_id": tid}))["ok"]
+    (entry,) = ends(paths, tid)
+    assert entry["result"] == "telegram_error"
+    assert f"transfer {tid} cancelled cancelled: " in entry["content"]
 
 
 async def test_what_claude_looked_for_is_logged(claude: RawClient, paths: FixedPaths) -> None:

@@ -159,9 +159,10 @@ outbox_dir = "~/Downloads/telegram-mcp/outbox"   # files Claude may send (defaul
 downloads_dir = "~/Downloads/telegram-mcp"       # where downloads are saved (default)
 ```
 
-- Only a file inside `outbox_dir` can be sent, at most 20 MB. Put a file there yourself, then
-  ask Claude to send it.
-- Downloads go into `downloads_dir` only, never replacing a file, at most 20 MB.
+- Only a file inside `outbox_dir` can be sent, up to 2000 MiB (a photo up to 10 MB). Put a file
+  there yourself, then ask Claude to send it; it uploads in the background.
+- Downloads go into `downloads_dir` only, never replacing a file, up to 4000 MiB, in the
+  background. A transfer stops only after 60 s with no progress.
 - Each value is an absolute path or starts with `~`, lies inside your home folder, contains no
   link, and does not overlap the data folder. A refused `outbox_dir` stops file sends only; a
   refused `downloads_dir` stops downloads only. Missing folders are created with mode 0700.

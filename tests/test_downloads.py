@@ -1,7 +1,8 @@
 """tg_media_download (test-after). Covers BR26.1 to BR26.4, NFR1.3, NFR2.4, NFR2.7, NFR5.1,
 NFR6.2 and NFR11.12: downloads go only into the downloads folder under a safe name, never over an
 existing file, never leave a partial file behind, return path, name and size only, wait out a
-short flood wait, and never hold up a send."""
+short flood wait, and never hold up a send. Attempt 2: the call returns the accepted transfer at
+once, and the file's path, name and size are the finished transfer's result (BR28.7)."""
 
 from __future__ import annotations
 
@@ -15,11 +16,19 @@ from typing import Any
 import pytest
 
 from support.brokers import FakeClock
-from support.catalog import PHOTO, PHOTO_BYTES, call, confirm, downloads, logged_in
+from support.catalog import (
+    PHOTO,
+    PHOTO_BYTES,
+    call,
+    confirm,
+    downloads,
+    finished,
+    logged_in,
+)
 from support.rpc import RawClient
 from support.samples import ALICE, FAMILY
 from telegram_mcp.broker.server import Broker
-from telegram_mcp.files import MAX_FILE_BYTES, safe_name
+from telegram_mcp.files import MAX_DOWNLOAD_BYTES, safe_name
 from telegram_mcp.gateway.fake import FakeGateway
 from telegram_mcp.gateway.models import FloodWait, TelegramError
 from telegram_mcp.paths import FixedPaths
@@ -35,28 +44,45 @@ async def download(client: RawClient, message_id: int = PHOTO, chat: int = ALICE
     return await call(client, DOWNLOAD, {"chat": chat, "message_id": message_id})
 
 
-async def test_a_download_lands_in_the_downloads_folder_privately(
+async def downloaded(client: RawClient, message_id: int = PHOTO) -> dict[str, Any]:
+    """The finished download's record."""
+    return await finished(client, await download(client, message_id))
+
+
+async def test_a_download_returns_at_once_and_lands_in_the_downloads_folder_privately(
     claude: RawClient, paths: FixedPaths
 ) -> None:
-    done = await download(claude)
-    data = done["data"]
-    expected = downloads(paths) / "holiday.jpg"
-    assert (data["path"], data["name"], data["size_bytes"]) == (
-        str(expected),
-        "holiday.jpg",
-        len(PHOTO_BYTES),
-    )
-    assert expected.read_bytes() == PHOTO_BYTES
-    assert stat.S_IMODE(os.stat(expected).st_mode) == 0o600
-    assert set(data) == {
+    accepted = await download(claude)
+    assert set(accepted["data"]) == {
+        "transfer_id",
+        "state",
+        "direction",
+        "tool",
         "chat_id",
         "message_id",
-        "path",
         "name",
         "size_bytes",
+        "note",
         "telegram_content_fields",
         "notice",
     }
+    assert (accepted["data"]["name"], accepted["data"]["size_bytes"]) == (
+        "holiday.jpg",
+        len(PHOTO_BYTES),
+    )
+    record = await finished(claude, accepted)
+    expected = downloads(paths) / "holiday.jpg"
+    assert record["state"] == "done"
+    assert record["result"] == {
+        "chat_id": ALICE.id,
+        "message_id": PHOTO,
+        "path": str(expected),
+        "name": "holiday.jpg",
+        "size_bytes": len(PHOTO_BYTES),
+    }
+    assert record["path"] == str(expected)
+    assert expected.read_bytes() == PHOTO_BYTES
+    assert stat.S_IMODE(os.stat(expected).st_mode) == 0o600
     assert leftovers(downloads(paths)) == []
 
 
@@ -66,14 +92,14 @@ async def test_a_message_with_no_file_is_refused(claude: RawClient) -> None:
     assert (await download(claude, message_id=99))["error"]["code"] == "not_found"
 
 
-async def test_a_file_over_20_mb_is_refused_before_downloading(
+async def test_a_file_over_4000_mib_is_refused_before_downloading(
     claude: RawClient, world: FakeGateway
 ) -> None:
-    big = world.add_message(ALICE.id, "big", media="video", media_size=MAX_FILE_BYTES + 1)
+    big = world.add_message(ALICE.id, "big", media="video", media_size=MAX_DOWNLOAD_BYTES + 1)
     done = await download(claude, message_id=big.id)
     assert done["error"]["code"] == "invalid_arguments"
-    assert str(MAX_FILE_BYTES + 1) in done["error"]["message"]
-    assert "download_media" not in world.call_names()
+    assert str(MAX_DOWNLOAD_BYTES + 1) in done["error"]["message"]
+    assert "download_part" not in world.call_names()
 
 
 @pytest.mark.parametrize(
@@ -104,9 +130,9 @@ async def test_a_hostile_name_stays_inside_the_downloads_folder(
     hostile = world.add_message(
         ALICE.id, "", media="document", file_name="../../.ssh/authorized_keys", content=b"k"
     )
-    data = (await download(claude, message_id=hostile.id))["data"]
-    assert Path(data["path"]).parent == downloads(paths)
-    assert data["name"] == "_.._.ssh_authorized_keys"
+    record = await downloaded(claude, hostile.id)
+    assert Path(record["path"]).parent == downloads(paths)
+    assert record["name"] == "_.._.ssh_authorized_keys"
 
 
 async def test_a_taken_name_gets_a_number_and_the_old_file_is_kept(
@@ -115,8 +141,8 @@ async def test_a_taken_name_gets_a_number_and_the_old_file_is_kept(
     folder = downloads(paths)
     folder.mkdir(parents=True)
     (folder / "holiday.jpg").write_bytes(b"mine")
-    data = (await download(claude))["data"]
-    assert data["name"] == "holiday (1).jpg"
+    record = await downloaded(claude)
+    assert record["name"] == "holiday (1).jpg"
     assert (folder / "holiday.jpg").read_bytes() == b"mine"
 
 
@@ -127,12 +153,12 @@ async def test_a_link_at_the_wanted_name_is_never_followed(
     folder.mkdir(parents=True)
     target = paths.home / "elsewhere.jpg"
     (folder / "holiday.jpg").symlink_to(target)
-    data = (await download(claude))["data"]
-    assert data["name"] == "holiday (1).jpg"
+    record = await downloaded(claude)
+    assert record["name"] == "holiday (1).jpg"
     assert not target.exists()
 
 
-async def test_a_thousand_way_clash_is_refused_with_nothing_left(
+async def test_a_thousand_way_clash_ends_the_download_with_nothing_left(
     claude: RawClient, paths: FixedPaths
 ) -> None:
     folder = downloads(paths)
@@ -140,19 +166,20 @@ async def test_a_thousand_way_clash_is_refused_with_nothing_left(
     (folder / "holiday.jpg").write_bytes(b"0")
     for number in range(1, 1000):
         (folder / f"holiday ({number}).jpg").write_bytes(b"0")
-    done = await download(claude)
-    assert done["error"]["code"] == "invalid_arguments"
-    assert "too many files" in done["error"]["message"]
+    record = await downloaded(claude)
+    assert record["state"] == "failed"
+    assert "too many files" in record["message"]
     assert leftovers(folder) == []
     assert len(os.listdir(folder)) == 1000
 
 
-async def test_a_failure_halfway_leaves_no_file(
+async def test_a_failure_leaves_no_file(
     claude: RawClient, world: FakeGateway, paths: FixedPaths
 ) -> None:
-    world.script("download_media", error=TelegramError("FILE_REFERENCE_EXPIRED"), after_bytes=10)
-    done = await download(claude)
-    assert done["error"]["code"] == "telegram_error"
+    world.script("download_part", error=TelegramError("FILE_PART_INVALID"))
+    record = await downloaded(claude)
+    assert (record["state"], record["code"]) == ("failed", "telegram_error")
+    assert "FILE_PART_INVALID" in record["message"]
     assert os.listdir(downloads(paths)) == []
 
 
@@ -170,13 +197,22 @@ async def test_a_refused_downloads_setting_is_named_and_other_tools_still_work(
 async def test_a_short_flood_wait_is_waited_out_and_a_long_one_returned(
     claude: RawClient, world: FakeGateway, clock: FakeClock
 ) -> None:
-    world.script("download_media", error=FloodWait(10))
+    world.script("download_part", error=FloodWait(10))
     before = clock.now
-    assert (await download(claude))["ok"] is True
+    assert (await downloaded(claude))["state"] == "done"
     assert (clock.now - before).total_seconds() >= 10
-    world.script("download_media", error=FloodWait(120))
-    done = await download(claude)
-    assert (done["error"]["code"], done["error"]["retry_after"]) == ("flood_wait", 120)
+    world.script("download_part", error=FloodWait(120))
+    record = await downloaded(claude)
+    assert (record["code"], record["retry_after"]) == ("flood_wait", 120)
+
+
+async def test_a_stalled_download_leaves_no_partial_file(
+    claude: RawClient, world: FakeGateway, paths: FixedPaths
+) -> None:
+    world.script("download_part", hang=True, times=None)
+    record = await downloaded(claude)
+    assert (record["state"], record["code"]) == ("failed", "stalled")
+    assert os.listdir(downloads(paths)) == []
 
 
 @pytest.fixture
@@ -199,19 +235,6 @@ async def quick_broker(
         await broker.stop()
 
 
-async def test_a_timeout_leaves_no_partial_file(
-    quick_broker: Broker, world: FakeGateway, paths: FixedPaths
-) -> None:
-    client = await RawClient.connect(paths)
-    try:
-        world.script("download_media", hang=True)
-        done = await download(client)
-        assert done["error"]["code"] == "telegram_timeout"
-        assert os.listdir(downloads(paths)) == []
-    finally:
-        await client.close()
-
-
 async def test_a_download_does_not_delay_a_send(
     quick_broker: Broker, world: FakeGateway, paths: FixedPaths
 ) -> None:
@@ -219,15 +242,14 @@ async def test_a_download_does_not_delay_a_send(
     sender = await RawClient.connect(paths)
     hook = await RawClient.connect(paths, client="approval-hook", client_name=None)
     try:
-        world.script("download_media", hang=True)
-        pending = asyncio.create_task(download(downloader))
-        await asyncio.sleep(0.05)
+        world.script("download_part", delay=20)
+        accepted = await asyncio.wait_for(download(downloader), 0.25)  # returns at once
+        assert accepted["ok"] is True
         args = {"chat": FAMILY.id}
         await confirm(hook, "tg_chats_leave", args)
         done = await asyncio.wait_for(call(sender, "tg_chats_leave", args), 0.25)
         assert done["ok"] is True
-        assert not pending.done()
-        assert (await pending)["error"]["code"] == "telegram_timeout"
+        assert (await finished(downloader, accepted))["state"] == "done"
     finally:
         for client in (downloader, sender, hook):
             await client.close()
