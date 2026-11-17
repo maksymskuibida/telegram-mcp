@@ -430,12 +430,14 @@ async def test_own_profile(gateway: TelethonGateway, stub: Stub) -> None:
 
 
 def with_media(stub: Stub, data: bytes, *, size: int | None = None, name: str = "a.pdf") -> Any:
+    """A message with a document; returns the Document that iter_download must be given."""
     media = SimpleNamespace(kind="document")
+    document = SimpleNamespace(kind="the document")
     file = SimpleNamespace(size=len(data) if size is None else size, name=name)
-    found = message(3, media=media, file=file, document=object())
+    found = message(3, media=media, file=file, document=document)
     stub.messages = [found]
     stub.media_data = data
-    return media
+    return document
 
 
 def downloads(stub: Stub) -> list[dict[str, Any]]:
@@ -471,6 +473,32 @@ async def test_download_parts_use_iter_download_at_their_offsets(
     assert all(call[1] == (media,) for call in stub.calls if call[0] == "iter_download")
     assert [c[0] for c in stub.calls].count("get_messages") == 1  # the message is read once
     no_read_acknowledgement(stub)
+
+
+async def test_a_link_preview_photo_downloads_the_photo_not_the_web_page(
+    gateway: TelethonGateway, stub: Stub
+) -> None:
+    # A channel post whose picture is a link preview: message.media is MessageMediaWebPage,
+    # which iter_download cannot cast (it raised TypeError on the real account); Telethon's
+    # message.photo finds the preview's Photo.
+    web_page = SimpleNamespace(kind="web page")
+    photo = SimpleNamespace(kind="the preview photo")
+    file = SimpleNamespace(size=6, name=None)
+    stub.messages = [message(3, media=web_page, file=file, photo=photo)]
+    stub.media_data = b"abcdef"
+    assert await gateway.media_info(TEAM_ID, 3) == MediaInfo("photo", 6, None)
+    assert await gateway.download_part(TEAM_ID, 3, 0, 4) == b"abcd"
+    assert [call[1] for call in stub.calls if call[0] == "iter_download"] == [(photo,)]
+
+
+async def test_media_with_nothing_to_download_is_no_media(
+    gateway: TelethonGateway, stub: Stub
+) -> None:
+    # A location, a poll or a web page without a picture: there is a media field and even a
+    # file view, but neither a Photo nor a Document to download.
+    file = SimpleNamespace(size=0, name=None)
+    stub.messages = [message(3, media=SimpleNamespace(kind="geo"), file=file)]
+    assert await gateway.media_info(TEAM_ID, 3) is None
 
 
 async def test_an_expired_file_reference_is_reported_and_the_message_read_again(
