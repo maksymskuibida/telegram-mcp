@@ -26,6 +26,7 @@ from support.catalog import (
     check,
     confirm,
     confirmed_run,
+    finished,
     put_file,
     question_text,
     write_calls,
@@ -112,12 +113,7 @@ WRITES: list[tuple[str, dict[str, Any], str, tuple[str, dict[str, Any]]]] = [
         f"Change {F}?\ntitle: Family → Family 2026\ndescription: (none) → Our family",
         (
             "edit_chat",
-            {
-                "chat_id": FAMILY.id,
-                "title": "Family 2026",
-                "description": "Our family",
-                "photo_name": None,
-            },
+            {"chat_id": FAMILY.id, "title": "Family 2026", "description": "Our family"},
         ),
     ),
     (
@@ -132,13 +128,7 @@ WRITES: list[tuple[str, dict[str, Any], str, tuple[str, dict[str, Any]]]] = [
         "Change your own profile?\nbio: (none) → New bio",
         (
             "edit_own_profile",
-            {
-                "first_name": None,
-                "last_name": None,
-                "bio": "New bio",
-                "username": None,
-                "photo_name": None,
-            },
+            {"first_name": None, "last_name": None, "bio": "New bio", "username": None},
         ),
     ),
 ]
@@ -242,9 +232,14 @@ async def test_a_file_send_shows_the_resolved_file_and_sends_it(
     await confirm(approval_hook, "tg_files_send", args)
     done = await call(claude, "tg_files_send", args)
     assert done["ok"] is True, done
+    assert (done["data"]["direction"], done["data"]["path"]) == ("upload", str(path))
+    record = await finished(claude, done)
+    assert record["state"] == "done", record
     assert [(f.chat_id, f.name, f.caption, f.data) for f in world.sent_files] == [
         (ALICE.id, "report.pdf", "Q3", b"report")
     ]
+    assert record["result"]["message_id"] == world.sent_files[0].message.id
+    assert "Q3" not in str(record)  # the caption is never shown in a record
 
 
 async def test_an_edit_sends_the_approved_text_after_telegram_changed(
@@ -473,12 +468,19 @@ async def test_a_photo_change_shows_and_uploads_the_admitted_file(
     )
     await answer(approval_hook, asked)
     done = await call(claude, "tg_profile_edit", profile_args)
-    assert done["data"] == {"changed": ["first_name", "photo"]}
+    assert done["data"]["changed"] == ["first_name"]
+    assert (await finished(claude, done))["result"] == {"changed": ["photo"]}
     assert world.profile_photos == [b"jpeg bytes"]
     chat_args = {"chat": FAMILY.id, "photo_path": str(photo)}
     edited = await confirmed_run(approval_hook, claude, "tg_chats_edit", chat_args)
-    assert edited["data"] == {"chat_id": FAMILY.id, "changed": ["photo"]}
+    assert edited["data"]["changed"] == []
+    assert set(edited["data"]) == {"chat_id", "changed", "photo_transfer_id"}
+    assert (await finished(claude, edited))["result"] == {
+        "chat_id": FAMILY.id,
+        "changed": ["photo"],
+    }
     assert world.chat_photos == [(FAMILY.id, b"jpeg bytes")]
+    assert "edit_chat" not in world.call_names()  # a photo alone makes no field request
 
 
 @pytest.mark.parametrize(

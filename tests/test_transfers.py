@@ -28,6 +28,7 @@ from telegram_mcp.broker.transfers import (
     FINAL_STATES,
     MOVES,
     Direction,
+    FinalNotStarted,
     InvalidMove,
     QueueFull,
     Transfer,
@@ -43,12 +44,17 @@ from telegram_mcp.files import (
 )
 from telegram_mcp.gateway.fake import FakeGateway
 from telegram_mcp.gateway.models import (
+    ChatNotFound,
     FileReferenceExpired,
     FloodWait,
+    GatewayError,
+    NotAuthorized,
     PartRetryable,
+    TopicNotFound,
     UploadedFile,
 )
 from telegram_mcp.paths import FixedPaths
+from telegram_mcp.vault import SessionVault
 
 DOWNLOAD = "tg_media_download"
 SEND = "tg_files_send"
@@ -88,13 +94,9 @@ async def make_queue(fake_gateway: FakeGateway) -> AsyncIterator[QueueMaker]:
 
         fake_gateway.sleep = clock.sleep
         options.setdefault("part_bytes", PART)
+        options.setdefault("final_line", final_line)
         queue = TransferQueue(
-            clock=clock,
-            sleep=clock.sleep,
-            open_gateway=opener,
-            final_line=final_line,
-            on_end=ended.append,
-            **options,
+            clock=clock, sleep=clock.sleep, open_gateway=opener, on_end=ended.append, **options
         )
         made.append(queue)
         return queue, ended
@@ -337,6 +339,110 @@ async def test_a_cancelled_download_leaves_no_file_and_a_final_one_is_unchanged(
     assert listing(folder) == []
     again, already = await queue.cancel(going.transfer_id)
     assert (again, already) == (going, True)
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (NotAuthorized(), "no_session"),
+        (ChatNotFound(), "not_found"),
+        (TopicNotFound(), "telegram_error"),
+    ],
+)
+async def test_a_part_error_that_cannot_be_retried_ends_the_transfer(
+    make_queue: QueueMaker,
+    fake_gateway: FakeGateway,
+    clock: ManualClock,
+    folder: Path,
+    error: GatewayError,
+    code: str,
+) -> None:
+    queue, _ = make_queue(clock)
+    fake_gateway.script("download_part", error=error)
+    broken = download(queue, folder, media(fake_gateway))
+    await drive(clock, ended(broken))
+    assert (str(broken.state), broken.code) == ("failed", code)
+    assert listing(folder) == []
+
+
+async def test_telegram_sending_fewer_bytes_than_the_file_has_ends_the_download(
+    make_queue: QueueMaker, fake_gateway: FakeGateway, clock: ManualClock, folder: Path
+) -> None:
+    queue, _ = make_queue(clock)
+    short = download(queue, folder, media(fake_gateway), size=20)  # Telegram said 20 bytes
+    await drive(clock, ended(short))
+    assert (str(short.state), short.code) == ("failed", "telegram_error")
+    assert "fewer bytes" in str(short.message)
+    assert listing(folder) == []
+
+
+async def test_a_file_cut_short_during_the_upload_is_not_sent(
+    make_queue: QueueMaker,
+    fake_gateway: FakeGateway,
+    clock: ManualClock,
+    paths: FixedPaths,
+) -> None:
+    queue, _ = make_queue(clock)
+    fake_gateway.script("upload_part", delay=5, part=0)
+    cut = upload(queue, paths)
+    await settle()
+    os.truncate(str(cut.path), 3)  # the open file now ends inside part 0's successor
+    await drive(clock, ended(cut))
+    assert (str(cut.state), cut.code) == ("failed", "changed")
+    assert fake_gateway.final_requests() == []
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "words"),
+    [
+        (FloodWait(50), "flood_wait", "nothing was sent"),
+        (NotAuthorized(), "no_session", "Not logged in"),
+        (ChatNotFound(), "not_found", "cannot see"),
+    ],
+)
+async def test_a_final_request_refused_before_sending_ends_failed(
+    make_queue: QueueMaker,
+    fake_gateway: FakeGateway,
+    clock: ManualClock,
+    paths: FixedPaths,
+    error: GatewayError,
+    code: str,
+    words: str,
+) -> None:
+    queue, _ = make_queue(clock)
+    fake_gateway.script("send_uploaded_file", error=error)
+    refused = upload(queue, paths)
+    await drive(clock, ended(refused))
+    assert (str(refused.state), refused.code) == ("failed", code)
+    assert words in str(refused.message)
+    assert len(fake_gateway.final_requests()) == 1
+
+
+async def test_a_final_request_that_left_the_write_line_unsent_sends_nothing(
+    make_queue: QueueMaker, fake_gateway: FakeGateway, clock: ManualClock, paths: FixedPaths
+) -> None:
+    async def dropped(_: Transfer, run: Callable[[], Any]) -> Any:
+        raise FinalNotStarted()
+
+    queue, _ = make_queue(clock, final_line=dropped)
+    unsent = upload(queue, paths)
+    await drive(clock, ended(unsent))
+    assert (str(unsent.state), unsent.code) == ("failed", "telegram_error")
+    assert "Nothing was sent" in str(unsent.message)
+    assert fake_gateway.final_requests() == []
+
+
+async def test_a_transfer_without_a_session_or_during_a_logout_ends_no_session(
+    broker: Broker, memory_keyring: Any
+) -> None:
+    broker._logging_out = True
+    with pytest.raises(NotAuthorized):
+        await broker._transfer_gateway()
+    broker._logging_out = False
+    SessionVault().delete()
+    broker._vault_result = None
+    with pytest.raises(NotAuthorized):
+        await broker._transfer_gateway()
 
 
 # Records: list, wait and retention (BR28.7, NFR11.14, NFR11.17) -------------------------------

@@ -1,9 +1,9 @@
 """The FileSandbox for file sends, written before the code (team Testing Posture).
 
-Covers BR25.1 to BR25.5, NFR1.2, NFR2.7, NFR3.2 and NFR11.11: only a regular, non-empty file of at
-most 20 MB inside the outbox is admitted, never one of the tool's own files whatever path or link
-names it, the question shows its resolved path, name and size, and the send uploads that same
-file from the descriptor it checked, or nothing."""
+Covers BR25.1 to BR25.5, NFR1.2, NFR2.7, NFR3.2, NFR3.3 and NFR11.11: only a regular, non-empty
+file within Telegram's limit (2000 MiB, 10 MB for a photo) inside the outbox is admitted, never one
+of the tool's own files whatever path or link names it, the question shows its resolved path, name
+and size, and the upload reads that same file from the descriptor it checked, or nothing."""
 
 from __future__ import annotations
 
@@ -19,12 +19,16 @@ from support.rpc import RawClient
 from support.samples import ALICE
 from telegram_mcp.broker.server import Broker
 from telegram_mcp.files import (
-    MAX_FILE_BYTES,
+    MAX_PHOTO_BYTES,
     MAX_RECORDS,
+    MAX_SEND_BYTES,
+    AdmittedFile,
     FileRefused,
     FileStore,
     admit,
+    admit_photo,
     open_admitted,
+    unchanged,
 )
 from telegram_mcp.gateway.fake import FakeGateway
 from telegram_mcp.paths import FixedPaths
@@ -46,6 +50,12 @@ def data_files(paths: FixedPaths) -> dict[str, Path]:
 def refused(given: str, paths: FixedPaths) -> FileRefused:
     with pytest.raises(FileRefused) as caught:
         admit(given, paths)
+    return caught.value
+
+
+def refused_photo(given: str, paths: FixedPaths) -> FileRefused:
+    with pytest.raises(FileRefused) as caught:
+        admit_photo(given, paths)
     return caught.value
 
 
@@ -127,14 +137,46 @@ def test_an_empty_file_is_refused(paths: FixedPaths) -> None:
     assert (error.code, "empty" in error.message) == ("invalid_arguments", True)
 
 
-def test_a_file_over_20_mb_is_refused_naming_the_limit(paths: FixedPaths) -> None:
+def test_a_file_over_2000_mib_is_refused_naming_the_limit(paths: FixedPaths) -> None:
     path = put_file(paths, "big.bin", b"x")
-    os.truncate(path, MAX_FILE_BYTES + 1)
+    os.truncate(path, MAX_SEND_BYTES + 1)  # a sparse file: no disk space is used
     error = refused("big.bin", paths)
     assert error.code == "invalid_arguments"
-    assert "20 MB" in error.message
-    os.truncate(path, MAX_FILE_BYTES)
-    assert admit("big.bin", paths).size_bytes == MAX_FILE_BYTES
+    assert "2000 MiB" in error.message
+    assert str(MAX_SEND_BYTES) in error.message
+    os.truncate(path, MAX_SEND_BYTES)
+    assert admit("big.bin", paths).size_bytes == MAX_SEND_BYTES
+    assert MAX_SEND_BYTES == 2_097_152_000
+
+
+def test_a_photo_over_10_mb_is_refused_naming_the_limit(paths: FixedPaths) -> None:
+    path = put_file(paths, "big.jpg", b"x")
+    os.truncate(path, MAX_PHOTO_BYTES + 1)
+    error = refused_photo("big.jpg", paths)
+    assert error.code == "invalid_arguments"
+    assert "10 MB" in error.message
+    os.truncate(path, MAX_PHOTO_BYTES)
+    assert admit_photo("big.jpg", paths).size_bytes == MAX_PHOTO_BYTES == 10_485_760
+
+
+def test_the_open_file_is_compared_again_after_the_upload(paths: FixedPaths) -> None:
+    path = put_file(paths, "report.pdf", b"report")
+    admitted = admit(str(path), paths)
+    with open_admitted(admitted, paths) as opened:
+        assert unchanged(admitted, opened)
+        with path.open("ab") as more:
+            more.write(b"!")
+        assert not unchanged(admitted, opened)
+    with open_admitted(admit(str(path), paths), paths) as opened:
+        path.unlink()
+        assert not unchanged(admit_record(path, opened), opened)
+
+
+def admit_record(path: Path, opened: object) -> AdmittedFile:
+    info = os.fstat(opened.fileno())  # type: ignore[attr-defined]
+    return AdmittedFile(
+        str(path), str(path), path.name, info.st_size, info.st_dev, info.st_ino, info.st_mtime_ns
+    )
 
 
 def test_a_refused_outbox_setting_is_not_allowed_naming_it(paths: FixedPaths) -> None:
@@ -233,6 +275,7 @@ async def test_a_file_changed_after_the_allow_is_not_uploaded(
     done = await call(claude, SEND, args)
     assert done["error"]["code"] == "not_allowed"
     assert world.sent_files == []
+    assert "upload_part" not in world.call_names()  # no transfer was accepted
     again = await call(claude, SEND, args)
     assert again["error"]["code"] == "needs_confirmation"  # the approval was used
 

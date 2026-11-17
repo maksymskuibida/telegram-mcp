@@ -5,6 +5,7 @@ clock and a sleep that steps that clock, so a flood wait never really waits."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -161,6 +162,25 @@ async def confirmed_run(
     return await call(client, tool, args)
 
 
+FINAL_STATES = {"done", "failed", "cancelled", "unknown"}
+
+
+async def finished(client: RawClient, accepted: dict[str, Any]) -> dict[str, Any]:
+    """Follow an accepted transfer (a send, a download or a photo change) with
+    tg_transfers_list until it is final; its final record (BR28.7)."""
+    assert accepted["ok"], accepted
+    data = accepted["data"]
+    transfer_id = data.get("transfer_id") or data["photo_transfer_id"]
+    for _ in range(1000):
+        listed = await call(client, "tg_transfers_list", {"transfer_id": transfer_id})
+        assert listed["ok"], listed
+        record: dict[str, Any] = listed["data"]["transfers"][0]
+        if record["state"] in FINAL_STATES:
+            return record
+        await asyncio.sleep(0.002)
+    pytest.fail(f"transfer {transfer_id} did not end")
+
+
 def question_text(asked: dict[str, Any]) -> str:
     """The question without its ``[tg-<id>] `` prefix."""
     text = str(asked["question"])
@@ -204,7 +224,9 @@ WRITE_CALLS = {
     "set_admin_rights",
     "edit_chat",
     "edit_own_profile",
-    "send_file",
+    "send_uploaded_file",
+    "set_chat_photo",
+    "set_profile_photo",
     "send_text",
     "mark_read",
 }

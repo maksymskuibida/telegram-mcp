@@ -118,6 +118,7 @@ def test_the_approval_matcher_covers_exactly_the_tools_that_can_ask() -> None:
     registry = default_registry(FixedPaths.from_home(ROOT))
     asking = asking_tools()
     assert len(asking) == 18  # 16 writes, the mark tool and the read tool
+    assert len(registry.decls()) == 32
     for tool in registry.decls():
         matched = re.fullmatch(pre["matcher"], PREFIX + tool) is not None
         assert matched is (tool in asking), tool
@@ -132,6 +133,8 @@ def test_the_approval_matcher_matches_nothing_else() -> None:
         "mcp__plugin_other_telegram__tg_messages_send",
         PREFIX + "tg_media_download",
         PREFIX + "tg_chats_resolve",
+        PREFIX + "tg_transfers_list",  # the transfer tools ask nothing (BR28.6, NFR2.10)
+        PREFIX + "tg_transfers_cancel",
         "Bash",
     ]:
         assert re.fullmatch(pre["matcher"], name) is None, name
