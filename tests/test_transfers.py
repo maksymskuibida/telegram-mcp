@@ -9,6 +9,7 @@ clock, never by sleeping."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import os
 from collections.abc import AsyncIterator, Callable
@@ -50,6 +51,7 @@ from telegram_mcp.gateway.models import (
     GatewayError,
     NotAuthorized,
     PartRetryable,
+    TelegramError,
     TopicNotFound,
     UploadedFile,
 )
@@ -95,9 +97,8 @@ async def make_queue(fake_gateway: FakeGateway) -> AsyncIterator[QueueMaker]:
         fake_gateway.sleep = clock.sleep
         options.setdefault("part_bytes", PART)
         options.setdefault("final_line", final_line)
-        queue = TransferQueue(
-            clock=clock, sleep=clock.sleep, open_gateway=opener, on_end=ended.append, **options
-        )
+        options.setdefault("open_gateway", opener)
+        queue = TransferQueue(clock=clock, sleep=clock.sleep, on_end=ended.append, **options)
         made.append(queue)
         return queue, ended
 
@@ -299,6 +300,185 @@ async def test_an_expired_file_reference_reads_the_message_again_and_goes_on(
     offsets = [c["offset"] for c in fake_gateway.part_calls("download_part")]
     assert offsets == [0, 4, 4, 8]  # it went on from the bytes it had
     assert read(going.path) == b"0123456789"
+
+
+async def test_a_message_deleted_during_the_download_ends_it_not_found(
+    make_queue: QueueMaker, fake_gateway: FakeGateway, clock: ManualClock, folder: Path
+) -> None:
+    queue, _ = make_queue(clock)
+    fake_gateway.script("download_part", delay=5, error=FileReferenceExpired(), part=1)
+    message_id = media(fake_gateway)
+    gone = download(queue, folder, message_id)
+    await settle()
+    await fake_gateway.delete(ALICE.id, [message_id], True)  # deleted while part 1 runs
+    await drive(clock, ended(gone))
+    assert (str(gone.state), gone.code) == ("failed", "not_found")
+    assert gone.message == "This account cannot see that chat or message any more."
+    assert listing(folder) == []
+
+
+@pytest.mark.parametrize(
+    ("error", "state", "code", "words"),
+    [
+        (NotAuthorized(), "failed", "no_session", "Not logged in"),
+        (ChatNotFound(), "failed", "not_found", "cannot see"),
+        (FloodWait(120), "failed", "flood_wait", "wait 120 s"),
+        (TelegramError("CHANNEL_PRIVATE"), "failed", "telegram_error", "read the message again"),
+        (GatewayError(), "failed", "telegram_error", "Reading the message again failed"),
+        (FloodWait(10), "done", None, None),
+        (PartRetryable(), "done", None, None),
+    ],
+)
+async def test_errors_while_reading_the_message_again_mean_what_a_parts_errors_mean(
+    make_queue: QueueMaker,
+    fake_gateway: FakeGateway,
+    clock: ManualClock,
+    folder: Path,
+    error: GatewayError,
+    state: str,
+    code: str | None,
+    words: str | None,
+) -> None:
+    queue, _ = make_queue(clock)
+    fake_gateway.script("download_part", error=FileReferenceExpired(), part=1)
+    fake_gateway.script("media_info", error=error)
+    refreshed = download(queue, folder, media(fake_gateway))
+    await drive(clock, ended(refreshed))
+    assert (str(refreshed.state), refreshed.code) == (state, code), refreshed.message
+    if words is None:
+        assert read(refreshed.path) == b"0123456789"
+        remove(refreshed.path)
+    else:
+        assert words in str(refreshed.message)
+        assert listing(folder) == []
+
+
+async def test_a_file_reference_that_keeps_expiring_ends_stalled_without_a_tight_loop(
+    make_queue: QueueMaker, fake_gateway: FakeGateway, clock: ManualClock, folder: Path
+) -> None:
+    queue, _ = make_queue(clock)
+    fake_gateway.script("download_part", error=FileReferenceExpired(), part=1, times=None)
+    expiring = download(queue, folder, media(fake_gateway))
+    moved = await drive(clock, ended(expiring))
+    assert (str(expiring.state), expiring.code) == ("failed", "stalled")
+    assert 60 <= moved <= 62
+    assert fake_gateway.call_names().count("media_info") <= 61  # about one read per second
+    assert listing(folder) == []
+
+
+def slow_teardown(clock: ManualClock, tearing: asyncio.Event) -> Callable[..., Any]:
+    """A part request that hangs and, once stopped, takes 5 s on the clock to close."""
+
+    async def part(*args: Any) -> bytes:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            tearing.set()
+            await clock.sleep(5)
+            raise
+        raise AssertionError("never answers")
+
+    return part
+
+
+@pytest.mark.parametrize("direction", ["download", "upload"])
+@pytest.mark.parametrize(
+    ("stop", "state", "code"),
+    [("cancel", "cancelled", "cancelled"), ("close", "failed", "broker_stopped")],
+)
+async def test_a_stop_while_a_timed_out_part_is_torn_down_ends_the_transfer(
+    make_queue: QueueMaker,
+    fake_gateway: FakeGateway,
+    clock: ManualClock,
+    folder: Path,
+    paths: FixedPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    direction: str,
+    stop: str,
+    state: str,
+    code: str,
+) -> None:
+    queue, _ = make_queue(clock)
+    tearing = asyncio.Event()
+    monkeypatch.setattr(fake_gateway, f"{direction}_part", slow_teardown(clock, tearing))
+    if direction == "download":
+        item = download(queue, folder, media(fake_gateway))
+    else:
+        item = upload(queue, paths)
+    moved = await drive(clock, tearing.is_set)  # the part passed its 30 s and is closing
+    assert 30 <= moved <= 31
+    stopping = queue.cancel(item.transfer_id) if stop == "cancel" else queue.close()
+    async with asyncio.timeout(5):  # real time: the stop is not swallowed by the clean-up
+        await stopping
+    assert (str(item.state), item.code) == (state, code)
+    assert listing(folder) == []
+    assert fake_gateway.final_requests() == []
+    if direction == "upload":
+        assert "Nothing was sent" in str(item.message)
+
+
+async def test_a_cancel_waits_for_a_request_that_ignores_it_at_most_30_s(
+    make_queue: QueueMaker,
+    fake_gateway: FakeGateway,
+    clock: ManualClock,
+    folder: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue, ended_list = make_queue(clock)
+    release = asyncio.Event()
+
+    async def stubborn(*args: Any) -> bytes:
+        while not release.is_set():
+            with contextlib.suppress(asyncio.CancelledError):
+                await release.wait()
+        raise ConnectionError("closed at last")
+
+    monkeypatch.setattr(fake_gateway, "download_part", stubborn)
+    stuck = download(queue, folder, media(fake_gateway))
+    await settle()
+    cancelling = asyncio.ensure_future(queue.cancel(stuck.transfer_id))
+    moved = await drive(clock, cancelling.done)
+    assert 30 <= moved <= 31
+    assert (str(stuck.state), stuck.code) == ("cancelled", "cancelled")
+    assert len(listing(folder)) == 1  # the stuck request's task still owns its partial file
+    release.set()
+    await settle()
+    assert listing(folder) == []  # removed when that task ended
+    assert (str(stuck.state), ended_list) == ("cancelled", [stuck])
+
+
+@pytest.mark.parametrize("failure", ["unreachable", "logged_out", "hangs"])
+async def test_a_connection_that_cannot_open_for_the_final_request_sent_nothing(
+    make_queue: QueueMaker,
+    fake_gateway: FakeGateway,
+    clock: ManualClock,
+    paths: FixedPaths,
+    failure: str,
+) -> None:
+    uploads: list[Transfer] = []
+
+    async def opener() -> FakeGateway:
+        if uploads and uploads[0].state is TransferState.SENDING:
+            if failure == "unreachable":
+                raise PartRetryable()
+            if failure == "logged_out":
+                raise NotAuthorized()
+            await asyncio.Event().wait()
+        return fake_gateway
+
+    queue, _ = make_queue(clock, open_gateway=opener)
+    uploads.append(upload(queue, paths))
+    (unsent,) = uploads
+    moved = await drive(clock, ended(unsent))
+    assert str(unsent.state) == "failed"
+    assert unsent.code == ("no_session" if failure == "logged_out" else "telegram_error")
+    assert not unsent.final_issued
+    assert fake_gateway.final_requests() == []
+    if failure != "logged_out":
+        assert "Nothing was sent" in str(unsent.message)
+        assert "may or may not" not in str(unsent.message)
+    if failure == "hangs":
+        assert 30 <= moved <= 31  # the connection's own 30 s limit
 
 
 async def test_a_full_disk_ends_the_download_and_removes_the_partial_file(

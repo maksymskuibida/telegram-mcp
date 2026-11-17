@@ -65,6 +65,8 @@ STALL_LIMIT_SECONDS = 60.0
 REQUEST_LIMIT_SECONDS = 30.0
 RETRY_PAUSE_SECONDS = 1.0
 LONGEST_FLOOD_WAIT_SECONDS = 30
+GONE_REASONS = frozenset({"MESSAGE_ID_INVALID", "MEDIA_EMPTY"})
+"""What Telegram answers when the message being downloaded was deleted or lost its media."""
 WAITING_LIMIT = 20
 KEEP_SECONDS = 3600.0
 KEEP_COUNT = 100
@@ -228,6 +230,9 @@ class Transfer:
     partial: Path | None = field(default=None, repr=False)
     partial_fd: int | None = field(default=None, repr=False)
     stop_code: str | None = field(default=None, repr=False)
+    final_issued: bool = field(default=False, repr=False)
+    """True once an upload's final request was handed to Telegram; before that, nothing can
+    have been sent (BR28.4)."""
     ended: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def __post_init__(self) -> None:
@@ -522,11 +527,18 @@ class TransferQueue:
             return
         transfer.stop_code = code
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        if not transfer.is_final:  # cancelled before its first step ran
+        # Wait for the task at most one request limit on the clock: a request or a disk call
+        # that ignores the cancel must not hold up a cancel or a broker stop.
+        timer = asyncio.ensure_future(self.sleep(self.request_limit))
+        try:
+            await asyncio.wait({task, timer}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            timer.cancel()
+        if not transfer.is_final:  # cancelled before its first step ran, or still stuck
             self._end(transfer, _Ended(code, state=state))
-            self._clean_up(transfer)
+            if task.done():
+                self._clean_up(transfer)
+            # A stuck task closes its own files when it ends: never close one under it.
             self._tasks.pop(transfer.transfer_id, None)
             self._pump()
 
@@ -584,10 +596,12 @@ class TransferQueue:
                 state = TransferState.CANCELLED if code == "cancelled" else TransferState.FAILED
                 self._end(transfer, _Ended(code, state=state))
         except Exception as error:  # every failure ends the transfer, never silently
-            if transfer.state is TransferState.SENDING:
+            if transfer.state is TransferState.SENDING and transfer.final_issued:
                 self._end(transfer, _Ended("outcome_unknown", state=TransferState.UNKNOWN))
             else:
                 message = f"The transfer failed: {type(error).__name__}."
+                if transfer.state is TransferState.SENDING:
+                    message = f"{message} {NOTHING_SENT}"
                 self._end(transfer, _Ended("telegram_error", message))
         finally:
             self._clean_up(transfer)
@@ -636,8 +650,9 @@ class TransferQueue:
         descriptor = source.fileno()
         for index in range(total):
             offset = index * self.part_bytes
-            data = os.pread(descriptor, min(self.part_bytes, size - offset), offset)
-            if len(data) != min(self.part_bytes, size - offset):
+            length = min(self.part_bytes, size - offset)
+            data = await self._in_thread(os.pread, descriptor, length, offset)
+            if len(data) != length:
                 raise _Ended("changed")
             checksum.update(data)
 
@@ -664,16 +679,18 @@ class TransferQueue:
     async def _send_final(
         self, transfer: Transfer, final: FinalCall, uploaded: UploadedFile
     ) -> dict[str, Any]:
-        """BR28.5: the one final request, from the write line, under the 30 s limit."""
+        """BR28.5: the one final request, from the write line, under the 30 s limit. The
+        connection is opened first, under its own limit: a failure there has sent nothing and
+        ends the transfer ``failed``; only once the request was issued is an unclear end
+        ``unknown``."""
 
         async def run() -> dict[str, Any]:
-            gateway = await self._open_gateway()
-            return await final(gateway, uploaded)
+            gateway = await self._bounded(None, self._open_gateway())
+            transfer.final_issued = True
+            return await self._bounded(None, final(gateway, uploaded))
 
         try:
-            result: dict[str, Any] = await self._final_line(
-                transfer, lambda: self._bounded(None, run())
-            )
+            result: dict[str, Any] = await self._final_line(transfer, run)
             return result
         except FinalNotStarted as unsent:
             raise _Ended("telegram_error", f"{MESSAGES['not_started']} {NOTHING_SENT}") from unsent
@@ -696,6 +713,9 @@ class TransferQueue:
             PartRetryable,
             ConnectionError,
         ) as error:
+            if not transfer.final_issued:
+                message = f"Telegram could not be reached for the final request. {NOTHING_SENT}"
+                raise _Ended("telegram_error", message) from error
             raise _Ended("outcome_unknown", state=TransferState.UNKNOWN) from error
 
     async def _download(self, transfer: Transfer) -> None:
@@ -718,7 +738,7 @@ class TransferQueue:
             if size is not None:
                 data = data[: max(0, size - offset)]
             if data:
-                self._write(transfer, data)
+                await self._write(transfer, data)
             offset += len(data)
             transfer.progress(offset, self.clock())
             if size is None and offset > self.max_download_bytes:
@@ -752,20 +772,36 @@ class TransferQueue:
         if self._on_end is not None:
             self._on_end(transfer)
 
-    def _write(self, transfer: Transfer, data: bytes) -> None:
-        """Append one part to the partial file; a full disk ends the download (BR26.3)."""
+    async def _write(self, transfer: Transfer, data: bytes) -> None:
+        """Append one part to the partial file, off the event loop; a full disk ends the
+        download (BR26.3)."""
         descriptor = transfer.partial_fd
         if descriptor is None:  # pragma: no cover (opened before the first part)
             raise _Ended("disk_full")
         view = memoryview(data)
         try:
             while view:
-                written = self.write_part(descriptor, bytes(view))
+                written = await self._in_thread(self.write_part, descriptor, bytes(view))
                 view = view[written:]
         except OSError as error:
             reason = error.strerror or type(error).__name__
             message = f"The downloads folder could not take the file ({reason})."
             raise _Ended("disk_full", message) from error
+
+    async def _in_thread[T](self, call: Callable[..., T], *args: Any) -> T:
+        """One blocking disk call (a part's read or write) off the event loop, so a slow disk
+        never holds up other calls or the limits' timers. A cancel waits for the call to
+        return before it goes on, so a file is never closed while the call still uses it."""
+        future: asyncio.Future[T] = asyncio.ensure_future(asyncio.to_thread(call, *args))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            while not future.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait({future})
+            if not future.cancelled():
+                future.exception()  # retrieved: the cancel is what goes on
+            raise
 
     # One part ------------------------------------------------------------------------------
 
@@ -780,47 +816,72 @@ class TransferQueue:
             self.most_in_flight[direction] = max(
                 self.most_in_flight[direction], self.in_flight[direction]
             )
+            expired = False
+            wait: float | None = None
             try:
                 gateway = await self._bounded(transfer, self._open_gateway())
                 return await self._bounded(transfer, request(gateway))
-            except FloodWait as flood:
-                if flood.seconds > LONGEST_FLOOD_WAIT_SECONDS:
-                    message = f"Telegram asked to wait {flood.seconds} s; the transfer stopped."
-                    raise _Ended("flood_wait", message, retry_after=flood.seconds) from flood
-                wait = flood.seconds
             except FileReferenceExpired:
-                await self._refresh_reference(transfer)
-                continue
-            except (_RequestTimedOut, PartRetryable, GatewayTimeout, TimeoutError, ConnectionError):
-                wait = None
-            except NotAuthorized as error:
-                raise _Ended("no_session") from error
-            except ChatNotFound as error:
-                raise _Ended("not_found") from error
-            except TelegramError as error:
-                raise _Ended(
-                    "telegram_error", f"Telegram refused a part: {error.reason}."
-                ) from error
-            except GatewayError as error:
-                raise _Ended("telegram_error", f"A part failed: {type(error).__name__}.") from error
+                expired = True
+            except (_RequestTimedOut, TimeoutError, ConnectionError, GatewayError) as error:
+                wait = self._after_error(error, "a part")
             finally:
                 self.in_flight[direction] -= 1
-            if wait is None:
-                await self.sleep(self.retry_pause)
-                continue
-            await self.sleep(wait)  # waited out with the stall clock paused (BR28.3)
-            if transfer.last_progress_at is not None:
-                transfer.last_progress_at += timedelta(seconds=wait)
+            if expired:  # outside the handler, so its own errors are mapped like a part's
+                wait = await self._refresh_reference(transfer)
+            await self._pause(transfer, wait)
 
-    async def _refresh_reference(self, transfer: Transfer) -> None:
+    def _after_error(self, error: BaseException, what: str) -> float | None:
+        """What a failed request means for the transfer: ``None`` to try again after a short
+        pause, the seconds of a short flood wait to wait out, or :class:`_Ended`."""
+        if isinstance(error, FloodWait):
+            if error.seconds > LONGEST_FLOOD_WAIT_SECONDS:
+                message = f"Telegram asked to wait {error.seconds} s; the transfer stopped."
+                raise _Ended("flood_wait", message, retry_after=error.seconds) from error
+            return float(error.seconds)
+        retryable = (_RequestTimedOut, PartRetryable, GatewayTimeout, TimeoutError, ConnectionError)
+        if isinstance(error, retryable):
+            return None
+        if isinstance(error, NotAuthorized):
+            raise _Ended("no_session") from error
+        if isinstance(error, ChatNotFound):
+            raise _Ended("not_found") from error
+        if isinstance(error, TelegramError):
+            message = f"Telegram refused {what}: {error.reason}."
+            raise _Ended("telegram_error", message) from error
+        raise _Ended("telegram_error", f"{what.capitalize()} failed: {type(error).__name__}.")
+
+    async def _pause(self, transfer: Transfer, wait: float | None) -> None:
+        """The pause before the next try: a short one, or a flood wait waited out with the
+        stall clock paused (BR28.3)."""
+        if wait is None:
+            await self.sleep(self.retry_pause)
+            return
+        await self.sleep(wait)
+        if transfer.last_progress_at is not None:
+            transfer.last_progress_at += timedelta(seconds=wait)
+
+    async def _refresh_reference(self, transfer: Transfer) -> float | None:
         """A download's file reference expired: read the message again (one read with the usual
-        limit); that counts as a retry inside the stall limit (BR28.3)."""
+        limit); that counts as a retry inside the stall limit (BR28.3). Its errors mean what a
+        part's errors mean, and a message that is gone ends the download ``not_found``."""
         chat_id, message_id = transfer.chat_id, transfer.message_id
         if chat_id is None or message_id is None:  # pragma: no cover (downloads have both)
             raise _Ended("telegram_error")
-        with contextlib.suppress(_RequestTimedOut, PartRetryable, GatewayTimeout, TimeoutError):
+        try:
             gateway = await self._bounded(transfer, self._open_gateway())
-            await self._bounded(transfer, gateway.media_info(chat_id, message_id))
+            info = await self._bounded(transfer, gateway.media_info(chat_id, message_id))
+        except FileReferenceExpired:
+            return None
+        except TelegramError as error:
+            if error.reason in GONE_REASONS:
+                raise _Ended("not_found") from error
+            return self._after_error(error, "to read the message again")
+        except (_RequestTimedOut, TimeoutError, ConnectionError, GatewayError) as error:
+            return self._after_error(error, "reading the message again")
+        if info is None:  # the message no longer has the media
+            raise _Ended("not_found")
+        return None
 
     def _check_stall(self, transfer: Transfer) -> None:
         if self._stalled(transfer):
@@ -860,5 +921,17 @@ class TransferQueue:
         finally:
             if not task.done():
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
+                await self._torn_down(task)
+
+    @staticmethod
+    async def _torn_down(task: asyncio.Future[Any]) -> None:
+        """Wait for a stopped request to finish its clean-up. Its own cancellation and its own
+        error are dropped, but a cancel of the transfer itself (``tg_transfers_cancel``, a
+        broker stop) that arrives meanwhile goes on, so the transfer ends."""
+        with contextlib.suppress(Exception):
+            try:
+                await task
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise

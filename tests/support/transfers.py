@@ -61,16 +61,27 @@ async def settle() -> None:
 async def drive(
     clock: ManualClock, until: Callable[[], bool], *, step: float = 1.0, limit: float = 900.0
 ) -> float:
-    """Move the clock ``step`` seconds at a time until ``until()`` holds; the seconds moved."""
+    """Move the clock ``step`` seconds at a time until ``until()`` holds; the seconds moved.
+    Before each move it lets work that is not waiting on the clock (a part's disk read or write
+    on a thread) reach its next wait, so a slow machine does not move the clock early."""
     moved = 0.0
     await settle()
     while not until():
         if moved >= limit:
             pytest.fail(f"the condition did not hold within {limit} s on the clock")
+        await _parked(clock, until)
         clock.advance(step)
         moved += step
         await settle()
     return moved
+
+
+async def _parked(clock: ManualClock, until: Callable[[], bool], seconds: float = 0.25) -> None:
+    """Wait (real time, at most ``seconds``) until something waits on the clock."""
+    for _ in range(int(seconds / 0.002)):
+        if clock.sleepers or until():
+            return
+        await asyncio.sleep(0.002)
 
 
 async def transfer(client: RawClient, transfer_id: str) -> dict[str, Any]:
